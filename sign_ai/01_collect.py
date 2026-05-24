@@ -8,6 +8,15 @@ from core.config import *
 from core.extractor import extraer_puntos
 
 # =========================================
+# NOMBRE DE PERSONA (para dataset individual)
+# =========================================
+nombre_persona = input(
+    "Tu nombre (sin espacios, ej: alanis, carlos, maria): "
+).lower().strip().replace(" ", "_")
+
+SAVE_PATH = f"data/{nombre_persona}_dataset.csv"
+
+# =========================================
 # MEDIAPIPE HOLISTIC
 # =========================================
 mp_holistic = mp.solutions.holistic
@@ -28,8 +37,8 @@ cam = cv2.VideoCapture(0)
 # INPUT DE ETIQUETA
 # =========================================
 etiqueta = input(
-    "Nombre de la seña a grabar (ej: IDLE, A, HOLA): "
-).upper()
+    "Nombre de la seña a grabar (ej: HOLA, GRACIAS, POR_FAVOR): "
+).upper().strip()
 
 # =========================================
 # VARIABLES
@@ -37,7 +46,8 @@ etiqueta = input(
 secuencia = []
 grabando = False
 
-print(f"\n🎥 Grabando para: {etiqueta}")
+print(f"\n🎥 Persona: {nombre_persona}  |  Seña: {etiqueta}")
+print(f"💾 Guardando en: {SAVE_PATH}")
 print("👉 Presiona 'S' para grabar una muestra")
 print("👉 Presiona 'ESC' para salir")
 
@@ -136,13 +146,10 @@ while cam.isOpened():
         # Cuando completa los frames
         if len(secuencia) == SEQ_LEN:
 
-            os.makedirs(
-                os.path.dirname(DATA_PATH),
-                exist_ok=True
-            )
+            os.makedirs("data", exist_ok=True)
 
             with open(
-                DATA_PATH,
+                SAVE_PATH,
                 "a",
                 newline=""
             ) as f:

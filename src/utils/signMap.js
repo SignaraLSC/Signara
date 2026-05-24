@@ -46,7 +46,9 @@ const SIGN_FILES = {
   POR_FAVOR: 'por_favor.mp4',
   TENGO_SED: 'tengo_sed.mp4',
   TE_AMO: 'te_amo.mp4',
-  NECESITO_AYUDA: 'necesito_ayuda.mp4'
+  NECESITO_AYUDA: 'necesito_ayuda.mp4',
+  SOMOS: 'somos.mp4',
+  SIGNARA: 'signara.mp4',
 }
 
 let currentAvatarId = 'alex'

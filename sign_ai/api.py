@@ -1,7 +1,7 @@
 """
-Signara ML API
-Servidor FastAPI que expone el modelo LSTM entrenado para predicción
-de señas en tiempo real.
+Signara ML API — GNN + LSTM
+El endpoint /predict acepta el mismo formato de siempre (30 × 1659 features).
+Internamente extrae lh/rh y los convierte al formato GNN (30 × 42 × 4).
 
 Uso:
     cd sign_ai
@@ -13,23 +13,29 @@ import os
 from pathlib import Path
 
 import numpy as np
+import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-import tensorflow as tf
+from core.gnn_model import GCN_LSTM, N_NODES, N_FEATURES, SEQ_LEN
 
-from core.config import (
-    LABEL_PATH,
-    MAX_FEATURES,
-    MODEL_PATH,
-    SEQ_LEN,
-    UMBRAL_CONFIANZA,
-)
+# ─── Rutas ────────────────────────────────────────────────────────────────────
 
-ANIM_DIR = Path(__file__).parent / "animations"
+GNN_MODEL_PATH = "models/signara_gnn.pt"
+GNN_LABEL_PATH = "models/labels_gnn.json"
+ANIM_DIR       = Path(__file__).parent / "animations"
 
-app = FastAPI(title="Signara ML API", version="1.0.0")
+UMBRAL_CONFIANZA = 0.70
+
+# ─── Índices del array flat (orden de extractor.py / InterpretScreen.jsx) ────
+# face(478×3=1434) + pose(33×3=99) + lh(21×3=63) + rh(21×3=63) = 1659
+_LH_START = 1434 + 99         # 1533
+_RH_START = _LH_START + 63   # 1596
+
+# ─── App ──────────────────────────────────────────────────────────────────────
+
+app = FastAPI(title="Signara ML API — GNN", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,7 +44,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_model = None
+_model: GCN_LSTM | None = None
 _labels: list[str] = []
 
 
@@ -46,28 +52,51 @@ _labels: list[str] = []
 async def load_model():
     global _model, _labels
 
-    if not os.path.exists(MODEL_PATH):
-        print(f"⚠  Modelo no encontrado: {MODEL_PATH}")
-        print("   Ejecuta primero: python 02_train.py")
+    if not os.path.exists(GNN_MODEL_PATH):
+        print(f"⚠  Modelo GNN no encontrado: {GNN_MODEL_PATH}")
+        print("   Ejecuta primero: python 06_gnn_train.py")
         return
 
-    if not os.path.exists(LABEL_PATH):
-        print(f"⚠  Labels no encontrados: {LABEL_PATH}")
+    if not os.path.exists(GNN_LABEL_PATH):
+        print(f"⚠  Labels no encontrados: {GNN_LABEL_PATH}")
         return
 
-    _model = tf.keras.models.load_model(MODEL_PATH)
-
-    with open(LABEL_PATH, "r", encoding="utf-8") as f:
+    with open(GNN_LABEL_PATH, "r", encoding="utf-8") as f:
         _labels = json.load(f)
 
-    print(f"✅ Modelo cargado — clases: {_labels}")
+    _model = GCN_LSTM(n_classes=len(_labels))
+    _model.load_state_dict(torch.load(GNN_MODEL_PATH, map_location="cpu"))
+    _model.eval()
+
+    print(f"✅ Modelo GNN cargado — clases: {_labels}")
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def compact_to_gnn(frame_compact: np.ndarray) -> np.ndarray:
+    """
+    Convierte 1 frame compacto de 126 valores (lh 63 + rh 63) al formato GNN (42, 4).
+    Nodos 0-20 = lh (mano=0), nodos 21-41 = rh (mano=1).
+    Features por nodo: [x, y, z, mano]
+    """
+    lh = frame_compact[:63].reshape(21, 3)   # (21, 3)
+    rh = frame_compact[63:].reshape(21, 3)   # (21, 3)
+
+    nodes = np.zeros((N_NODES, N_FEATURES), dtype=np.float32)
+    nodes[:21, :3] = lh
+    nodes[:21,  3] = 0.0
+    nodes[21:, :3] = rh
+    nodes[21:,  3] = 1.0
+
+    return nodes
 
 
 # ─── Schemas ──────────────────────────────────────────────────────────────────
 
 class PredictRequest(BaseModel):
-    # 30 frames × 1659 features (debe coincidir con SEQ_LEN × MAX_FEATURES)
-    landmarks: list[list[float]]
+    # Formato optimizado: 30 frames × 126 valores (lh 63 + rh 63)
+    # Mucho más liviano que los 1659 features originales
+    frames: list[list[float]]
 
 
 class PredictResponse(BaseModel):
@@ -83,16 +112,56 @@ def health():
     return {
         "status": "ok",
         "model_loaded": _model is not None,
+        "model_type": "GNN+LSTM",
         "labels": _labels,
         "seq_len": SEQ_LEN,
-        "max_features": MAX_FEATURES,
         "umbral_confianza": UMBRAL_CONFIANZA,
     }
 
 
+@app.post("/predict", response_model=PredictResponse)
+async def predict(req: PredictRequest):
+    if _model is None or not _labels:
+        raise HTTPException(
+            status_code=503,
+            detail="Modelo no disponible. Ejecuta 06_gnn_train.py primero.",
+        )
+
+    try:
+        data = np.array(req.frames, dtype=np.float32)  # (30, 126)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"Frames inválidos: {exc}")
+
+    if data.shape[0] != SEQ_LEN or data.shape[1] != 126:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Shape esperado ({SEQ_LEN}, 126), recibido {data.shape}.",
+        )
+
+    # Convertir compacto → GNN: (30, 126) → (30, 42, 4)
+    gnn_seq = np.stack([compact_to_gnn(data[i]) for i in range(SEQ_LEN)])  # (30, 42, 4)
+
+    x = torch.FloatTensor(gnn_seq).unsqueeze(0)  # (1, 30, 42, 4)
+
+    with torch.no_grad():
+        logits = _model(x)                          # (1, n_classes)
+        probs  = torch.softmax(logits, dim=1)[0]
+        conf, idx = probs.max(0)
+        confidence = conf.item()
+        prediction = _labels[idx.item()]
+
+    if confidence < UMBRAL_CONFIANZA:
+        return PredictResponse(prediction="", confidence=confidence, is_idle=True)
+
+    return PredictResponse(
+        prediction=prediction,
+        confidence=confidence,
+        is_idle=False,
+    )
+
+
 @app.get("/animations")
 def list_animations():
-    """Devuelve la lista de tokens con animación disponible."""
     if not ANIM_DIR.exists():
         return {"tokens": []}
     tokens = [p.stem for p in ANIM_DIR.glob("*.json")]
@@ -101,53 +170,9 @@ def list_animations():
 
 @app.get("/sign/{token}")
 def get_sign_animation(token: str):
-    """
-    Devuelve los keyframes de MediaPipe para un token de seña.
-    Formato: { token, fps, frames: [{lh, rh, pose}] }
-    """
     token = token.upper()
     path = ANIM_DIR / f"{token}.json"
     if not path.exists():
         raise HTTPException(status_code=404, detail=f"Animación no encontrada: {token}")
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
-
-
-@app.post("/predict", response_model=PredictResponse)
-async def predict(req: PredictRequest):
-    if _model is None or not _labels:
-        raise HTTPException(
-            status_code=503,
-            detail="Modelo no disponible. Ejecuta 02_train.py primero.",
-        )
-
-    try:
-        data = np.array(req.landmarks, dtype=np.float32)
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"Landmarks inválidos: {exc}")
-
-    if data.shape != (SEQ_LEN, MAX_FEATURES):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"Shape esperado ({SEQ_LEN}, {MAX_FEATURES}), "
-                f"recibido {data.shape}. "
-                "Asegúrate de enviar exactamente SEQ_LEN frames con MAX_FEATURES features cada uno."
-            ),
-        )
-
-    input_data = np.expand_dims(data, axis=0)
-    res = _model.predict(input_data, verbose=0)[0]
-
-    idx = int(np.argmax(res))
-    confidence = float(res[idx])
-    prediction = _labels[idx]
-
-    if confidence < UMBRAL_CONFIANZA:
-        return PredictResponse(prediction="", confidence=confidence, is_idle=True)
-
-    return PredictResponse(
-        prediction=prediction,
-        confidence=confidence,
-        is_idle=(prediction == "IDLE"),
-    )

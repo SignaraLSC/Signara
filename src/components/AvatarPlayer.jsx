@@ -1,5 +1,5 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react'
-import { AVATARS, normalizeSign } from '../utils/signMap.js'
+import { AVATARS, normalizeSign, getSignSrc } from '../utils/signMap.js'
 import { resolveSign } from '../utils/signPlayer.js'
 
 /**
@@ -104,11 +104,9 @@ const AvatarPlayer = forwardRef(function AvatarPlayer(
     triedFallbackRef.current = false
 
     if (resolved.type === 'animation') {
-      // 3D avatar animation path — will be activated when the avatar API is ready.
-      // When ready: send resolved.token to resolved.endpoint and animate the avatar.
-      // For now fall back to video if available, otherwise skip.
-      const fallback = resolveSign(sign)
-      if (fallback?.type === 'video') preloadAndSwap(sign, fallback.src)
+      // Modo animación 3D — por ahora reproducir el video local si existe
+      const src = getSignSrc(sign)
+      if (src) preloadAndSwap(sign, src)
       else setTimeout(playNext, 50)
       return
     }
@@ -193,7 +191,7 @@ const AvatarPlayer = forwardRef(function AvatarPlayer(
   function queueAnimation(rawSign) {
     if (!rawSign) return
     const sign = normalizeSign(rawSign)
-    if (!resolveSign(sign)) return  // no video and no animation for this token
+    if (!getSignSrc(sign) && !resolveSign(sign)) return  // no video disponible
     queueRef.current.push(sign)
     refreshQueueLen()
     if (!isPlayingRef.current) playNext()
@@ -217,7 +215,7 @@ const AvatarPlayer = forwardRef(function AvatarPlayer(
   function replaceQueue(newSigns) {
     queueRef.current = (newSigns || [])
       .map(normalizeSign)
-      .filter((s) => Boolean(resolveSign(s)))
+      .filter((s) => Boolean(getSignSrc(s)) || Boolean(resolveSign(s)))
     refreshQueueLen()
     setPlaying(false)
     setCurrentLabel(null)

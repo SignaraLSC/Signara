@@ -3,8 +3,8 @@ import Logo from './Logo.jsx'
 import HandModel3D from './HandModel3D.jsx'
 
 const MEDIAPIPE_HOLISTIC_VER = '0.5.1675471629'
-const MEDIAPIPE_CAM_VER = '0.3.1675466862'
-const MEDIAPIPE_DRAW_VER = '0.3.1675466124'
+const MEDIAPIPE_CAM_VER      = '0.3.1675466862'
+const MEDIAPIPE_DRAW_VER     = '0.3.1675466124'
 
 const MP_SCRIPTS = [
   `https://cdn.jsdelivr.net/npm/@mediapipe/holistic@${MEDIAPIPE_HOLISTIC_VER}/holistic.js`,
@@ -12,21 +12,18 @@ const MP_SCRIPTS = [
   `https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@${MEDIAPIPE_DRAW_VER}/drawing_utils.js`,
 ]
 
-// Heuristic fallback
-const HISTORY_LEN = 20
-const HEURISTIC_COOLDOWN_MS = 1500
+// ── Parámetros ────────────────────────────────────────────────────────────────
+const ML_API_URL     = import.meta.env.VITE_ML_API_URL || 'http://localhost:8000'
+const SEQ_LEN        = 30
+const HAND_COUNT     = 21
+const UMBRAL         = 0.75   // confianza mínima
+const STABILITY_NEED = 2      // predicciones iguales consecutivas para confirmar
+const NO_HAND_RESET  = 20     // frames sin manos para resetear todo
+const SAME_SIGN_WAIT = 20     // frames de cooldown tras confirmar seña
+const MOVEMENT_MIN   = 0.002  // movimiento mínimo por frame para acumular
+const MIN_FRAMES     = 5      // frames mínimos antes de predecir (navegador < 30fps)
 
-// ML pipeline — deben coincidir con sign_ai/core/config.py
-const ML_API_URL = import.meta.env.VITE_ML_API_URL || 'http://localhost:8000'
-const SEQ_LEN = 30
-const MAX_FEATURES = 1659
-const FACE_COUNT = 478   // refine_face_landmarks=True → 478 landmarks (468 + 10 iris)
-const POSE_COUNT = 33
-const HAND_COUNT = 21
-const STABILITY_NEEDED = 3    // predicciones consecutivas iguales para confirmar
-const PREDICT_EVERY = 5       // enviar al API cada N frames (~6 veces/seg a 30fps)
-const ML_COOLDOWN_MS = 600    // cooldown entre señas DISTINTAS
-const SAME_SIGN_COOLDOWN_MS = 2500 // cooldown para REPETIR la misma seña (evita spam al mantener)
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function loadScript(url) {
   return new Promise((resolve, reject) => {
@@ -34,16 +31,14 @@ function loadScript(url) {
     if (s) {
       if (s.getAttribute('data-loaded') === 'true') return resolve()
       s.addEventListener('load', resolve)
-      s.addEventListener('error', () => reject(new Error('Failed to load ' + url)))
+      s.addEventListener('error', () => reject(new Error('Failed: ' + url)))
       return
     }
     s = document.createElement('script')
-    s.src = url
-    s.async = true
-    s.crossOrigin = 'anonymous'
+    s.src = url; s.async = true; s.crossOrigin = 'anonymous'
     s.dataset.signara = url
     s.addEventListener('load', () => { s.setAttribute('data-loaded', 'true'); resolve() })
-    s.addEventListener('error', () => reject(new Error('Failed to load ' + url)))
+    s.addEventListener('error', () => reject(new Error('Failed: ' + url)))
     document.head.appendChild(s)
   })
 }
@@ -53,76 +48,107 @@ async function loadMediaPipe() {
 }
 
 /**
- * Extrae 1659 features de los resultados de MediaPipe Holistic,
- * en el mismo orden que sign_ai/core/extractor.py:
- *   face (478×3) + pose (33×3) + left_hand (21×3) + right_hand (21×3)
+ * Extrae lh (21×3) + rh (21×3) = 126 valores flat.
  *
- * Requiere refineFaceLandmarks: true en holistic.setOptions()
- * para obtener los 478 puntos faciales que el modelo espera.
+ * CORRECCIÓN DE ESPEJO:
+ * En Python, el frame se hace cv2.flip(frame,1) ANTES de MediaPipe, por lo que:
+ *   - Las coordenadas x están invertidas respecto al frame crudo del navegador
+ *   - left_hand_landmarks en Python = mano izquierda ANATÓMICA (la persona)
+ *   - En el navegador (frame crudo sin flip):
+ *       leftHandLandmarks  = mano DERECHA de la persona (cámara ve su izquierda)
+ *       rightHandLandmarks = mano IZQUIERDA de la persona
+ * Fix: intercambiar lh↔rh y aplicar x = 1-x para que coincida con el entrenamiento.
  */
 function extractLandmarks(results) {
-  const flatCoords = (landmarks, count) => {
-    const arr = new Array(count * 3).fill(0)
+  const handCoords = (landmarks) => {
+    const arr = new Array(HAND_COUNT * 3).fill(0)
     if (landmarks && landmarks.length > 0) {
-      const n = Math.min(landmarks.length, count)
+      const n = Math.min(landmarks.length, HAND_COUNT)
       for (let i = 0; i < n; i++) {
-        arr[i * 3]     = landmarks[i]?.x ?? 0
+        arr[i * 3]     = 1.0 - (landmarks[i]?.x ?? 0)  // flip x (espejo Python)
         arr[i * 3 + 1] = landmarks[i]?.y ?? 0
         arr[i * 3 + 2] = landmarks[i]?.z ?? 0
       }
     }
     return arr
   }
+  // Intercambiar: rightHandLandmarks del navegador = mano izquierda anatómica (slot lh)
+  //               leftHandLandmarks  del navegador = mano derecha anatómica  (slot rh)
   return [
-    ...flatCoords(results.faceLandmarks,       FACE_COUNT),  // 1434
-    ...flatCoords(results.poseLandmarks,        POSE_COUNT),  // 99
-    ...flatCoords(results.leftHandLandmarks,    HAND_COUNT),  // 63
-    ...flatCoords(results.rightHandLandmarks,   HAND_COUNT),  // 63
-  ] // total: 1659
+    ...handCoords(results.rightHandLandmarks),  // → slot lh (primeros 63)
+    ...handCoords(results.leftHandLandmarks),   // → slot rh (últimos 63)
+  ]
 }
+
+/**
+ * Movimiento entre dos frames flat (126 valores).
+ * Equivale a: np.abs(a[:, :2] - b[:, :2]).mean() en Python.
+ */
+function movBetween(prev, curr) {
+  let sum = 0, count = 0
+  for (let i = 0; i < 126; i += 3) {
+    sum += Math.abs(curr[i] - prev[i]) + Math.abs(curr[i + 1] - prev[i + 1])
+    count += 2
+  }
+  return sum / count
+}
+
+/**
+ * Pad del buffer al inicio repitiendo el primer frame.
+ * Equivale a: while len(seq) < SEQ_LEN: seq.insert(0, seq[0])
+ */
+function padBuffer(buffer) {
+  const padded = [...buffer]
+  while (padded.length < SEQ_LEN) padded.unshift(padded[0])
+  return padded.slice(-SEQ_LEN)
+}
+
+// ── Componente ────────────────────────────────────────────────────────────────
 
 export default function InterpretScreen({ onBack, onHome }) {
   const videoRef    = useRef(null)
   const canvasRef   = useRef(null)
   const holisticRef = useRef(null)
   const cameraRef   = useRef(null)
+  const handModelRef = useRef(null)
+  const runningRef  = useRef(false)
+  const audioRef    = useRef(true)
 
-  // Heuristic pose tracking
-  const poseHistoryLeftRef  = useRef([])
-  const poseHistoryRightRef = useRef([])
-  const lastDetectionRef    = useRef(0)
-  const runningRef          = useRef(false)
-  const audioRef            = useRef(true)
+  // ── Estado del pipeline (refs = sin re-render innecesario) ─────────────────
+  const landmarkBufferRef = useRef([])   // frames con movimiento, maxlen=SEQ_LEN
+  const predHistRef       = useRef([])   // historial de predicciones para estabilidad
+  const prevFrameRef      = useRef(null) // frame anterior para calcular movimiento
+  const noHandCountRef    = useRef(0)    // frames consecutivos sin manos
+  const cooldownRef       = useRef(0)    // cooldown frame-based (decrementa c/frame)
+  const lastSignRef       = useRef('')   // última seña confirmada (evita repetir)
+  const apiInFlightRef    = useRef(false)
+  const mlAvailableRef    = useRef(false)
+  const sentenceClearRef  = useRef(null)
 
-  // ML pipeline state (refs para acceso dentro del callback de MediaPipe)
-  const landmarkBufferRef   = useRef([])   // buffer circular de 30 frames
-  const frameCountRef       = useRef(0)    // frames procesados desde inicio
-  const mlAvailableRef      = useRef(false)
-  const apiInFlightRef      = useRef(false)
-  const stabilityRef        = useRef({ count: 0, prediction: '' })
-  const lastEmittedSignRef  = useRef('')   // última seña disparada (para cooldown diferenciado)
-  const sentenceClearTimer  = useRef(null)
-  const handModelRef        = useRef(null)
-
-  // UI state
+  // ── UI state ───────────────────────────────────────────────────────────────
   const [scriptsLoaded, setScriptsLoaded] = useState(false)
   const [scriptsError,  setScriptsError]  = useState(null)
   const [cameraOk,      setCameraOk]      = useState(false)
   const [cameraError,   setCameraError]   = useState(null)
   const [running,       setRunning]       = useState(false)
-  const [handVisible,   setHandVisible]   = useState(false)
-  const [latest,        setLatest]        = useState(null)
-  const [history,       setHistory]       = useState([])
-  const [audioOn,       setAudioOn]       = useState(true)
-  const [unrecognized,  setUnrecognized]  = useState(false)
   const [mlMode,        setMlMode]        = useState(false)
   const [mlConnecting,  setMlConnecting]  = useState(false)
-  const [sentence,      setSentence]      = useState([])
+  const [audioOn,       setAudioOn]       = useState(true)
+  const [handVisible,   setHandVisible]   = useState(false)
+  const [bufferLen,     setBufferLen]     = useState(0)
+  const [inCooldown,    setInCooldown]    = useState(false)
+
+  // Display: persiste hasta que las manos desaparezcan NO_HAND_RESET frames
+  const [displaySign, setDisplaySign] = useState('')
+  const [displayConf, setDisplayConf] = useState(0)
+  const [latest,      setLatest]      = useState(null)
+  const [history,     setHistory]     = useState([])
+  const [sentence,    setSentence]    = useState([])
 
   useEffect(() => { runningRef.current = running }, [running])
   useEffect(() => { audioRef.current   = audioOn  }, [audioOn])
 
-  // Verificar si el servidor ML está disponible al montar
+  // Verificar servidor ML
   useEffect(() => {
     let cancelled = false
     setMlConnecting(true)
@@ -144,7 +170,7 @@ export default function InterpretScreen({ onBack, onHome }) {
     return () => { cancelled = true }
   }, [])
 
-  // Cargar scripts MediaPipe
+  // Cargar MediaPipe
   useEffect(() => {
     let cancelled = false
     loadMediaPipe()
@@ -153,7 +179,7 @@ export default function InterpretScreen({ onBack, onHome }) {
     return () => { cancelled = true }
   }, [])
 
-  // Inicializar Holistic + cámara cuando scripts listos
+  // Inicializar Holistic + cámara
   useEffect(() => {
     if (!scriptsLoaded) return
     const HolisticCtor = window.Holistic
@@ -170,11 +196,10 @@ export default function InterpretScreen({ onBack, onHome }) {
         `https://cdn.jsdelivr.net/npm/@mediapipe/holistic@${MEDIAPIPE_HOLISTIC_VER}/${f}`
     })
     holistic.setOptions({
-      modelComplexity:        0,
+      modelComplexity:        1,
       smoothLandmarks:        true,
       enableSegmentation:     false,
-      smoothSegmentation:     false,
-      refineFaceLandmarks:    true,  // debe ser true — el modelo fue entrenado con 478 landmarks faciales
+      refineFaceLandmarks:    false,  // no necesitamos cara
       minDetectionConfidence: 0.5,
       minTrackingConfidence:  0.5,
     })
@@ -200,67 +225,15 @@ export default function InterpretScreen({ onBack, onHome }) {
       ))
 
     return () => {
-      try { camera.stop()   } catch (_) {}
+      try { camera.stop()    } catch (_) {}
       try { holistic.close() } catch (_) {}
       holisticRef.current = null
       cameraRef.current   = null
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scriptsLoaded])
 
-  // ─── Heuristic helpers ──────────────────────────────────────────────────────
-
-  const isFingersClosedExceptIndex = (lms) => {
-    const d = (a, b) => Math.hypot(a.x-b.x, a.y-b.y, a.z-b.z)
-    return (
-      d(lms[8],  lms[0]) > d(lms[6],  lms[0]) &&
-      d(lms[12], lms[0]) < d(lms[10], lms[0]) &&
-      d(lms[16], lms[0]) < d(lms[14], lms[0]) &&
-      d(lms[20], lms[0]) < d(lms[18], lms[0])
-    )
-  }
-
-  const isFist = (lms) => {
-    const d = (a, b) => Math.hypot(a.x-b.x, a.y-b.y, a.z-b.z)
-    return (
-      d(lms[8],  lms[0]) < d(lms[5],  lms[0]) &&
-      d(lms[12], lms[0]) < d(lms[9],  lms[0]) &&
-      d(lms[16], lms[0]) < d(lms[13], lms[0]) &&
-      d(lms[20], lms[0]) < d(lms[17], lms[0])
-    )
-  }
-
-  const isCircularMovement = (hist) => {
-    if (hist.length < 8) return false
-    let minX = 1, maxX = 0, minY = 1, maxY = 0
-    hist.forEach(p => {
-      if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x
-      if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y
-    })
-    const rx = maxX - minX, ry = maxY - minY
-    if (rx < 0.03 || ry < 0.03) return false
-    const ratio = rx / ry
-    return ratio >= 0.25 && ratio <= 4.0
-  }
-
-  // ─── Sentence building ──────────────────────────────────────────────────────
-
-  function triggerRecognition(sign, text, confidence = 0.95) {
-    lastDetectionRef.current = Date.now()
-    poseHistoryLeftRef.current  = []
-    poseHistoryRightRef.current = []
-
-    const detection = { sign, text, confidence }
-    setLatest(detection)
-    setHistory(h => [detection, ...h].slice(0, 8))
-
-    // Acumular en la oración de la conversación (máx 10 palabras visibles)
-    setSentence(prev => [...prev, sign].slice(-10))
-    if (sentenceClearTimer.current) clearTimeout(sentenceClearTimer.current)
-    sentenceClearTimer.current = setTimeout(() => setSentence([]), 5000)
-
-    speak(text)
-  }
-
+  // ── Voz ───────────────────────────────────────────────────────────────────
   function speak(text) {
     if (!audioRef.current || !text) return
     if (!window?.speechSynthesis) return
@@ -272,8 +245,19 @@ export default function InterpretScreen({ onBack, onHome }) {
     } catch (e) { console.warn(e) }
   }
 
-  // ─── Main MediaPipe callback ─────────────────────────────────────────────────
+  // ── Confirmar seña ────────────────────────────────────────────────────────
+  function triggerRecognition(sign, confidence) {
+    const text = sign.replace(/_/g, ' ')
+    const det  = { sign, text, confidence }
+    setLatest(det)
+    setHistory(h => [det, ...h].slice(0, 8))
+    setSentence(prev => [...prev, sign].slice(-10))
+    if (sentenceClearRef.current) clearTimeout(sentenceClearRef.current)
+    sentenceClearRef.current = setTimeout(() => setSentence([]), 6000)
+    speak(text)
+  }
 
+  // ── Callback principal de MediaPipe ───────────────────────────────────────
   function handleResults(results) {
     const canvas = canvasRef.current
     const video  = videoRef.current
@@ -285,272 +269,155 @@ export default function InterpretScreen({ onBack, onHome }) {
     ctx.save()
     ctx.clearRect(0, 0, canvas.width, canvas.height)
 
-    const hasLeftHand  = !!results.leftHandLandmarks
-    const hasRightHand = !!results.rightHandLandmarks
-    const hasFace      = !!results.faceLandmarks
-    const hasPose      = !!results.poseLandmarks
+    const hasLeft  = !!results.leftHandLandmarks
+    const hasRight = !!results.rightHandLandmarks
+    const hasHands = hasLeft || hasRight
 
-    // Dibujar esqueleto
+    // ── Solo dibuja las manos (igual que 07_gnn_predict.py) ─────────────────
     if (window.drawConnectors && window.drawLandmarks) {
-      if (hasPose) {
-        window.drawConnectors(ctx, results.poseLandmarks, window.POSE_CONNECTIONS,
-          { color: '#00FF00', lineWidth: 4 })
-        window.drawLandmarks(ctx, results.poseLandmarks,
-          { color: '#FF0000', lineWidth: 2 })
-      }
-      if (hasFace) {
-        window.drawConnectors(ctx, results.faceLandmarks, window.FACEMESH_TESSELATION,
-          { color: '#C0C0C070', lineWidth: 1 })
-        window.drawConnectors(ctx, results.faceLandmarks, window.FACEMESH_RIGHT_EYE,     { color: '#FF3030' })
-        window.drawConnectors(ctx, results.faceLandmarks, window.FACEMESH_RIGHT_EYEBROW, { color: '#FF3030' })
-        window.drawConnectors(ctx, results.faceLandmarks, window.FACEMESH_LEFT_EYE,      { color: '#30FF30' })
-        window.drawConnectors(ctx, results.faceLandmarks, window.FACEMESH_LEFT_EYEBROW,  { color: '#30FF30' })
-        window.drawConnectors(ctx, results.faceLandmarks, window.FACEMESH_FACE_OVAL,     { color: '#E0E0E0' })
-        window.drawConnectors(ctx, results.faceLandmarks, window.FACEMESH_LIPS,          { color: '#E0E0E0' })
-      }
-      if (hasRightHand) {
-        window.drawConnectors(ctx, results.rightHandLandmarks, window.HAND_CONNECTIONS,
-          { color: '#9333ea', lineWidth: 5 })
-        window.drawLandmarks(ctx, results.rightHandLandmarks,
-          { color: '#3b82f6', lineWidth: 2, radius: 4 })
-      }
-      if (hasLeftHand) {
+      if (hasLeft) {
         window.drawConnectors(ctx, results.leftHandLandmarks, window.HAND_CONNECTIONS,
-          { color: '#3b82f6', lineWidth: 5 })
+          { color: '#3b82f6', lineWidth: 4 })
         window.drawLandmarks(ctx, results.leftHandLandmarks,
-          { color: '#9333ea', lineWidth: 2, radius: 4 })
+          { color: '#60a5fa', lineWidth: 2, radius: 4 })
+      }
+      if (hasRight) {
+        window.drawConnectors(ctx, results.rightHandLandmarks, window.HAND_CONNECTIONS,
+          { color: '#9333ea', lineWidth: 4 })
+        window.drawLandmarks(ctx, results.rightHandLandmarks,
+          { color: '#c084fc', lineWidth: 2, radius: 4 })
       }
     }
 
-    if (hasLeftHand || hasRightHand) {
-      const now = Date.now()
+    ctx.restore()
 
-      if (hasLeftHand) {
-        const lms   = results.leftHandLandmarks
-        const wrist = lms[0]
-        const size  = Math.hypot(lms[0].x - lms[9].x, lms[0].y - lms[9].y)
-        poseHistoryLeftRef.current.push({ x: wrist.x, y: wrist.y, s: size, lms })
-        if (poseHistoryLeftRef.current.length > HISTORY_LEN) poseHistoryLeftRef.current.shift()
-      } else {
-        poseHistoryLeftRef.current = []
-      }
-
-      if (hasRightHand) {
-        const lms   = results.rightHandLandmarks
-        const wrist = lms[0]
-        const size  = Math.hypot(lms[0].x - lms[9].x, lms[0].y - lms[9].y)
-        poseHistoryRightRef.current.push({ x: wrist.x, y: wrist.y, s: size, lms })
-        if (poseHistoryRightRef.current.length > HISTORY_LEN) poseHistoryRightRef.current.shift()
-      } else {
-        poseHistoryRightRef.current = []
-      }
-
-      if (runningRef.current) {
-
-        // ── ML PIPELINE ────────────────────────────────────────────────────────
-        // Extraer landmarks y acumular buffer de 30 frames
-        const frame = extractLandmarks(results)
-        landmarkBufferRef.current.push(frame)
-        if (landmarkBufferRef.current.length > SEQ_LEN) landmarkBufferRef.current.shift()
-
-        frameCountRef.current++
-
-        // Enviar al API cada PREDICT_EVERY frames, una vez que el buffer esté lleno
-        if (
-          mlAvailableRef.current &&
-          landmarkBufferRef.current.length === SEQ_LEN &&
-          frameCountRef.current % PREDICT_EVERY === 0 &&
-          !apiInFlightRef.current
-        ) {
-          const bufferCopy = landmarkBufferRef.current.map(f => [...f])
-          apiInFlightRef.current = true
-
-          ;(async () => {
-            try {
-              const resp = await fetch(`${ML_API_URL}/predict`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ landmarks: bufferCopy }),
-              })
-              if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
-
-              const { prediction, confidence, is_idle } = await resp.json()
-
-              if (!is_idle && prediction) {
-                const s = stabilityRef.current
-                if (prediction === s.prediction) {
-                  s.count++
-                } else {
-                  s.count = 1
-                  s.prediction = prediction
-                }
-                if (s.count >= STABILITY_NEEDED) {
-                  const isSameSign = prediction === lastEmittedSignRef.current
-                  const requiredCooldown = isSameSign ? SAME_SIGN_COOLDOWN_MS : ML_COOLDOWN_MS
-                  if (now - lastDetectionRef.current > requiredCooldown) {
-                    lastEmittedSignRef.current = prediction
-                    triggerRecognition(prediction, prediction, confidence)
-                    stabilityRef.current = { count: 0, prediction: '' }
-                  }
-                }
-              } else {
-                // No hay seña clara — resetear contador de estabilidad
-                stabilityRef.current = { count: 0, prediction: '' }
-              }
-            } catch {
-              // API no disponible — cambiar a modo heurístico
-              mlAvailableRef.current = false
-              setMlMode(false)
-            } finally {
-              apiInFlightRef.current = false
-            }
-          })()
-        }
-
-        // ── HEURISTIC FALLBACK (solo si ML no disponible) ──────────────────────
-        if (!mlAvailableRef.current) {
-          const canDetect = now - lastDetectionRef.current > HEURISTIC_COOLDOWN_MS
-          let fired = false
-
-          // YO — índice apuntando hacia el cuerpo
-          if (canDetect && !fired) {
-            const checkYo = (buf) => {
-              if (buf.length < 6) return false
-              const first = buf[0], last = buf[buf.length - 1]
-              return (
-                isFingersClosedExceptIndex(last.lms) &&
-                last.lms[8].z > last.lms[5].z &&
-                ((last.s - first.s) < 0 || Math.abs(last.x - first.x) > 0.01 || Math.abs(last.y - first.y) > 0.01)
-              )
-            }
-            if (checkYo(poseHistoryRightRef.current) || checkYo(poseHistoryLeftRef.current)) {
-              triggerRecognition('YO', 'Yo'); fired = true
-            }
-          }
-
-          // TÚ — índice apuntando a la cámara
-          if (canDetect && !fired) {
-            const checkTu = (buf) => {
-              if (buf.length < 8) return false
-              const d3 = (a, b) => Math.hypot(a.x-b.x, a.y-b.y, a.z-b.z)
-              let valid = 0
-              for (const fr of buf.slice(-8)) {
-                const l = fr.lms
-                if (
-                  d3(l[8],l[0])>d3(l[6],l[0]) &&
-                  d3(l[12],l[0])<d3(l[10],l[0]) &&
-                  d3(l[16],l[0])<d3(l[14],l[0]) &&
-                  d3(l[20],l[0])<d3(l[18],l[0]) &&
-                  l[8].z < l[5].z - 0.01
-                ) valid++
-              }
-              const f = buf[0], la = buf[buf.length-1]
-              return valid >= 5 && Math.abs(la.x-f.x) < 0.12 && Math.abs(la.y-f.y) < 0.12
-            }
-            if (checkTu(poseHistoryRightRef.current)) {
-              triggerRecognition('TÚ', 'Tú'); fired = true
-            }
-          }
-
-          // GRACIAS — mano cerca de la boca moviéndose en X
-          if (canDetect && !fired && poseHistoryRightRef.current.length >= 6 && hasFace) {
-            const buf  = poseHistoryRightRef.current
-            const f    = buf[0], la = buf[buf.length-1]
-            const mouth = results.faceLandmarks[14]
-            if (
-              Math.abs(f.x - mouth.x) < 0.15 && Math.abs(f.y - mouth.y) < 0.15 &&
-              Math.abs(la.x - f.x) > 0.05 && Math.abs(la.y - f.y) < 0.15
-            ) { triggerRecognition('GRACIAS', 'Gracias'); fired = true }
-          }
-
-          // SÍ — puño asintiendo verticalmente
-          if (canDetect && !fired) {
-            const checkSi = (buf) => {
-              if (buf.length < 8) return false
-              let closed = 0
-              for (const fr of buf) { if (isFist(fr.lms)) closed++ }
-              if (closed < buf.length * 0.6) return false
-              let minY=1, maxY=0, minX=1, maxX=0
-              for (const fr of buf) {
-                const k = fr.lms[5]
-                if (k.y<minY) minY=k.y; if (k.y>maxY) maxY=k.y
-                if (k.x<minX) minX=k.x; if (k.x>maxX) maxX=k.x
-              }
-              const ry = maxY-minY, rx = maxX-minX
-              return ry > 0.04 && ry > rx*1.5 && buf[0].y > 0.2
-            }
-            if (checkSi(poseHistoryRightRef.current) || checkSi(poseHistoryLeftRef.current)) {
-              triggerRecognition('SÍ', 'Sí'); fired = true
-            }
-          }
-
-          // POR FAVOR — movimiento circular debajo del rostro
-          if (canDetect && !fired && hasPose) {
-            const checkPorFavor = (buf) => {
-              if (buf.length < 6) return false
-              const f = buf[0], la = buf[buf.length-1]
-              let boundaryY = 0.5
-              if (results.faceLandmarks?.[152]) boundaryY = results.faceLandmarks[152].y
-              else if (results.poseLandmarks?.[11] && results.poseLandmarks?.[12])
-                boundaryY = Math.min(results.poseLandmarks[11].y, results.poseLandmarks[12].y) - 0.05
-              return f.y > boundaryY && la.y > boundaryY && isCircularMovement(buf) && Math.abs(la.x-f.x) < 0.12
-            }
-            if (checkPorFavor(poseHistoryRightRef.current) || checkPorFavor(poseHistoryLeftRef.current)) {
-              triggerRecognition('POR FAVOR', 'Por favor'); fired = true
-            }
-          }
-
-          // HOLA — barrido horizontal con mano izquierda
-          if (canDetect && !fired && poseHistoryLeftRef.current.length >= 6) {
-            const buf = poseHistoryLeftRef.current
-            const f = buf[0], la = buf[buf.length-1]
-            const mx = la.x-f.x, my = la.y-f.y
-            if (Math.abs(mx)>Math.abs(my)*1.5 && mx>0.06 && Math.abs(my)<0.15) {
-              triggerRecognition('HOLA', 'Hola'); fired = true
-            }
-          }
-
-          // Movimiento no reconocido
-          if (!fired && now - lastDetectionRef.current > HEURISTIC_COOLDOWN_MS) {
-            const sig = (buf) => {
-              if (buf.length < 10) return false
-              return Math.abs(buf[buf.length-1].x-buf[0].x) > 0.15 || Math.abs(buf[buf.length-1].y-buf[0].y) > 0.15
-            }
-            if (sig(poseHistoryLeftRef.current) || sig(poseHistoryRightRef.current)) {
-              setUnrecognized(true)
-              setTimeout(() => setUnrecognized(false), 800)
-              poseHistoryLeftRef.current  = []
-              poseHistoryRightRef.current = []
-            }
-          }
-        }
-      }
-    } else {
-      poseHistoryLeftRef.current  = []
-      poseHistoryRightRef.current = []
-    }
-
-    setHandVisible(hasLeftHand || hasRightHand)
-
-    // Actualizar modelo 3D en tiempo real (sin causar re-render de React)
+    // Actualizar modelo 3D
     handModelRef.current?.update(
       results.leftHandLandmarks  ?? null,
       results.rightHandLandmarks ?? null
     )
 
-    ctx.restore()
+    setHandVisible(hasHands)
+
+    // ── Cooldown frame-based (decrementa cada frame) ─────────────────────────
+    if (cooldownRef.current > 0) {
+      cooldownRef.current--
+      setInCooldown(cooldownRef.current > 0)
+    }
+
+    // ── Sin manos ────────────────────────────────────────────────────────────
+    if (!hasHands) {
+      noHandCountRef.current++
+      if (noHandCountRef.current >= NO_HAND_RESET) {
+        // Reset completo — igual que Python
+        landmarkBufferRef.current = []
+        predHistRef.current       = []
+        prevFrameRef.current      = null
+        lastSignRef.current       = ''
+        cooldownRef.current       = 0
+        setDisplaySign('')
+        setDisplayConf(0)
+        setBufferLen(0)
+        setInCooldown(false)
+      }
+      prevFrameRef.current = null
+      return
+    }
+
+    // ── Con manos ────────────────────────────────────────────────────────────
+    noHandCountRef.current = 0
+
+    const currFrame = extractLandmarks(results)
+
+    // Calcular movimiento respecto al frame anterior
+    let mov = 0
+    if (prevFrameRef.current !== null) {
+      mov = movBetween(prevFrameRef.current, currFrame)
+    }
+    prevFrameRef.current = currFrame
+
+    // Solo acumular frames con movimiento real (≥ MOVEMENT_MIN)
+    if (mov >= MOVEMENT_MIN) {
+      landmarkBufferRef.current.push(currFrame)
+      if (landmarkBufferRef.current.length > SEQ_LEN) {
+        landmarkBufferRef.current.shift()
+      }
+    }
+
+    const n = landmarkBufferRef.current.length
+    setBufferLen(n)
+
+    // ── Predecir cuando hay frames suficientes ───────────────────────────────
+    if (
+      runningRef.current &&
+      mlAvailableRef.current &&
+      n >= MIN_FRAMES &&
+      cooldownRef.current === 0 &&
+      !apiInFlightRef.current
+    ) {
+      const bufferCopy = padBuffer([...landmarkBufferRef.current])
+      apiInFlightRef.current = true
+
+      ;(async () => {
+        try {
+          const resp = await fetch(`${ML_API_URL}/predict`, {
+            method:  'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body:    JSON.stringify({ frames: bufferCopy }),
+          })
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+
+          const { prediction, confidence, is_idle } = await resp.json()
+
+          if (!is_idle && prediction && confidence >= UMBRAL) {
+            predHistRef.current.push(prediction)
+            if (predHistRef.current.length > STABILITY_NEED) {
+              predHistRef.current.shift()
+            }
+
+            // Confirmar si STABILITY_NEED consecutivas iguales y seña nueva
+            if (
+              predHistRef.current.length >= STABILITY_NEED &&
+              new Set(predHistRef.current).size === 1 &&
+              prediction !== lastSignRef.current
+            ) {
+              lastSignRef.current       = prediction
+              cooldownRef.current       = SAME_SIGN_WAIT
+              landmarkBufferRef.current = []   // limpiar buffer tras confirmación
+              predHistRef.current       = []
+
+              setDisplaySign(prediction)
+              setDisplayConf(confidence)
+              setBufferLen(0)
+              setInCooldown(true)
+
+              triggerRecognition(prediction, confidence)
+            }
+          } else {
+            // is_idle o baja confianza → resetear historial de estabilidad
+            predHistRef.current = []
+          }
+        } catch {
+          mlAvailableRef.current = false
+          setMlMode(false)
+        } finally {
+          apiInFlightRef.current = false
+        }
+      })()
+    }
   }
 
-  // ─── Controls ───────────────────────────────────────────────────────────────
-
+  // ── Controles ─────────────────────────────────────────────────────────────
   function startDetect() {
-    poseHistoryLeftRef.current  = []
-    poseHistoryRightRef.current = []
-    landmarkBufferRef.current   = []
-    frameCountRef.current       = 0
-    stabilityRef.current        = { count: 0, prediction: '' }
-    lastDetectionRef.current    = 0
-    lastEmittedSignRef.current  = ''
+    landmarkBufferRef.current = []
+    predHistRef.current       = []
+    prevFrameRef.current      = null
+    noHandCountRef.current    = 0
+    cooldownRef.current       = 0
+    lastSignRef.current       = ''
+    apiInFlightRef.current    = false
+    setBufferLen(0)
+    setInCooldown(false)
     setRunning(true)
   }
 
@@ -560,17 +427,21 @@ export default function InterpretScreen({ onBack, onHome }) {
   }
 
   const handleReset = useCallback(() => {
+    landmarkBufferRef.current = []
+    predHistRef.current       = []
+    prevFrameRef.current      = null
+    noHandCountRef.current    = 0
+    cooldownRef.current       = 0
+    lastSignRef.current       = ''
+    apiInFlightRef.current    = false
     setLatest(null)
     setHistory([])
     setSentence([])
-    poseHistoryLeftRef.current  = []
-    poseHistoryRightRef.current = []
-    landmarkBufferRef.current   = []
-    frameCountRef.current       = 0
-    stabilityRef.current        = { count: 0, prediction: '' }
-    lastDetectionRef.current    = 0
-    lastEmittedSignRef.current  = ''
-    if (sentenceClearTimer.current) clearTimeout(sentenceClearTimer.current)
+    setDisplaySign('')
+    setDisplayConf(0)
+    setBufferLen(0)
+    setInCooldown(false)
+    if (sentenceClearRef.current) clearTimeout(sentenceClearRef.current)
     window?.speechSynthesis?.cancel()
   }, [])
 
@@ -591,16 +462,18 @@ export default function InterpretScreen({ onBack, onHome }) {
       })
   }
 
+  // ── Status HUD — igual al texto del script Python ─────────────────────────
   const statusLabel = (() => {
-    if (!running)      return cameraOk ? 'Listo' : 'En espera'
-    if (!handVisible)  return 'Esperando mano...'
-    if (unrecognized)  return 'No reconocido'
-    if (mlMode)        return 'IA interpretando...'
-    return 'Detectando movimiento...'
+    if (!running)                 return cameraOk ? 'Listo' : 'En espera'
+    if (!mlMode)                  return '⚠ Servidor IA no conectado'
+    if (!handVisible)             return 'Muestra una mano'
+    if (displaySign && inCooldown) return `${displaySign.replace(/_/g, ' ')} · ${Math.round(displayConf * 100)}%`
+    if (bufferLen >= MIN_FRAMES)  return 'Detectando...'
+    if (bufferLen > 0)            return `Moviendo... ${bufferLen}/${MIN_FRAMES}`
+    return 'Haz la seña'
   })()
 
-  // ─── Render ─────────────────────────────────────────────────────────────────
-
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
     <section className="min-h-screen flex flex-col px-4 sm:px-6 py-6 max-w-6xl mx-auto">
       <header className="flex items-center justify-between mb-6">
@@ -614,18 +487,18 @@ export default function InterpretScreen({ onBack, onHome }) {
         </button>
 
         <div className="flex items-center gap-3">
-          {/* Indicador de modo ML */}
           <button
             onClick={!mlMode && !mlConnecting ? retryMlConnection : undefined}
-            className={'flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/10 border border-white/20 text-xs ' + (!mlMode && !mlConnecting ? 'cursor-pointer hover:bg-white/20 transition' : 'cursor-default')}
+            className={'flex items-center gap-2 px-3 py-1.5 rounded-full bg-white/10 border border-white/20 text-xs ' +
+              (!mlMode && !mlConnecting ? 'cursor-pointer hover:bg-white/20 transition' : 'cursor-default')}
             title={!mlMode && !mlConnecting ? 'Reintentar conexión con IA' : undefined}
           >
             <span className={`inline-block h-2 w-2 rounded-full ${
-              mlConnecting   ? 'bg-yellow-300 animate-pulse' :
-              mlMode         ? 'bg-blue-400 animate-pulse'   : 'bg-white/40'
+              mlConnecting ? 'bg-yellow-300 animate-pulse' :
+              mlMode       ? 'bg-blue-400 animate-pulse'   : 'bg-white/40'
             }`} />
             <span className="text-white/80">
-              {mlConnecting ? 'Conectando...' : mlMode ? 'Modo IA' : 'Modo básico'}
+              {mlConnecting ? 'Conectando...' : mlMode ? 'Modo IA' : 'Sin conexión'}
             </span>
           </button>
 
@@ -656,12 +529,12 @@ export default function InterpretScreen({ onBack, onHome }) {
 
             {!scriptsLoaded && !scriptsError && (
               <div className="absolute inset-0 flex items-center justify-center text-white/80 text-sm">
-                Cargando MediaPipe Holistic...
+                Cargando MediaPipe...
               </div>
             )}
             {scriptsError && (
               <div className="absolute inset-0 flex flex-col items-center justify-center text-center text-white p-6">
-                <p className="font-semibold text-lg">No se pudo cargar MediaPipe</p>
+                <p className="font-semibold text-lg">Error cargando MediaPipe</p>
                 <p className="mt-2 text-sm text-white/80">{scriptsError}</p>
               </div>
             )}
@@ -677,17 +550,51 @@ export default function InterpretScreen({ onBack, onHome }) {
               </div>
             )}
 
-            {/* Status badge */}
-            <div className="absolute top-3 left-3 flex items-center gap-2 px-3 py-1.5 rounded-full bg-black/55 backdrop-blur text-white text-xs">
+            {/* Status badge — top left */}
+            <div className="absolute top-3 left-3 flex items-center gap-2 px-3 py-1.5 rounded-full bg-black/55 backdrop-blur text-white text-xs font-medium">
               <span className={'inline-block h-2 w-2 rounded-full ' +
                 (running ? 'bg-red-400 animate-pulse' : cameraOk ? 'bg-green-400' : 'bg-white/60')} />
               {statusLabel}
             </div>
 
-            {/* Última seña detectada */}
-            {latest && (
-              <div className="absolute bottom-3 left-1/2 -translate-x-1/2 px-5 py-2 rounded-full bg-white/95 backdrop-blur text-signara-navy font-bold tracking-wide shadow-soft text-sm">
-                {latest.sign} · {Math.round((latest.confidence || 0) * 100)}%
+            {/* Barra de progreso de frames — solo visible cuando hay movimiento */}
+            {running && mlMode && handVisible && bufferLen > 0 && !inCooldown && (
+              <div className="absolute top-3 right-3 flex items-center gap-2 px-3 py-1.5 rounded-full bg-black/55 backdrop-blur text-white text-xs">
+                <div className="w-16 h-1.5 rounded-full bg-white/20 overflow-hidden">
+                  <div
+                    className="h-full rounded-full transition-all duration-100"
+                    style={{
+                      width: `${Math.min(100, (bufferLen / MIN_FRAMES) * 100)}%`,
+                      background: bufferLen >= MIN_FRAMES ? '#4ade80' : '#facc15'
+                    }}
+                  />
+                </div>
+                <span className="tabular-nums">{bufferLen}/{MIN_FRAMES}</span>
+              </div>
+            )}
+
+            {/* Overlay cuando API no conectada */}
+            {running && !mlMode && !mlConnecting && (
+              <div className="absolute inset-0 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+                <div className="text-center text-white px-6">
+                  <p className="text-2xl mb-2">⚠️</p>
+                  <p className="font-bold text-lg">Servidor IA no conectado</p>
+                  <p className="text-sm text-white/70 mt-1">Ejecuta en una terminal:</p>
+                  <code className="block mt-2 bg-black/50 rounded-lg px-4 py-2 text-xs text-green-300 font-mono">
+                    cd sign_ai &amp;&amp; uvicorn api:app --port 8000
+                  </code>
+                  <button onClick={retryMlConnection}
+                    className="mt-4 px-4 py-2 bg-white/20 hover:bg-white/30 rounded-full text-sm font-semibold transition">
+                    Reintentar
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Seña detectada — bottom center, persiste hasta reset */}
+            {displaySign && (
+              <div className="absolute bottom-3 left-1/2 -translate-x-1/2 px-5 py-2 rounded-full bg-white/95 backdrop-blur text-signara-navy font-bold tracking-wide shadow-soft text-sm whitespace-nowrap">
+                {displaySign.replace(/_/g, ' ')} · {Math.round(displayConf * 100)}%
               </div>
             )}
           </div>
@@ -696,7 +603,7 @@ export default function InterpretScreen({ onBack, onHome }) {
           <div className="flex flex-wrap items-center gap-3">
             {!running ? (
               <button onClick={startDetect} disabled={!cameraOk}
-                className="btn-primary py-2.5 px-5 text-sm disabled:opacity-50">
+                className="btn-primary py-2.5 px-5 text-sm disabled:opacity-50 inline-flex items-center gap-2">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
                   stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                   <polygon points="5 3 19 12 5 21 5 3" />
@@ -704,7 +611,8 @@ export default function InterpretScreen({ onBack, onHome }) {
                 Empezar a interpretar
               </button>
             ) : (
-              <button onClick={stopDetect} className="btn-primary py-2.5 px-5 text-sm">
+              <button onClick={stopDetect}
+                className="btn-primary py-2.5 px-5 text-sm inline-flex items-center gap-2">
                 <svg width="16" height="16" viewBox="0 0 24 24" fill="none"
                   stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
                   <rect x="6" y="6" width="12" height="12" rx="2" />
@@ -719,14 +627,14 @@ export default function InterpretScreen({ onBack, onHome }) {
             </label>
           </div>
 
-          {/* Panel de conversación — se llena a medida que se detectan señas */}
+          {/* Oración acumulada */}
           {sentence.length > 0 && (
             <div className="glass-card p-4">
               <p className="text-[10px] font-bold uppercase tracking-[0.3em] text-signara-purple">
                 Conversación
               </p>
               <p className="mt-2 text-signara-navy text-xl font-bold leading-relaxed tracking-wide">
-                {sentence.join(' ')}
+                {sentence.map(s => s.replace(/_/g, ' ')).join(' ')}
               </p>
             </div>
           )}
@@ -753,8 +661,9 @@ export default function InterpretScreen({ onBack, onHome }) {
             </p>
             {latest ? (
               <div className="mt-2">
-                <p className="text-3xl font-extrabold gradient-text">{latest.sign}</p>
-                <p className="mt-1 text-signara-navy text-lg leading-relaxed">{latest.text}</p>
+                <p className="text-3xl font-extrabold gradient-text">
+                  {latest.sign.replace(/_/g, ' ')}
+                </p>
                 <p className="mt-2 text-xs text-signara-navy/60">
                   Confianza: {Math.round((latest.confidence || 0) * 100)}%
                 </p>
@@ -767,7 +676,7 @@ export default function InterpretScreen({ onBack, onHome }) {
           </div>
 
           {/* Historial */}
-          <div className="glass-card p-5 flex-1 min-h-[200px]">
+          <div className="glass-card p-5 flex-1 min-h-[180px]">
             <p className="text-[10px] font-bold uppercase tracking-[0.3em] text-signara-purple">
               Historial
             </p>
@@ -777,9 +686,8 @@ export default function InterpretScreen({ onBack, onHome }) {
               <ul className="mt-3 space-y-2">
                 {history.map((h, i) => (
                   <li key={i} className="flex items-baseline gap-3">
-                    <span className="chip">{h.sign}</span>
-                    <span className="text-signara-navy/80 text-sm flex-1">{h.text}</span>
-                    <span className="text-[11px] text-signara-navy/50">
+                    <span className="chip">{h.sign.replace(/_/g, ' ')}</span>
+                    <span className="text-[11px] text-signara-navy/50 ml-auto">
                       {Math.round((h.confidence || 0) * 100)}%
                     </span>
                   </li>
@@ -787,14 +695,11 @@ export default function InterpretScreen({ onBack, onHome }) {
               </ul>
             )}
           </div>
-
         </div>
       </div>
 
       <footer className="mt-6 text-center text-xs text-white/60">
-        {mlMode
-          ? 'Reconocimiento con IA · LSTM + MediaPipe Holistic'
-          : 'Reconocimiento básico · MediaPipe Holistic'}
+        {mlMode ? 'GNN + LSTM · solo manos · MediaPipe' : 'Reconocimiento con IA · GNN + LSTM'}
       </footer>
     </section>
   )

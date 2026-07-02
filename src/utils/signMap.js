@@ -98,30 +98,3 @@ export function getSignSrc(sign) {
   const avatar = getCurrentAvatar()
   return `${avatar.folder}/${file}`
 }
-
-/**
- * Back-compat export: the previous signMap object. Resolves against the
- * currently-active avatar at access time via a Proxy, so any code that
- * imports `signMap` directly keeps working.
- */
-export const signMap = new Proxy(
-  {},
-  {
-    get(_target, prop) {
-      if (typeof prop !== 'string') return undefined
-      return getSignSrc(prop)
-    },
-    has(_target, prop) {
-      return typeof prop === 'string' && getSignSrc(prop) !== null
-    },
-    ownKeys() {
-      return Object.keys(SIGN_FILES)
-    },
-    getOwnPropertyDescriptor(_target, prop) {
-      if (typeof prop !== 'string') return undefined
-      const value = getSignSrc(prop)
-      if (value === null) return undefined
-      return { enumerable: true, configurable: true, value }
-    }
-  }
-)

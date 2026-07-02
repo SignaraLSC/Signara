@@ -7,10 +7,11 @@ export default defineConfig({
     port: 5173,
     open: true,
     proxy: {
-      '/api': {
-        target: 'http://localhost:3001',
-        changeOrigin: true
-      }
-    }
-  }
+      '/api/pose': {
+        target: 'https://us-central1-sign-mt.cloudfunctions.net',
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api\/pose/, '/spoken_text_to_signed_pose'),
+      },
+    },
+  },
 })

@@ -18,15 +18,19 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from core.gnn_model import GCN_LSTM, N_NODES, N_FEATURES, SEQ_LEN
+from core.gnn_model import GCN_LSTM, SEQ_LEN
+from core.confusion import evaluate_prediction
+from core.preprocess import sequence_compact_to_gnn
 
 # ─── Rutas ────────────────────────────────────────────────────────────────────
 
 GNN_MODEL_PATH = "models/signara_gnn.pt"
 GNN_LABEL_PATH = "models/labels_gnn.json"
+GNN_META_PATH  = "models/signara_gnn_meta.json"
 ANIM_DIR       = Path(__file__).parent / "animations"
 
-UMBRAL_CONFIANZA = 0.70
+UMBRAL_CONFIANZA = float(os.getenv("SIGNARA_UMBRAL", "0.75"))
+MARGEN_TOP2      = float(os.getenv("SIGNARA_MARGEN_TOP2", "0.16"))
 
 # ─── App ──────────────────────────────────────────────────────────────────────
 
@@ -41,11 +45,19 @@ app.add_middleware(
 
 _model: GCN_LSTM | None = None
 _labels: list[str] = []
+_normalize_inputs = False
+
+
+def _load_meta() -> dict:
+    if not os.path.exists(GNN_META_PATH):
+        return {}
+    with open(GNN_META_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
 @app.on_event("startup")
 async def load_model():
-    global _model, _labels
+    global _model, _labels, _normalize_inputs
 
     if not os.path.exists(GNN_MODEL_PATH):
         print(f"⚠  Modelo GNN no encontrado: {GNN_MODEL_PATH}")
@@ -58,30 +70,15 @@ async def load_model():
     with open(GNN_LABEL_PATH, "r", encoding="utf-8") as f:
         _labels = json.load(f)
 
+    meta = _load_meta()
+    _normalize_inputs = bool(meta.get("normalize_inputs", False))
+
     _model = GCN_LSTM(n_classes=len(_labels))
     _model.load_state_dict(torch.load(GNN_MODEL_PATH, map_location="cpu"))
     _model.eval()
 
     print(f"✅ Modelo GNN cargado — clases: {_labels}")
-
-
-# ─── Helpers ──────────────────────────────────────────────────────────────────
-
-def compact_to_gnn(frame_compact: np.ndarray) -> np.ndarray:
-    """
-    Convierte 1 frame compacto de 126 valores (lh 63 + rh 63) al formato GNN (42, 4).
-    Nodos 0-20 = lh (mano=0), nodos 21-41 = rh (mano=1).
-    """
-    lh = frame_compact[:63].reshape(21, 3)
-    rh = frame_compact[63:].reshape(21, 3)
-
-    nodes = np.zeros((N_NODES, N_FEATURES), dtype=np.float32)
-    nodes[:21, :3] = lh
-    nodes[:21,  3] = 0.0
-    nodes[21:, :3] = rh
-    nodes[21:,  3] = 1.0
-
-    return nodes
+    print(f"   Normalización: {_normalize_inputs} | umbral: {UMBRAL_CONFIANZA} | margen top2: {MARGEN_TOP2}")
 
 
 # ─── Schemas ──────────────────────────────────────────────────────────────────
@@ -108,6 +105,8 @@ def health():
         "labels": _labels,
         "seq_len": SEQ_LEN,
         "umbral_confianza": UMBRAL_CONFIANZA,
+        "margen_top2": MARGEN_TOP2,
+        "normalize_inputs": _normalize_inputs,
     }
 
 
@@ -130,19 +129,20 @@ async def predict(req: PredictRequest):
             detail=f"Shape esperado ({SEQ_LEN}, 126), recibido {data.shape}.",
         )
 
-    # (30, 126) → (30, 42, 4)
-    gnn_seq = np.stack([compact_to_gnn(data[i]) for i in range(SEQ_LEN)])
+    gnn_seq = sequence_compact_to_gnn(data, normalize=_normalize_inputs)
 
-    x = torch.FloatTensor(gnn_seq).unsqueeze(0)  # (1, 30, 42, 4)
-
+    x = torch.as_tensor(gnn_seq, dtype=torch.float32).unsqueeze(0)
     with torch.no_grad():
         logits = _model(x)
-        probs  = torch.softmax(logits, dim=1)[0]
-        conf, idx = probs.max(0)
-        confidence = conf.item()
-        prediction = _labels[idx.item()]
+        probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
 
-    if confidence < UMBRAL_CONFIANZA:
+    prediction, confidence, margin = evaluate_prediction(
+        _labels,
+        probs,
+        min_conf=UMBRAL_CONFIANZA,
+    )
+
+    if prediction is None:
         return PredictResponse(prediction="", confidence=confidence, is_idle=True)
 
     return PredictResponse(

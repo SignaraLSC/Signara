@@ -3,7 +3,9 @@ import LandingScreen from './components/LandingScreen.jsx'
 import ModeSelection from './components/ModeSelection.jsx'
 import TranslationScreen from './components/TranslationScreen.jsx'
 import InterpretScreen from './components/InterpretScreen.jsx'
+import ScreenTransition from './components/ScreenTransition.jsx'
 import { setCurrentAvatar } from './utils/signMap.js'
+import { warmupMlApi } from './utils/mlApi.js'
 
 /**
  * App
@@ -16,13 +18,21 @@ import { setCurrentAvatar } from './utils/signMap.js'
  *                desde un modal en TranslationScreen (Alex / Anuar / Grace).
  * 'interpret'  : camara -> reconocimiento de senas -> texto / audio
  *
- * El avatar elegido se persiste en localStorage. App lo carga al iniciar y
- * lo recibe de vuelta via onAvatarChange cuando el usuario lo cambia desde
- * dentro de Traducir.
+ * El avatar elegido se persiste en localStorage. La pantalla activa se refleja
+ * en el hash de la URL (#mode, #translate, #interpret) para conservarla al recargar.
  */
 
 const AVATAR_KEY = 'signara:avatarId'
 const VALID_IDS = ['alex', 'anuar', 'grace']
+const VALID_SCREENS = ['landing', 'mode', 'translate', 'interpret']
+const SCREEN_DEPTH = { landing: 0, mode: 1, translate: 2, interpret: 2 }
+
+function motionClassForTransition(from, to) {
+  const delta = (SCREEN_DEPTH[to] ?? 0) - (SCREEN_DEPTH[from] ?? 0)
+  if (delta > 0) return 'animate-motion-enter-forward'
+  if (delta < 0) return 'animate-motion-enter-back'
+  return 'animate-motion-fade-through'
+}
 
 function readStoredAvatar() {
   try {
@@ -38,15 +48,60 @@ function saveStoredAvatar(id) {
   } catch (_) {}
 }
 
+/** Pantalla actual desde el hash (#mode, #translate, #interpret). */
+function screenFromLocation() {
+  const hash = window.location.hash.replace(/^#\/?/, '').toLowerCase()
+  if (hash && VALID_SCREENS.includes(hash) && hash !== 'landing') return hash
+  return 'landing'
+}
+
+function syncLocation(screen) {
+  const url = new URL(window.location.href)
+  url.hash = screen === 'landing' ? '' : screen
+  window.history.replaceState(null, '', url)
+}
+
 export default function App() {
-  const [screen, setScreen] = useState('landing')
+  const [screen, setScreen] = useState(screenFromLocation)
   const [avatarId, setAvatarId] = useState('alex')
+  const [motionClass, setMotionClass] = useState('animate-motion-enter')
 
   useEffect(() => {
     const stored = readStoredAvatar()
     setAvatarId(stored)
     setCurrentAvatar(stored)
   }, [])
+
+  useEffect(() => {
+    if (screen === 'landing' || screen === 'mode') {
+      warmupMlApi()
+    }
+  }, [screen])
+
+  useEffect(() => {
+    const onNavigate = () => {
+      const next = screenFromLocation()
+      setScreen((current) => {
+        if (next !== current) {
+          setMotionClass(motionClassForTransition(current, next))
+        }
+        return next
+      })
+    }
+    window.addEventListener('hashchange', onNavigate)
+    window.addEventListener('popstate', onNavigate)
+    return () => {
+      window.removeEventListener('hashchange', onNavigate)
+      window.removeEventListener('popstate', onNavigate)
+    }
+  }, [])
+
+  const navigate = (next) => {
+    if (!VALID_SCREENS.includes(next)) return
+    setMotionClass(motionClassForTransition(screen, next))
+    syncLocation(next)
+    setScreen(next)
+  }
 
   const handleAvatarChange = (id) => {
     if (!VALID_IDS.includes(id)) return
@@ -56,45 +111,42 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen w-full relative overflow-x-hidden">
-      {screen !== 'landing' && (
-        <>
-          <div className="absolute inset-0 bg-signara-gradient" />
-          <div className="pointer-events-none absolute -top-32 -left-32 w-[480px] h-[480px] rounded-full bg-signara-sky/40 blur-3xl" />
-          <div className="pointer-events-none absolute -bottom-40 -right-32 w-[520px] h-[520px] rounded-full bg-signara-lilac/40 blur-3xl" />
-          <div className="pointer-events-none absolute top-1/3 right-1/4 w-[300px] h-[300px] rounded-full bg-signara-purple/30 blur-3xl" />
-        </>
-      )}
-
-      <div className={`relative z-10 ${screen !== 'landing' ? 'text-white' : ''}`}>
-        {screen === 'landing' && (
-          <LandingScreen onStart={() => setScreen('mode')} />
-        )}
-
-        {screen === 'mode' && (
-          <ModeSelection
-            onBack={() => setScreen('landing')}
-            onSelect={(m) => setScreen(m)}
-          />
-        )}
-
-        {screen === 'translate' && (
-          <TranslationScreen
-            initialMode="text"
-            avatarId={avatarId}
-            onAvatarChange={handleAvatarChange}
-            onBack={() => setScreen('mode')}
-            onHome={() => setScreen('landing')}
-          />
-        )}
-
-        {screen === 'interpret' && (
-          <InterpretScreen
-            onBack={() => setScreen('mode')}
-            onHome={() => setScreen('landing')}
-          />
-        )}
-      </div>
+    <div className="min-h-screen w-full">
+      <ScreenTransition
+        screen={screen}
+        enterClass={motionClass}
+        render={(currentScreen) => {
+          if (currentScreen === 'landing') {
+            return <LandingScreen onStart={() => navigate('mode')} />
+          }
+          if (currentScreen === 'mode') {
+            return (
+              <ModeSelection
+                onBack={() => navigate('landing')}
+                onSelect={(m) => navigate(m)}
+              />
+            )
+          }
+          if (currentScreen === 'translate') {
+            return (
+              <TranslationScreen
+                initialMode="text"
+                onBack={() => navigate('mode')}
+                onHome={() => navigate('landing')}
+              />
+            )
+          }
+          if (currentScreen === 'interpret') {
+            return (
+              <InterpretScreen
+                onBack={() => navigate('mode')}
+                onHome={() => navigate('landing')}
+              />
+            )
+          }
+          return null
+        }}
+      />
     </div>
   )
 }

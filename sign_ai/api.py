@@ -64,10 +64,16 @@ def _load_meta() -> dict:
 
 
 def _resolve_normalize_inputs(meta: dict) -> tuple[bool, str]:
-    """Devuelve (valor, origen) — origen es 'env' o 'meta.json (o default)'."""
+    """Devuelve (valor, origen) — origen es 'env' o 'meta.json (o default)'.
+
+    Default = True porque 06_gnn_train.py SIEMPRE entrena con normalize_inputs=True.
+    Como signara_gnn_meta.json no se versiona, si cayéramos a False la API
+    normalizaría distinto al entrenamiento y degradaría las predicciones.
+    Override con SIGNARA_NORMALIZE_INPUTS o commiteando un meta.json real.
+    """
     if _NORMALIZE_OVERRIDE is not None:
         return _NORMALIZE_OVERRIDE.strip().lower() in ("1", "true", "yes", "on"), "env"
-    return bool(meta.get("normalize_inputs", False)), "meta.json (o default)"
+    return bool(meta.get("normalize_inputs", True)), "meta.json (o default)"
 
 
 @app.on_event("startup")

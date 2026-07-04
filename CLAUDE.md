@@ -39,12 +39,6 @@ Preview production build:
 npm run preview
 ```
 
-Run the local static server (optional, serves `dist` + proxy `/api/pose`):
-```bash
-npm run server
-```
-Default port 3001.
-
 ### AI Server (Optional, for camera recognition)
 
 Navigate to `sign_ai` directory and follow these steps:
@@ -69,8 +63,8 @@ The server runs on http://localhost:8000.
 
 ### Deploy
 
-- **Frontend:** Netlify (`netlify.toml` + `netlify/functions/pose.js` proxy hacia sign.mt)
-- **Interpretar (ML):** Render (`sign_ai/`)
+- **Frontend:** Vercel (`vercel.json` + `api/pose.js`, función serverless que hace de proxy hacia sign.mt)
+- **Interpretar (ML):** Render (`render.yaml` en la raíz, `rootDir: sign_ai`)
 
 ## Architecture and Structure
 
@@ -108,8 +102,10 @@ Pipeline scripts (run from `sign_ai/`, Python 3.11):
 - `05_build_graphs.py` — renders the hand graphs (nodes+edges) for inspection.
 - `06_gnn_train.py` — trains the GCN+LSTM → `models/signara_gnn.pt`.
 - `07_gnn_predict.py` — desktop real-time prediction (reference for the browser).
-- `01_collect.py` / `04_record_animations.py` — legacy single-purpose capture,
-  superseded by `00_capture.py`.
+
+The full pipeline is: `00_capture.py` → `06_gnn_train.py` → `uvicorn api:app`.
+(Legacy Keras/LSTM scripts `01_collect`/`02_train`/`03_realtime`/`04_record_animations`
+and `merge_datasets.py` were removed — `00_capture.py` replaces all of them.)
 
 ### The dataset serves both modules
 
@@ -122,14 +118,14 @@ retrain — no re-recording needed (full body is already stored in `data/raw_ful
 
 ### Communication
 
-- The web app communicates with the local translation API (`server.js`) for AI-powered text-to-sign translation when `.env` is configured.
+- For text/voice → sign, the web app requests a POSE animation from sign.mt through the `/api/pose` proxy (Vite dev proxy locally, `api/pose.js` serverless on Vercel). Recorded 3D animations served by the ML API (`/animations`, `/sign/{token}`) take priority when a token matches.
 - For camera recognition, the web app (when in "Interpretar" mode) sends video frames to the `sign_ai` API (`api.py`) running on port 8000 to get sign predictions.
 
 ### Key Technologies
 
 - Web: React, Vite, Tailwind CSS, Three.js (for avatar animations)
 - AI Server: FastAPI, PyTorch (GNN model), MediaPipe (hand landmark extraction)
-- Translation: sign.mt API (`spoken_text_to_signed_pose`) vía Netlify Function o proxy local
+- Translation: sign.mt API (`spoken_text_to_signed_pose`) vía proxy `/api/pose` (Vite en dev, función serverless de Vercel en producción)
 
 ## Common Development Tasks
 
@@ -139,16 +135,9 @@ retrain — no re-recording needed (full body is already stored in `data/raw_ful
    `/animations`; any matched token plays in `AvatarSigner3D` (the primary avatar).
    Phrases without a recorded animation fall back to the sign.mt `PoseViewer`.
 
-### Adding a New Avatar Phrase (MP4 fallback)
-1. Place the MP4 in `public/videos/videos_avatar/<avatar_name>/<phrase>.mp4` (and _hombre/_mujer).
-2. Reference it in `AvatarPlayer.jsx`.
-
 ### Modifying Translation Logic
-- Edit `src/utils/translateText.js` for local translation rules.
-- For AI translation, modify `server.js` (uses Anthropic and Google APIs).
-
-### Updating Sign Mapping
-- Edit `src/utils/signMap.js` which maps words/signs to video filenames.
+- Edit `src/utils/translateText.js` (text → sign.mt POSE) and `src/utils/poseApi.js` (proxy paths).
+- The proxy itself lives in `api/pose.js` (Vercel) and `vite.config.js` (dev).
 
 ### Working on AI Server
 - Modify `sign_ai/api.py` for endpoint changes.

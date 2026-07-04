@@ -32,6 +32,16 @@ const STABILITY_NEED = 3
 const NO_HAND_RESET  = 12
 const SAME_SIGN_WAIT = 30
 const MIN_FRAMES     = 8
+const MOVEMENT_MIN   = 0.003  // movimiento mínimo (x,y) para acumular frame
+
+// La predicción en vivo solo debe correr sobre una ventana COMPLETA de
+// SEQ_LEN frames reales (sin relleno). padBuffer() rellena un buffer corto
+// repitiendo el primer frame al inicio; ese patrón artificial no se parece
+// a ninguna muestra de entrenamiento y el modelo puede "estabilizarse" con
+// confianza alta sobre una seña incorrecta antes de que el usuario termine
+// el gesto. MIN_FRAMES (más bajo) se reserva para el camino de respaldo al
+// retirar la mano, donde un poco de relleno es aceptable como último recurso.
+const LIVE_MIN_FRAMES = SEQ_LEN
 
 // Conexiones MediaPipe para dibujar el esqueleto de la mano (no viene en drawing_utils).
 const HAND_CONNECTIONS = [
@@ -105,6 +115,19 @@ function padBuffer(buffer) {
   const padded = [...buffer]
   while (padded.length < SEQ_LEN) padded.unshift(padded[0])
   return padded.slice(-SEQ_LEN)
+}
+
+// Movimiento medio (x,y) entre dos frames — igual que mov_entre() en
+// 07_gnn_predict.py. Sin frame previo se considera "sin movimiento" (0),
+// igual que el script de referencia (evita un salto espurio al reaparecer
+// la mano). 42 landmarks × [x,y,z] → compara solo x,y, ignora z.
+function frameMovement(prev, curr) {
+  if (!prev) return 0
+  let sum = 0
+  for (let i = 0; i < curr.length; i += 3) {
+    sum += Math.abs(curr[i] - prev[i]) + Math.abs(curr[i + 1] - prev[i + 1])
+  }
+  return sum / ((curr.length / 3) * 2)
 }
 
 // ── Componente principal ──────────────────────────────────────────────────────
@@ -246,7 +269,6 @@ export default function InterpretScreen({ onBack, onHome }) {
       cameraRef.current   = null
       setCameraOk(false)
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [scriptsLoaded, cameraConsent, cameraRetryKey])
 
   function acceptCameraPermission() {
@@ -299,17 +321,19 @@ export default function InterpretScreen({ onBack, onHome }) {
     if (!bufferHudRef.current) return
     bufferHudRef.current.style.display = showHud ? 'block' : 'none'
     if (!showHud) return
-    const pct = Math.min(100, (len / MIN_FRAMES) * 100)
+    const pct = Math.min(100, (len / LIVE_MIN_FRAMES) * 100)
     if (bufferBarRef.current) {
       bufferBarRef.current.style.width = `${pct}%`
-      bufferBarRef.current.style.background = len >= MIN_FRAMES ? '#94D08E' : '#E9CF7E'
+      bufferBarRef.current.style.background = len >= LIVE_MIN_FRAMES ? '#94D08E' : '#E9CF7E'
     }
     if (bufferTextRef.current) {
-      bufferTextRef.current.textContent = `${len}/${MIN_FRAMES}`
+      bufferTextRef.current.textContent = `${len}/${LIVE_MIN_FRAMES}`
     }
   }
 
-  function resetPipelineState() {
+  // Solo toca refs y setState setters (identidades estables) → useCallback
+  // con deps vacías es correcto y permite referenciarla desde otros hooks.
+  const resetPipelineState = useCallback(() => {
     landmarkBufferRef.current = []
     predHistRef.current       = []
     prevFrameRef.current      = null
@@ -324,7 +348,7 @@ export default function InterpretScreen({ onBack, onHome }) {
     updateCaptureHud(0, { showHud: false, status: 'Listo' })
     setDisplaySign('')
     setDisplayConf(0)
-  }
+  }, [])
 
   function confirmSign(prediction, confidence) {
     lastSignRef.current       = prediction
@@ -480,15 +504,31 @@ export default function InterpretScreen({ onBack, onHome }) {
     handWasVisibleRef.current = true
 
     const currFrame = extractLandmarks(results)
+    const movement  = frameMovement(prevFrameRef.current, currFrame)
     prevFrameRef.current = currFrame
 
     let len = 0
     if (runningRef.current) {
-      landmarkBufferRef.current.push(currFrame)
-      if (landmarkBufferRef.current.length > SEQ_LEN) {
-        landmarkBufferRef.current.shift()
+      // Solo acumular frames con movimiento real (igual que 07_gnn_predict.py):
+      // evita diluir el buffer con encuadres de mano quieta y acelera la
+      // llegada a una ventana completa (LIVE_MIN_FRAMES) con movimiento
+      // útil para el modelo.
+      if (movement >= MOVEMENT_MIN) {
+        landmarkBufferRef.current.push(currFrame)
+        if (landmarkBufferRef.current.length > SEQ_LEN) {
+          landmarkBufferRef.current.shift()
+        }
       }
       len = landmarkBufferRef.current.length
+
+      // Predicción en vivo: ya no hace falta retirar la mano para detectar.
+      // Solo con ventana completa (ver LIVE_MIN_FRAMES) para no predecir
+      // sobre un buffer relleno artificialmente. runPrediction() se
+      // autolimita con apiInFlightRef (una petición a la vez) y cooldownRef,
+      // así que esto no satura la API.
+      if (!cooling && len >= LIVE_MIN_FRAMES) {
+        runPrediction(landmarkBufferRef.current)
+      }
     }
 
     const showHud = runningRef.current && mlAvailableRef.current && len > 0 && !cooling
@@ -496,10 +536,10 @@ export default function InterpretScreen({ onBack, onHome }) {
       ? (cameraOk ? 'Listo' : 'Conectando…')
       : !mlMode
         ? '⚠ Servidor IA no conectado'
-        : len >= MIN_FRAMES
+        : len >= LIVE_MIN_FRAMES
           ? 'Detectando…'
           : len > 0
-            ? `Capturando… ${len}/${MIN_FRAMES}`
+            ? `Capturando… ${len}/${LIVE_MIN_FRAMES}`
             : 'Haz la seña'
     updateCaptureHud(len, { showHud, status })
   }
@@ -531,7 +571,7 @@ export default function InterpretScreen({ onBack, onHome }) {
     setInCooldown(false)
     if (sentenceClearRef.current) clearTimeout(sentenceClearRef.current)
     window?.speechSynthesis?.cancel()
-  }, [])
+  }, [resetPipelineState])
 
   function retryMlConnection() {
     setMlConnecting(true)
@@ -552,8 +592,8 @@ export default function InterpretScreen({ onBack, onHome }) {
     if (!mlMode)                   return '⚠ Servidor IA no conectado'
     if (!handVisible)              return 'Muestra una mano'
     if (displaySign && inCooldown) return `${displaySign.replace(/_/g, ' ')} · ${Math.round(displayConf * 100)}%`
-    if (bufferLen >= MIN_FRAMES)   return 'Detectando…'
-    if (bufferLen > 0)             return `Capturando… ${bufferLen}/${MIN_FRAMES}`
+    if (bufferLen >= LIVE_MIN_FRAMES) return 'Detectando…'
+    if (bufferLen > 0)             return `Capturando… ${bufferLen}/${LIVE_MIN_FRAMES}`
     return 'Haz la seña'
   })()
 
@@ -661,7 +701,7 @@ export default function InterpretScreen({ onBack, onHome }) {
                             />
                           </div>
                           <span ref={bufferTextRef} className="text-xs font-bold tabular-nums text-pastel-ink">
-                            0/{MIN_FRAMES}
+                            0/{LIVE_MIN_FRAMES}
                           </span>
                         </div>
                       </div>

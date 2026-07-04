@@ -66,11 +66,12 @@ export default function PoseViewer({ src, className = '', onError, onEnded }) {
     if (!src) return
 
     let cancelled = false
+    const host = hostRef.current
 
     loadPoseViewerScript()
       .then(() => {
-        if (cancelled || !hostRef.current) return
-        hostRef.current.innerHTML = ''
+        if (cancelled || !host) return
+        host.innerHTML = ''
         const viewer = document.createElement('pose-viewer')
         viewer.setAttribute('src', src)
         viewer.setAttribute('autoplay', 'true')
@@ -93,7 +94,7 @@ export default function PoseViewer({ src, className = '', onError, onEnded }) {
         viewer.addEventListener('ended$', onEndedEvent)
 
         viewerRef.current = viewer
-        hostRef.current.appendChild(viewer)
+        host.appendChild(viewer)
       })
       .catch((err) => {
         console.warn('[PoseViewer]', err?.message || err)
@@ -103,7 +104,7 @@ export default function PoseViewer({ src, className = '', onError, onEnded }) {
     return () => {
       cancelled = true
       viewerRef.current = null
-      if (hostRef.current) hostRef.current.innerHTML = ''
+      if (host) host.innerHTML = ''
     }
   }, [src])
 

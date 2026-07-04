@@ -32,6 +32,13 @@ ANIM_DIR       = Path(__file__).parent / "animations"
 UMBRAL_CONFIANZA = float(os.getenv("SIGNARA_UMBRAL", "0.75"))
 MARGEN_TOP2      = float(os.getenv("SIGNARA_MARGEN_TOP2", "0.16"))
 
+# Override manual para probar normalización sin reentrenar. 06_gnn_train.py
+# siempre entrena con normalize_inputs=True y escribe signara_gnn_meta.json,
+# pero ese archivo nunca se comitió a git — así que sin esta variable, la API
+# cae al default False y puede quedar desalineada con cómo se entrenó el
+# modelo. Ponla en Render (SIGNARA_NORMALIZE_INPUTS=true) para probar.
+_NORMALIZE_OVERRIDE = os.getenv("SIGNARA_NORMALIZE_INPUTS")
+
 # ─── App ──────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="Signara ML API — GNN", version="2.0.0")
@@ -46,6 +53,7 @@ app.add_middleware(
 _model: GCN_LSTM | None = None
 _labels: list[str] = []
 _normalize_inputs = False
+_normalize_source = "default"
 
 
 def _load_meta() -> dict:
@@ -55,9 +63,22 @@ def _load_meta() -> dict:
         return json.load(f)
 
 
+def _resolve_normalize_inputs(meta: dict) -> tuple[bool, str]:
+    """Devuelve (valor, origen) — origen es 'env' o 'meta.json (o default)'.
+
+    Default = True porque 06_gnn_train.py SIEMPRE entrena con normalize_inputs=True.
+    Como signara_gnn_meta.json no se versiona, si cayéramos a False la API
+    normalizaría distinto al entrenamiento y degradaría las predicciones.
+    Override con SIGNARA_NORMALIZE_INPUTS o commiteando un meta.json real.
+    """
+    if _NORMALIZE_OVERRIDE is not None:
+        return _NORMALIZE_OVERRIDE.strip().lower() in ("1", "true", "yes", "on"), "env"
+    return bool(meta.get("normalize_inputs", True)), "meta.json (o default)"
+
+
 @app.on_event("startup")
 async def load_model():
-    global _model, _labels, _normalize_inputs
+    global _model, _labels, _normalize_inputs, _normalize_source
 
     if not os.path.exists(GNN_MODEL_PATH):
         print(f"⚠  Modelo GNN no encontrado: {GNN_MODEL_PATH}")
@@ -71,14 +92,15 @@ async def load_model():
         _labels = json.load(f)
 
     meta = _load_meta()
-    _normalize_inputs = bool(meta.get("normalize_inputs", False))
+    _normalize_inputs, _normalize_source = _resolve_normalize_inputs(meta)
 
     _model = GCN_LSTM(n_classes=len(_labels))
     _model.load_state_dict(torch.load(GNN_MODEL_PATH, map_location="cpu"))
     _model.eval()
 
     print(f"✅ Modelo GNN cargado — clases: {_labels}")
-    print(f"   Normalización: {_normalize_inputs} | umbral: {UMBRAL_CONFIANZA} | margen top2: {MARGEN_TOP2}")
+    print(f"   Normalización: {_normalize_inputs} (fuente: {_normalize_source}) | "
+          f"umbral: {UMBRAL_CONFIANZA} | margen top2: {MARGEN_TOP2}")
 
 
 # ─── Schemas ──────────────────────────────────────────────────────────────────
@@ -107,6 +129,7 @@ def health():
         "umbral_confianza": UMBRAL_CONFIANZA,
         "margen_top2": MARGEN_TOP2,
         "normalize_inputs": _normalize_inputs,
+        "normalize_source": _normalize_source,
     }
 
 

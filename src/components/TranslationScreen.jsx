@@ -253,7 +253,7 @@ export default function TranslationScreen({
                   hasContent={!!originalText}
                 >
                   <p className="text-base font-bold leading-relaxed text-pastel-ink sm:text-lg">
-                    "{originalText}"
+                    &quot;{originalText}&quot;
                   </p>
                 </OutputCard>
 

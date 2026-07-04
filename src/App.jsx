@@ -1,11 +1,28 @@
-import { useEffect, useState } from 'react'
+import { lazy, Suspense, useEffect, useState } from 'react'
 import LandingScreen from './components/LandingScreen.jsx'
 import ModeSelection from './components/ModeSelection.jsx'
-import TranslationScreen from './components/TranslationScreen.jsx'
-import InterpretScreen from './components/InterpretScreen.jsx'
 import ScreenTransition from './components/ScreenTransition.jsx'
 import { setCurrentAvatar } from './utils/signMap.js'
 import { warmupMlApi } from './utils/mlApi.js'
+
+// Pantallas pesadas cargadas bajo demanda (code-splitting).
+// TranslationScreen arrastra Three.js (avatar 3D); InterpretScreen es grande.
+// Así el bundle inicial (landing + selección de modo) queda mucho más liviano.
+const importTranslation = () => import('./components/TranslationScreen.jsx')
+const importInterpret = () => import('./components/InterpretScreen.jsx')
+const TranslationScreen = lazy(importTranslation)
+const InterpretScreen = lazy(importInterpret)
+
+function ScreenFallback() {
+  return (
+    <div className="flex min-h-screen w-full items-center justify-center">
+      <div className="flex flex-col items-center gap-3 text-pastel-sub">
+        <span className="h-8 w-8 animate-spin rounded-full border-4 border-pastel-purple/40 border-t-pastel-grape" />
+        <span className="text-sm font-semibold">Cargando…</span>
+      </div>
+    </div>
+  )
+}
 
 /**
  * App
@@ -76,6 +93,12 @@ export default function App() {
     if (screen === 'landing' || screen === 'mode') {
       warmupMlApi()
     }
+    // En la selección de modo, precarga los chunks de ambas pantallas para
+    // que elegir "Traducir" o "Interpretar" no espere a la descarga.
+    if (screen === 'mode') {
+      importTranslation()
+      importInterpret()
+    }
   }, [screen])
 
   useEffect(() => {
@@ -129,19 +152,23 @@ export default function App() {
           }
           if (currentScreen === 'translate') {
             return (
-              <TranslationScreen
-                initialMode="text"
-                onBack={() => navigate('mode')}
-                onHome={() => navigate('landing')}
-              />
+              <Suspense fallback={<ScreenFallback />}>
+                <TranslationScreen
+                  initialMode="text"
+                  onBack={() => navigate('mode')}
+                  onHome={() => navigate('landing')}
+                />
+              </Suspense>
             )
           }
           if (currentScreen === 'interpret') {
             return (
-              <InterpretScreen
-                onBack={() => navigate('mode')}
-                onHome={() => navigate('landing')}
-              />
+              <Suspense fallback={<ScreenFallback />}>
+                <InterpretScreen
+                  onBack={() => navigate('mode')}
+                  onHome={() => navigate('landing')}
+                />
+              </Suspense>
             )
           }
           return null

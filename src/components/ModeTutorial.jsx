@@ -83,19 +83,18 @@ function scrollTargetIntoView(
 
   return new Promise((resolve) => {
     const start = performance.now()
-    let rafId = 0
 
     const tick = () => {
       onFrame?.()
       if (performance.now() - start < STEP_MORPH_MS) {
-        rafId = requestAnimationFrame(tick)
+        requestAnimationFrame(tick)
         return
       }
       onFrame?.()
       resolve()
     }
 
-    rafId = requestAnimationFrame(tick)
+    requestAnimationFrame(tick)
   })
 }
 

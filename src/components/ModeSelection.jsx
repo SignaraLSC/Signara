@@ -3,7 +3,6 @@ import {
   AppPage,
   AppPageFooter,
   AppPageHeader,
-  AppPageHeading,
   AppPageMain,
   AppPagePanel,
   AppPageStagger,

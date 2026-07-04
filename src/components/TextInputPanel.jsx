@@ -234,7 +234,7 @@ const TextInputPanel = forwardRef(function TextInputPanel(
           </span>
           {pendingWord && (
             <span className="inline-flex items-center gap-1 rounded-full border-2 border-pastel-purple-line bg-pastel-purple px-2.5 py-1 text-pastel-grape animate-pulse">
-              "{pendingWord}"…
+              &quot;{pendingWord}&quot;…
             </span>
           )}
           {missedWord && (

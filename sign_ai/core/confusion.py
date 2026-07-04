@@ -12,6 +12,7 @@ CONFUSION_PAIRS: set[frozenset[str]] = {
     frozenset({"BIEN", "MAL"}),
     frozenset({"SED", "NECESITO_AYUDA"}),
     frozenset({"MAL", "NECESITO_AYUDA"}),
+    frozenset({"BIEN", "NECESITO_AYUDA"}),
     frozenset({"COMO_ESTAS", "GRACIAS"}),
 }
 

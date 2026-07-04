@@ -32,7 +32,7 @@ export function normalizeForSearch(text) {
       .toLowerCase()
       .normalize('NFD')
       .replace(/[̀-ͯ]/g, '')   // quitar acentos
-      .replace(/[¿¡.,!?;:()\-]/g, ' ')  // puntuación → espacio
+      .replace(/[¿¡.,!?;:()-]/g, ' ')  // puntuación → espacio
       .replace(/\s+/g, ' ')
       .trim()
   )

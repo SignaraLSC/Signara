@@ -1,26 +1,18 @@
 import os
 
 # =========================
-# RUTAS
+# CARPETAS DE SALIDA
 # =========================
-DATA_PATH = "data/dataset.csv"
-MODEL_PATH = "models/signara_lstm.keras"
-LABEL_PATH = "models/labels.json"
-
 os.makedirs("data", exist_ok=True)
 os.makedirs("models", exist_ok=True)
 
 # =========================
 # IA (DIMENSIONES)
 # =========================
-# Cara refinada (478) + Pose (33) + Manos (21*2)
-# Total = 553 puntos
-# 553 * 3 coordenadas (x,y,z) = 1659 features
+# Cuerpo completo capturado: cara refinada (478) + pose (33) + manos (21*2)
+# 553 puntos * 3 coordenadas (x,y,z) = 1659 features.
+# El GNN actual solo usa las manos (42 nodos); el resto se guarda para escalar.
 MAX_FEATURES = 1659
 
-# Frames por seña
+# Frames por seña (longitud de secuencia)
 SEQ_LEN = 30
-
-# Realtime
-UMBRAL_CONFIANZA = 0.70
-FRAMES_ESTABILIDAD = 3

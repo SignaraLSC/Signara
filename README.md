@@ -62,29 +62,34 @@ npm run dev
 
 http://localhost:5173
 
-IA (captura de datos)
+IA (captura de señas: datos + animación del avatar)
 
-python 01_collect.py
+python 00_capture.py
 
-IA (API futura) //aun no
-uvicorn api:app --reload
+IA (entrenar el modelo)
+python 06_gnn_train.py
+
+IA (servidor)
+uvicorn api:app --port 8000
 
 
 Estructura 
 Signara/
 ├── public/
 │   ├── logo.svg
+│   ├── pose-viewer/       # visor de poses (sign.mt)
 │   └── videos/
 ├── src/ (Frontend React)
 │
 ├── sign_ai/ (Backend IA)
-│   ├── 01_collect.py      # captura de datos
-│   ├── 02_train.py        # entrenamiento
-│   ├── 03_realtime.py     # predicción en vivo
-│   ├── core/
-│   ├── datasets/
-│   ├── api.py             # FastAPI (en desarrollo)
-│   └── requirements.txt
+│   ├── 00_capture.py      # captura única (datos + avatar)
+│   ├── 05_build_graphs.py # visualiza grafos de manos
+│   ├── 06_gnn_train.py    # entrenamiento GNN
+│   ├── 07_gnn_predict.py  # predicción en vivo (escritorio)
+│   ├── core/              # config, gnn_model, preprocess, confusion
+│   ├── models/            # signara_gnn.pt + labels
+│   ├── api.py             # FastAPI (/predict, /sign, /animations)
+│   └── requirements_api.txt
 │
 ├── package.json
 └── README.md

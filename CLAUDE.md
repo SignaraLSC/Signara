@@ -102,8 +102,10 @@ Pipeline scripts (run from `sign_ai/`, Python 3.11):
 - `05_build_graphs.py` — renders the hand graphs (nodes+edges) for inspection.
 - `06_gnn_train.py` — trains the GCN+LSTM → `models/signara_gnn.pt`.
 - `07_gnn_predict.py` — desktop real-time prediction (reference for the browser).
-- `01_collect.py` / `04_record_animations.py` — legacy single-purpose capture,
-  superseded by `00_capture.py`.
+
+The full pipeline is: `00_capture.py` → `06_gnn_train.py` → `uvicorn api:app`.
+(Legacy Keras/LSTM scripts `01_collect`/`02_train`/`03_realtime`/`04_record_animations`
+and `merge_datasets.py` were removed — `00_capture.py` replaces all of them.)
 
 ### The dataset serves both modules
 

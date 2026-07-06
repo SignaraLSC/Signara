@@ -18,8 +18,10 @@ os.makedirs("models", exist_ok=True)
 # 553 * 3 coordenadas (x,y,z) = 1659 features
 MAX_FEATURES = 1659
 
-# Frames por seña
-SEQ_LEN = 30
+# Frames por seña (usado por 00_capture.py — más frames = más tiempo real de
+# captura a FPS_TARGET fijo). Debe coincidir con core/gnn_model.SEQ_LEN y con
+# SEQ_LEN en src/components/InterpretScreen.jsx.
+SEQ_LEN = 40
 
 # Realtime
 UMBRAL_CONFIANZA = 0.70

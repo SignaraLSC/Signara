@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { ResetButton, SectionLabel } from './AppShell.jsx'
 import PoseViewer from './PoseViewer.jsx'
 import AvatarSigner3D from './AvatarSigner3D.jsx'
+import Icon from './Icon.jsx'
 import { ML_API_URL } from '../utils/mlApi.js'
 import TextInputPanel from './TextInputPanel.jsx'
 import SignChips from './SignChips.jsx'
@@ -268,7 +269,7 @@ export default function TranslationScreen({
                   color="neutral"
                   icon={<TextIcon />}
                   title="Lo que dijiste"
-                  emptyIcon="💬"
+                  emptyIcon="message"
                   empty="Tu texto aparecerá aquí."
                   hasContent={!!originalText}
                 >
@@ -282,7 +283,7 @@ export default function TranslationScreen({
                     color="green"
                     icon={<SignIcon />}
                     title="Palabras"
-                    emptyIcon="🤟"
+                    emptyIcon="sign"
                     empty=""
                     hasContent
                   >
@@ -294,8 +295,8 @@ export default function TranslationScreen({
               <div className="animate-motion-scale-in lg:col-span-7">
                 <div className="relative flex h-full flex-col overflow-hidden rounded-[2rem] border-[3px] border-pastel-green-line bg-pastel-green p-5 shadow-[0_24px_50px_-28px_rgba(148,208,142,0.7)] sm:p-7">
                   <div className="relative mb-4">
-                    <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-pastel-ink/70">
-                      👀 Mira aquí
+                    <p className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-[0.22em] text-pastel-ink/70">
+                      <Icon name="eye" className="h-3.5 w-3.5" strokeWidth={2.25} /> Mira aquí
                     </p>
                     <p className="mt-1 text-xl font-extrabold text-pastel-ink sm:text-2xl">
                       {busy
@@ -334,7 +335,7 @@ export default function TranslationScreen({
                         />
                       ) : (
                         <div className="flex min-h-[280px] flex-col items-center justify-center rounded-2xl border-2 border-dashed border-pastel-ink/15 bg-white/60 px-6 text-center">
-                          <span className="text-5xl opacity-40">🧍</span>
+                          <Icon name="user" className="h-12 w-12 text-pastel-ink/30" strokeWidth={1.5} />
                           <p className="mt-3 text-sm font-semibold text-pastel-sub">
                             {busy
                               ? 'Cargando animación 3D…'
@@ -347,8 +348,8 @@ export default function TranslationScreen({
 
                   {!originalText && !busy && (
                     <div className="relative mt-4 rounded-2xl border-2 border-dashed border-pastel-ink/15 bg-white/50 px-4 py-3 text-center">
-                      <p className="text-sm font-bold text-pastel-ink">
-                        ↑ Escribe arriba o elige un ejemplo para empezar
+                      <p className="flex items-center justify-center gap-1.5 text-sm font-bold text-pastel-ink">
+                        <Icon name="arrow-up" className="h-4 w-4" strokeWidth={2.25} /> Escribe arriba o elige un ejemplo para empezar
                       </p>
                     </div>
                   )}
@@ -399,7 +400,7 @@ function OutputCard({ color, icon, title, empty, emptyIcon, hasContent, children
       </div>
       {hasContent ? children : (
         <div className="flex flex-col items-center py-6 text-center">
-          <span className="text-3xl opacity-40">{emptyIcon}</span>
+          <Icon name={emptyIcon} className="h-8 w-8 text-pastel-sub/50" strokeWidth={1.75} />
           <p className="mt-2 text-sm font-semibold text-pastel-sub">{empty}</p>
         </div>
       )}
@@ -416,9 +417,9 @@ function BackIcon() {
 }
 
 function TextIcon() {
-  return <span className="text-lg" aria-hidden>📝</span>
+  return <Icon name="pencil" className="h-5 w-5 text-pastel-ink" strokeWidth={1.75} />
 }
 
 function SignIcon() {
-  return <span className="text-lg" aria-hidden>🤟</span>
+  return <Icon name="sign" className="h-5 w-5 text-pastel-grape" strokeWidth={1.75} />
 }

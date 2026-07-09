@@ -1,4 +1,5 @@
 import { Component } from 'react'
+import Icon from './Icon.jsx'
 
 /**
  * Última barrera ante errores de render no capturados. Sin esto, cualquier
@@ -31,7 +32,7 @@ export default class ErrorBoundary extends Component {
     return (
       <div className="flex min-h-screen w-full items-center justify-center bg-pastel-cream p-6">
         <div className="max-w-sm rounded-2xl border-2 border-pastel-blue-line bg-white p-6 text-center shadow-xl">
-          <p className="text-3xl">😵</p>
+          <Icon name="frown" className="mx-auto h-10 w-10 text-pastel-grape" strokeWidth={1.75} />
           <p className="mt-3 text-lg font-extrabold text-pastel-ink">Algo salió mal</p>
           <p className="mt-2 text-sm font-semibold text-pastel-sub">
             Ocurrió un error inesperado. Intenta recargar la página.

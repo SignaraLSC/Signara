@@ -5,10 +5,12 @@
  *
  * Acabado profesional:
  *  - Cara como malla de contornos (óvalo, ojos, cejas, labios, nariz).
+ *  - Líneas gruesas reales (LineSegments2), fondo con degradado y auto-órbita
+ *    suave para que se perciba la profundidad.
  *  - Suavizado temporal (media móvil) para quitar el tembleque de MediaPipe.
- *  - Manos ausentes: se ocultan (si nunca aparecen) o se mantienen (si parpadean),
- *    en vez de saltar al origen.
+ *  - Manos ausentes: se ocultan o se mantienen, en vez de saltar al origen.
  *  - Reproducción por tiempo con interpolación entre frames → fluido a 60fps.
+ *  - La seña se repite en bucle para que el movimiento se aprecie.
  *
  * API imperativa (via ref): queue(token) · replace([tokens]) · clear()
  */
@@ -17,6 +19,9 @@ import {
   forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState,
 } from 'react'
 import * as THREE from 'three'
+import { LineSegments2 } from 'three/examples/jsm/lines/LineSegments2.js'
+import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeometry.js'
+import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js'
 
 // ─── Conexiones ────────────────────────────────────────────────────────────────
 const HAND_CONNECTIONS = [
@@ -46,8 +51,8 @@ function buildFaceEdges(spans) {
 const FACE_EDGES = buildFaceEdges(FACE_SPANS)
 
 const FPS = 30
-const Z_SCALE = 0.7   // profundidad (se lee mejor con la cámara en ángulo 3/4)
-const LOOP_GAP_MS = 700   // pausa entre repeticiones al hacer loop
+const Z_SCALE = 0.7
+const LOOP_GAP_MS = 700
 
 // ─── Preproceso de datos ────────────────────────────────────────────────────────
 const isZeroPt = (p) => !p || (p[0] === 0 && p[1] === 0 && p[2] === 0)
@@ -123,10 +128,13 @@ function makeDots(count, color, size) {
   g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(count * 3), 3))
   return new THREE.Points(g, new THREE.PointsMaterial({ color, size, sizeAttenuation: true, transparent: true, opacity: 0.95 }))
 }
-function makeLines(edgeCount, color, opacity) {
-  const g = new THREE.BufferGeometry()
-  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(edgeCount * 2 * 3), 3))
-  return new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color, transparent: true, opacity }))
+// Líneas GRUESAS reales (LineSegments2) — grosor en píxeles.
+function makeLines(color, linewidth, opacity) {
+  const geo = new LineSegmentsGeometry()
+  const mat = new LineMaterial({ color, linewidth, transparent: true, opacity, dashed: false })
+  const line = new LineSegments2(geo, mat)
+  line.frustumCulled = false
+  return line
 }
 function setDots(points, list) {
   const a = points.geometry.attributes.position
@@ -138,14 +146,14 @@ function setDotsSubset(points, list, idxs) {
   for (let i = 0; i < idxs.length; i++) { const [x, y, z] = list[idxs[i]]; a.setXYZ(i, x, -y, z * Z_SCALE) }
   a.needsUpdate = true
 }
-function setLines(lines, list, edges) {
-  const a = lines.geometry.attributes.position
+function setLines(lineObj, list, edges) {
+  const pos = new Float32Array(edges.length * 6)
   for (let i = 0; i < edges.length; i++) {
     const [u, v] = edges[i]; const A = list[u], B = list[v]
-    a.setXYZ(i * 2, A[0], -A[1], A[2] * Z_SCALE)
-    a.setXYZ(i * 2 + 1, B[0], -B[1], B[2] * Z_SCALE)
+    pos[i*6+0] = A[0]; pos[i*6+1] = -A[1]; pos[i*6+2] = A[2] * Z_SCALE
+    pos[i*6+3] = B[0]; pos[i*6+4] = -B[1]; pos[i*6+5] = B[2] * Z_SCALE
   }
-  a.needsUpdate = true
+  lineObj.geometry.setPositions(pos)
 }
 
 const AvatarSigner3D = forwardRef(function AvatarSigner3D({ apiUrl, onSign, onFinish }, ref) {
@@ -155,8 +163,8 @@ const AvatarSigner3D = forwardRef(function AvatarSigner3D({ apiUrl, onSign, onFi
   const queueRef = useRef([])
   const playingRef = useRef(false)
   const timerRef = useRef(null)
-  const loopTokensRef = useRef([])   // secuencia a repetir en bucle
-  const loopTimerRef = useRef(null)  // pausa entre repeticiones
+  const loopTokensRef = useRef([])
+  const loopTimerRef = useRef(null)
   const [status, setStatus] = useState('idle')
   const [everPlayed, setEverPlayed] = useState(false)
 
@@ -180,31 +188,47 @@ const AvatarSigner3D = forwardRef(function AvatarSigner3D({ apiUrl, onSign, onFi
     renderer.setSize(w, h, false)
 
     const scene = new THREE.Scene()
-    // Cámara en ángulo 3/4 (no de frente): así se percibe la profundidad.
     const camera = new THREE.PerspectiveCamera(40, w / h, 0.01, 10)
-    camera.position.set(0.86, -0.48, 1.55)
-    camera.lookAt(0.45, -0.5, 0)
 
-    const faceLines = makeLines(FACE_EDGES.length, 0x9aa6bc, 0.85)
-    const faceDots  = makeDots(124, 0xc7d0e0, 0.004)
-    const poseLines = makeLines(POSE_CONNECTIONS.length, 0x8a94a8, 0.9)
-    const poseDots  = makeDots(POSE_POINTS.length, 0xaab2c4, 0.018)
-    const lhLines   = makeLines(HAND_CONNECTIONS.length, 0x6366f1, 0.95)
-    const lhDots    = makeDots(21, 0xa5b4fc, 0.02)
-    const rhLines   = makeLines(HAND_CONNECTIONS.length, 0x8b5cf6, 0.95)
-    const rhDots    = makeDots(21, 0xc4b5fd, 0.02)
+    // Órbita: target y radio en el plano xz para el vaivén suave (percibe profundidad)
+    const target = new THREE.Vector3(0.45, -0.5, 0)
+    const R = 1.6, BASE_ANG = 0.26   // ~15°
+    camera.position.set(target.x + R * Math.sin(BASE_ANG), -0.48, target.z + R * Math.cos(BASE_ANG))
+    camera.lookAt(target)
 
-    scene.add(faceLines, faceDots, poseLines, poseDots, lhLines, lhDots, rhLines, rhDots)
+    const faceLines = makeLines(0x8b93a7, 1.6, 0.9)
+    const poseLines = makeLines(0x7c86a0, 3.0, 0.95)
+    const poseDots  = makeDots(POSE_POINTS.length, 0x9aa6bc, 0.02)
+    const lhLines   = makeLines(0x6366f1, 3.5, 0.98)
+    const lhDots    = makeDots(21, 0xa5b4fc, 0.022)
+    const rhLines   = makeLines(0x8b5cf6, 3.5, 0.98)
+    const rhDots    = makeDots(21, 0xc4b5fd, 0.022)
 
+    scene.add(faceLines, poseLines, poseDots, lhLines, lhDots, rhLines, rhDots)
+
+    const lineMats = [faceLines.material, poseLines.material, lhLines.material, rhLines.material]
+    const setRes = (ww, hh) => lineMats.forEach((m) => m.resolution.set(ww, hh))
+    setRes(w, h)
+
+    const t0 = performance.now()
     let animId
-    const render = () => { animId = requestAnimationFrame(render); renderer.render(scene, camera) }
+    const render = () => {
+      animId = requestAnimationFrame(render)
+      const t = (performance.now() - t0) / 1000
+      const ang = BASE_ANG + Math.sin(t * 0.45) * 0.16   // vaivén ±~9°
+      camera.position.x = target.x + R * Math.sin(ang)
+      camera.position.z = target.z + R * Math.cos(ang)
+      camera.lookAt(target)
+      renderer.render(scene, camera)
+    }
     render()
 
-    sceneRef.current = { scene, camera, renderer, faceLines, faceDots, poseLines, poseDots, lhLines, lhDots, rhLines, rhDots }
+    sceneRef.current = { scene, camera, renderer, faceLines, poseLines, poseDots, lhLines, lhDots, rhLines, rhDots }
 
     const onResize = () => {
       const w2 = canvas.clientWidth, h2 = canvas.clientHeight
       renderer.setSize(w2, h2, false); camera.aspect = w2 / h2; camera.updateProjectionMatrix()
+      setRes(w2, h2)
     }
     window.addEventListener('resize', onResize)
     return () => {
@@ -216,26 +240,24 @@ const AvatarSigner3D = forwardRef(function AvatarSigner3D({ apiUrl, onSign, onFi
   const drawFrame = useCallback((f) => {
     const s = sceneRef.current
     if (!s) return
-    if (s.faceDots.visible && f.face.length) { setDots(s.faceDots, f.face); setLines(s.faceLines, f.face, FACE_EDGES) }
+    if (s.faceLines.visible && f.face.length) setLines(s.faceLines, f.face, FACE_EDGES)
     setDotsSubset(s.poseDots, f.pose, POSE_POINTS); setLines(s.poseLines, f.pose, POSE_CONNECTIONS)
-    if (s.lhDots.visible) { setDots(s.lhDots, f.lh); setLines(s.lhLines, f.lh, HAND_CONNECTIONS) }
-    if (s.rhDots.visible) { setDots(s.rhDots, f.rh); setLines(s.rhLines, f.rh, HAND_CONNECTIONS) }
+    if (s.lhLines.visible) { setDots(s.lhDots, f.lh); setLines(s.lhLines, f.lh, HAND_CONNECTIONS) }
+    if (s.rhLines.visible) { setDots(s.rhDots, f.rh); setLines(s.rhLines, f.rh, HAND_CONNECTIONS) }
   }, [])
 
-  // Reproduce una animación procesada por TIEMPO (interpola entre frames → fluido)
   const playProcessed = useCallback((proc, onDone) => {
     const { frames } = proc
     if (!frames.length) { onDone(); return }
-
     let start = null
     let visSet = false
     const step = (now) => {
       const s = sceneRef.current
-      if (!s) { timerRef.current = requestAnimationFrame(step); return }  // esperar init de escena
+      if (!s) { timerRef.current = requestAnimationFrame(step); return }
       if (!visSet) {
-        s.lhDots.visible = s.lhLines.visible = proc.lhActive
-        s.rhDots.visible = s.rhLines.visible = proc.rhActive
-        s.faceDots.visible = s.faceLines.visible = proc.hasFace
+        s.lhLines.visible = s.lhDots.visible = proc.lhActive
+        s.rhLines.visible = s.rhDots.visible = proc.rhActive
+        s.faceLines.visible = proc.hasFace
         visSet = true
       }
       if (start === null) start = now
@@ -251,7 +273,6 @@ const AvatarSigner3D = forwardRef(function AvatarSigner3D({ apiUrl, onSign, onFi
   const processQueue = useCallback(async () => {
     if (playingRef.current) return
     if (queueRef.current.length === 0) {
-      // Fin de la secuencia: si hay loop, reinicia tras una pausa; si no, termina.
       if (loopTokensRef.current.length) {
         setStatus('idle')
         loopTimerRef.current = setTimeout(() => {
@@ -283,7 +304,7 @@ const AvatarSigner3D = forwardRef(function AvatarSigner3D({ apiUrl, onSign, onFi
       if (timerRef.current) cancelAnimationFrame(timerRef.current)
       if (loopTimerRef.current) clearTimeout(loopTimerRef.current)
       playingRef.current = false
-      loopTokensRef.current = [...(tokens || [])]   // repetir esta secuencia en bucle
+      loopTokensRef.current = [...(tokens || [])]
       queueRef.current = [...(tokens || [])]
       processQueue()
     },
@@ -298,7 +319,10 @@ const AvatarSigner3D = forwardRef(function AvatarSigner3D({ apiUrl, onSign, onFi
   }), [processQueue])
 
   return (
-    <div className="relative w-full h-full rounded-4xl overflow-hidden bg-white border border-white/90 shadow-soft">
+    <div
+      className="relative w-full h-full rounded-4xl overflow-hidden border border-white/90 shadow-soft"
+      style={{ background: 'radial-gradient(120% 95% at 50% 12%, #F1EEFB 0%, #FBFAFE 55%, #F4F1FA 100%)' }}
+    >
       <canvas ref={canvasRef} className="w-full h-full" style={{ display: 'block' }} />
       {status === 'loading' && (
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none">

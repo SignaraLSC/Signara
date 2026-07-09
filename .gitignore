@@ -50,3 +50,6 @@ dist-ssr/
 *.local
 .vercel
 .env*.local
+
+# Config local de preview (no versionar)
+.claude/launch.json

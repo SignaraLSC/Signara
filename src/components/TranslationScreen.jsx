@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { ResetButton, SectionLabel } from './AppShell.jsx'
 import PoseViewer from './PoseViewer.jsx'
 import AvatarSigner3D from './AvatarSigner3D.jsx'
+import AvatarHuman3D from './AvatarHuman3D.jsx'
 import Icon from './Icon.jsx'
 import { ML_API_URL } from '../utils/mlApi.js'
 import TextInputPanel from './TextInputPanel.jsx'
@@ -61,6 +62,7 @@ export default function TranslationScreen({
   // 00_capture.py y servidas por la API ML en /sign/{token}.
   const [useSigner, setUseSigner] = useState(false)
   const [signerTokens, setSignerTokens] = useState([])
+  const [avatarKind, setAvatarKind] = useState('skeleton')   // 'skeleton' | 'human'
 
   const inputRef = useRef(null)
   const poseBlobRef = useRef(null)
@@ -84,7 +86,7 @@ export default function TranslationScreen({
     if (useSigner && signerTokens.length) {
       signerRef.current?.replace(signerTokens)
     }
-  }, [useSigner, signerTokens])
+  }, [useSigner, signerTokens, avatarKind])
 
   const revokePoseBlob = useCallback(() => {
     if (poseBlobRef.current?.startsWith('blob:')) {
@@ -295,6 +297,22 @@ export default function TranslationScreen({
               <div className="animate-motion-scale-in lg:col-span-7">
                 <div className="relative flex h-full flex-col overflow-hidden rounded-[2rem] border-[3px] border-pastel-green-line bg-pastel-green p-5 shadow-[0_24px_50px_-28px_rgba(148,208,142,0.7)] sm:p-7">
                   <div className="relative mb-4">
+                    <div className="absolute right-0 top-0 inline-flex overflow-hidden rounded-full border-2 border-pastel-green-line text-[10px] font-bold">
+                      <button
+                        type="button"
+                        onClick={() => setAvatarKind('skeleton')}
+                        className={(avatarKind === 'skeleton' ? 'bg-pastel-grape text-white' : 'bg-white text-pastel-ink') + ' px-2.5 py-1 transition'}
+                      >
+                        Esqueleto
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setAvatarKind('human')}
+                        className={(avatarKind === 'human' ? 'bg-pastel-grape text-white' : 'bg-white text-pastel-ink') + ' px-2.5 py-1 transition'}
+                      >
+                        Humano
+                      </button>
+                    </div>
                     <p className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-[0.22em] text-pastel-ink/70">
                       <Icon name="eye" className="h-3.5 w-3.5" strokeWidth={2.25} /> Mira aquí
                     </p>
@@ -321,11 +339,19 @@ export default function TranslationScreen({
                     <div className="w-full max-w-lg">
                       {useSigner ? (
                         <div className="h-[320px] w-full">
-                          <AvatarSigner3D
-                            ref={signerRef}
-                            apiUrl={ML_API_URL}
-                            onFinish={() => setPoseFinished(true)}
-                          />
+                          {avatarKind === 'human' ? (
+                            <AvatarHuman3D
+                              ref={signerRef}
+                              apiUrl={ML_API_URL}
+                              onFinish={() => setPoseFinished(true)}
+                            />
+                          ) : (
+                            <AvatarSigner3D
+                              ref={signerRef}
+                              apiUrl={ML_API_URL}
+                              onFinish={() => setPoseFinished(true)}
+                            />
+                          )}
                         </div>
                       ) : hasPose3d ? (
                         <PoseViewer

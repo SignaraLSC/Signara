@@ -25,7 +25,9 @@ const MP_SCRIPTS = [
 ]
 
 // ── Parámetros (alineados con sign_ai/07_gnn_predict.py) ─────────────────────
-const SEQ_LEN        = 30
+// SEQ_LEN debe coincidir exactamente con sign_ai/core/gnn_model.SEQ_LEN y
+// sign_ai/core/config.SEQ_LEN — si no coinciden, /predict rechaza el shape.
+const SEQ_LEN        = 40
 const HAND_COUNT     = 21
 const UMBRAL         = 0.75
 const STABILITY_NEED = 3

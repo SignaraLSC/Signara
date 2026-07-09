@@ -17,7 +17,10 @@ import numpy as np
 
 N_NODES   = 42
 N_FEATURES = 4
-SEQ_LEN   = 30
+# Debe coincidir con core/config.SEQ_LEN (captura) y con SEQ_LEN en
+# src/components/InterpretScreen.jsx (navegador) — los tres deben ir
+# sincronizados o /predict rechaza el shape (422) o el modelo entrena mal.
+SEQ_LEN   = 40
 
 HAND_CONNECTIONS = [
     (0,1),(1,2),(2,3),(3,4),

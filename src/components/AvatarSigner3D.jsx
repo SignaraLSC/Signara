@@ -46,7 +46,8 @@ function buildFaceEdges(spans) {
 const FACE_EDGES = buildFaceEdges(FACE_SPANS)
 
 const FPS = 30
-const Z_SCALE = 0.5   // aplana un poco la profundidad (MediaPipe z es ruidoso)
+const Z_SCALE = 0.7   // profundidad (se lee mejor con la cámara en ángulo 3/4)
+const LOOP_GAP_MS = 700   // pausa entre repeticiones al hacer loop
 
 // ─── Preproceso de datos ────────────────────────────────────────────────────────
 const isZeroPt = (p) => !p || (p[0] === 0 && p[1] === 0 && p[2] === 0)
@@ -154,6 +155,8 @@ const AvatarSigner3D = forwardRef(function AvatarSigner3D({ apiUrl, onSign, onFi
   const queueRef = useRef([])
   const playingRef = useRef(false)
   const timerRef = useRef(null)
+  const loopTokensRef = useRef([])   // secuencia a repetir en bucle
+  const loopTimerRef = useRef(null)  // pausa entre repeticiones
   const [status, setStatus] = useState('idle')
   const [everPlayed, setEverPlayed] = useState(false)
 
@@ -177,8 +180,9 @@ const AvatarSigner3D = forwardRef(function AvatarSigner3D({ apiUrl, onSign, onFi
     renderer.setSize(w, h, false)
 
     const scene = new THREE.Scene()
+    // Cámara en ángulo 3/4 (no de frente): así se percibe la profundidad.
     const camera = new THREE.PerspectiveCamera(40, w / h, 0.01, 10)
-    camera.position.set(0.45, -0.5, 1.7)
+    camera.position.set(0.86, -0.48, 1.55)
     camera.lookAt(0.45, -0.5, 0)
 
     const faceLines = makeLines(FACE_EDGES.length, 0x9aa6bc, 0.85)
@@ -246,7 +250,18 @@ const AvatarSigner3D = forwardRef(function AvatarSigner3D({ apiUrl, onSign, onFi
 
   const processQueue = useCallback(async () => {
     if (playingRef.current) return
-    if (queueRef.current.length === 0) { setStatus('idle'); onFinish?.(); return }
+    if (queueRef.current.length === 0) {
+      // Fin de la secuencia: si hay loop, reinicia tras una pausa; si no, termina.
+      if (loopTokensRef.current.length) {
+        setStatus('idle')
+        loopTimerRef.current = setTimeout(() => {
+          queueRef.current = [...loopTokensRef.current]
+          processQueue()
+        }, LOOP_GAP_MS)
+        return
+      }
+      setStatus('idle'); onFinish?.(); return
+    }
     playingRef.current = true
     const token = queueRef.current.shift()
     onSign?.(token)
@@ -266,13 +281,19 @@ const AvatarSigner3D = forwardRef(function AvatarSigner3D({ apiUrl, onSign, onFi
     queue(token) { if (!token) return; queueRef.current.push(token); processQueue() },
     replace(tokens) {
       if (timerRef.current) cancelAnimationFrame(timerRef.current)
+      if (loopTimerRef.current) clearTimeout(loopTimerRef.current)
       playingRef.current = false
+      loopTokensRef.current = [...(tokens || [])]   // repetir esta secuencia en bucle
       queueRef.current = [...(tokens || [])]
       processQueue()
     },
     clear() {
       if (timerRef.current) cancelAnimationFrame(timerRef.current)
-      playingRef.current = false; queueRef.current = []; setStatus('idle')
+      if (loopTimerRef.current) clearTimeout(loopTimerRef.current)
+      playingRef.current = false
+      loopTokensRef.current = []
+      queueRef.current = []
+      setStatus('idle')
     },
   }), [processQueue])
 

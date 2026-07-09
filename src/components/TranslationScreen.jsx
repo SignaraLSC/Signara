@@ -21,6 +21,26 @@ import { translateText } from '../utils/translateText.js'
 import { tokenize } from '../utils/textNormalizer.js'
 import { SIGNED_LANG_LABEL } from '../utils/signLanguage.js'
 
+/**
+ * Empareja las palabras del texto con las señas disponibles, reconociendo
+ * frases de varias palabras (p.ej. "por favor" → token "POR_FAVOR").
+ * Estrategia voraz: intenta unir hasta 3 palabras seguidas con "_".
+ */
+function matchSignTokens(words, available) {
+  if (!available || !available.length) return []
+  const result = []
+  let i = 0
+  while (i < words.length) {
+    let hit = null, len = 0
+    for (let n = Math.min(3, words.length - i); n >= 1; n--) {
+      const cand = words.slice(i, i + n).join('_')
+      if (available.includes(cand)) { hit = cand; len = n; break }
+    }
+    if (hit) { result.push(hit); i += len } else { i += 1 }
+  }
+  return result
+}
+
 export default function TranslationScreen({
   initialMode = 'text',
   onBack,
@@ -113,7 +133,7 @@ export default function TranslationScreen({
     // reprodúcela en el esqueleto 3D en vez de pedir la pose a sign.mt.
     const tokens = tokenize(text).map((w) => w.toUpperCase())
     const available = availableTokensRef.current
-    const matched = available.length ? tokens.filter((t) => available.includes(t)) : []
+    const matched = matchSignTokens(tokens, available)
 
     if (matched.length > 0) {
       setTranslateSource('signer3d')

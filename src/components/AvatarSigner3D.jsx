@@ -10,7 +10,6 @@
  *  - Suavizado temporal (media móvil) para quitar el tembleque de MediaPipe.
  *  - Manos ausentes: se ocultan o se mantienen, en vez de saltar al origen.
  *  - Reproducción por tiempo con interpolación entre frames → fluido a 60fps.
- *  - La seña se repite en bucle para que el movimiento se aprecie.
  *
  * API imperativa (via ref): queue(token) · replace([tokens]) · clear()
  */
@@ -52,7 +51,6 @@ const FACE_EDGES = buildFaceEdges(FACE_SPANS)
 
 const FPS = 30
 const Z_SCALE = 0.7
-const LOOP_GAP_MS = 700
 
 // ─── Preproceso de datos ────────────────────────────────────────────────────────
 const isZeroPt = (p) => !p || (p[0] === 0 && p[1] === 0 && p[2] === 0)
@@ -163,8 +161,6 @@ const AvatarSigner3D = forwardRef(function AvatarSigner3D({ apiUrl, onSign, onFi
   const queueRef = useRef([])
   const playingRef = useRef(false)
   const timerRef = useRef(null)
-  const loopTokensRef = useRef([])
-  const loopTimerRef = useRef(null)
   const [status, setStatus] = useState('idle')
   const [everPlayed, setEverPlayed] = useState(false)
 
@@ -272,17 +268,7 @@ const AvatarSigner3D = forwardRef(function AvatarSigner3D({ apiUrl, onSign, onFi
 
   const processQueue = useCallback(async () => {
     if (playingRef.current) return
-    if (queueRef.current.length === 0) {
-      if (loopTokensRef.current.length) {
-        setStatus('idle')
-        loopTimerRef.current = setTimeout(() => {
-          queueRef.current = [...loopTokensRef.current]
-          processQueue()
-        }, LOOP_GAP_MS)
-        return
-      }
-      setStatus('idle'); onFinish?.(); return
-    }
+    if (queueRef.current.length === 0) { setStatus('idle'); onFinish?.(); return }
     playingRef.current = true
     const token = queueRef.current.shift()
     onSign?.(token)
@@ -302,17 +288,13 @@ const AvatarSigner3D = forwardRef(function AvatarSigner3D({ apiUrl, onSign, onFi
     queue(token) { if (!token) return; queueRef.current.push(token); processQueue() },
     replace(tokens) {
       if (timerRef.current) cancelAnimationFrame(timerRef.current)
-      if (loopTimerRef.current) clearTimeout(loopTimerRef.current)
       playingRef.current = false
-      loopTokensRef.current = [...(tokens || [])]
       queueRef.current = [...(tokens || [])]
       processQueue()
     },
     clear() {
       if (timerRef.current) cancelAnimationFrame(timerRef.current)
-      if (loopTimerRef.current) clearTimeout(loopTimerRef.current)
       playingRef.current = false
-      loopTokensRef.current = []
       queueRef.current = []
       setStatus('idle')
     },

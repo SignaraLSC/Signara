@@ -36,6 +36,8 @@ Formato de data/<persona>_raw.csv (una fila por landmark de mano y frame):
 import csv
 import json
 import os
+import re
+import unicodedata
 
 import cv2
 import mediapipe as mp
@@ -85,6 +87,33 @@ def extract_full(results):
     }
 
 
+# ─── Cara recortada (mismos 124 puntos de contorno que dibuja AvatarSigner3D) ──
+# Orden EXACTO: óvalo, ojo der, ojo izq, ceja der, ceja izq, labios ext, labios int, nariz.
+FACE_OVAL   = [10,338,297,332,284,251,389,356,454,323,361,288,397,365,379,378,400,377,152,148,176,149,150,136,172,58,132,93,234,127,162,21,54,103,67,109]
+FACE_R_EYE  = [33,7,163,144,145,153,154,155,133,173,157,158,159,160,161,246]
+FACE_L_EYE  = [263,249,390,373,374,380,381,382,362,398,384,385,386,387,388,466]
+FACE_R_BROW = [107,66,105,63,70]
+FACE_L_BROW = [336,296,334,293,300]
+FACE_LIPS_O = [61,146,91,181,84,17,314,405,321,375,291,409,270,269,267,0,37,39,40,185]
+FACE_LIPS_I = [78,95,88,178,87,14,317,402,318,324,308,415,310,311,312,13,82,81,80,191]
+FACE_NOSE   = [168,6,197,195,5,4]
+FACE_KEEP   = (FACE_OVAL + FACE_R_EYE + FACE_L_EYE + FACE_R_BROW + FACE_L_BROW
+               + FACE_LIPS_O + FACE_LIPS_I + FACE_NOSE)   # 124 puntos
+
+
+def slim_face(face):
+    """Recorta los 478 puntos de cara a los 124 de contorno (para el avatar)."""
+    return [face[i] if i < len(face) else [0.0, 0.0, 0.0] for i in FACE_KEEP]
+
+
+def normalize_label(raw):
+    """Nombre de seña sin acentos, MAYÚSCULAS y con espacios→'_'
+    (así 'por favor' → 'POR_FAVOR', que es como lo empareja el frontend)."""
+    s = unicodedata.normalize("NFD", raw).encode("ascii", "ignore").decode("ascii")
+    s = re.sub(r"[^A-Za-z0-9]+", "_", s.strip())
+    return s.upper().strip("_")
+
+
 def next_muestra_id(csv_path, label):
     """Continúa la numeración de muestras si el CSV ya existe."""
     if not os.path.exists(csv_path):
@@ -132,12 +161,17 @@ def save_raw_full(persona, label, muestra, full_frames):
 
 
 def save_animation(label, full_frames):
-    """Animación canónica del avatar (formato de 04_record_animations.py)."""
+    """Animación canónica del avatar. Guarda la cara RECORTADA (124 puntos de
+    contorno) que dibuja AvatarSigner3D; la cara completa queda en raw_full."""
+    frames = [
+        {"lh": f["lh"], "rh": f["rh"], "pose": f["pose"], "face": slim_face(f["face"])}
+        for f in full_frames
+    ]
     path = os.path.join(ANIM_DIR, f"{label}.json")
     with open(path, "w", encoding="utf-8") as f:
-        json.dump({"token": label, "fps": FPS_TARGET, "frames": full_frames},
+        json.dump({"token": label, "fps": FPS_TARGET, "frames": frames},
                   f, separators=(",", ":"))
-    print(f"⭐ Animación canónica guardada: {path}  ({len(full_frames)} frames)")
+    print(f"⭐ Animación canónica guardada: {path}  ({len(frames)} frames)")
 
 
 def draw_overlay(frame, results):
@@ -159,7 +193,7 @@ def draw_overlay(frame, results):
 
 def main():
     persona = input("Persona (quién graba, ej: alanis): ").strip().lower() or "anon"
-    label   = input("Nombre de la seña (ej: HOLA, GRACIAS, IDLE): ").upper().strip()
+    label   = normalize_label(input("Nombre de la seña (ej: HOLA, POR FAVOR, IDLE): "))
 
     csv_path = os.path.join(DATA_DIR, f"{persona}_raw.csv")
     muestra  = next_muestra_id(csv_path, label)

@@ -1,273 +1,323 @@
 /**
  * AvatarSigner3D
- * Plays sign-language animations recorded with 04_record_animations.py.
+ * Reproduce animaciones de señas grabadas con 00_capture.py, servidas por la API
+ * ML en /sign/{token} como { token, fps, frames:[{lh, rh, pose, face}] }.
  *
- * Each animation is a JSON file with:
- *   { token, fps, frames: [{lh, rh, pose}] }
- * where lh/rh = 21 landmarks [x,y,z], pose = 33 landmarks [x,y,z].
+ * Acabado profesional:
+ *  - Cara como malla de contornos (óvalo, ojos, cejas, labios, nariz).
+ *  - Líneas gruesas reales (LineSegments2), fondo con degradado y auto-órbita
+ *    suave para que se perciba la profundidad.
+ *  - Suavizado temporal (media móvil) para quitar el tembleque de MediaPipe.
+ *  - Manos ausentes: se ocultan o se mantienen, en vez de saltar al origen.
+ *  - Reproducción por tiempo con interpolación entre frames → fluido a 60fps.
+ *  - Transición interpolada entre señas encadenadas (sin salto de pose al
+ *    pasar de una seña a la siguiente en una frase de varias palabras).
  *
- * Imperative API (via ref):
- *   queue(token)          — add one token to the play queue
- *   replace([tokens])     — clear queue and replace with new list
- *   clear()               — stop and clear everything
+ * API imperativa (via ref): queue(token) · replace([tokens]) · clear()
  */
 
 import {
-  forwardRef,
-  useCallback,
-  useEffect,
-  useImperativeHandle,
-  useRef,
-  useState,
+  forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState,
 } from 'react'
 import * as THREE from 'three'
+import { LineSegments2 } from 'three/examples/jsm/lines/LineSegments2.js'
+import { LineSegmentsGeometry } from 'three/examples/jsm/lines/LineSegmentsGeometry.js'
+import { LineMaterial } from 'three/examples/jsm/lines/LineMaterial.js'
 
-// ─── MediaPipe hand landmark connections ──────────────────────────────────────
+// ─── Conexiones ────────────────────────────────────────────────────────────────
 const HAND_CONNECTIONS = [
-  [0,1],[1,2],[2,3],[3,4],
-  [0,5],[5,6],[6,7],[7,8],
-  [5,9],[9,10],[10,11],[11,12],
-  [9,13],[13,14],[14,15],[15,16],
-  [13,17],[17,18],[18,19],[19,20],
-  [0,17],
+  [0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17],
 ]
+// Pose: solo hombros, codos y muñecas (la cara la dibuja la malla facial; se
+// omiten las caderas porque suelen quedar fuera de cuadro y dan valores extremos)
+const POSE_POINTS = [11, 12, 13, 14, 15, 16]
+const POSE_CONNECTIONS = [[11,12],[11,13],[13,15],[12,14],[14,16]]
 
-// Pose landmarks we care about (upper body only: shoulders, elbows, wrists)
-const POSE_CONNECTIONS = [
-  [11,12],[11,13],[13,15],[12,14],[14,16],
-  [11,23],[12,24],[23,24],
+// Cara: tamaños de cada grupo de contorno (deben coincidir con slim_face() en
+// sign_ai/00_capture.py, que es quien recorta los 478 puntos de MediaPipe a
+// estos 124 antes de guardar la animación).
+const FACE_SPANS = [
+  { count: 36, loop: true },  { count: 16, loop: true },  { count: 16, loop: true },
+  { count: 5,  loop: false }, { count: 5,  loop: false }, { count: 20, loop: true },
+  { count: 20, loop: true },  { count: 6,  loop: false },
 ]
+function buildFaceEdges(spans) {
+  const edges = []; let off = 0
+  for (const g of spans) {
+    for (let i = 0; i < g.count - 1; i++) edges.push([off + i, off + i + 1])
+    if (g.loop && g.count > 2) edges.push([off + g.count - 1, off])
+    off += g.count
+  }
+  return edges
+}
+const FACE_EDGES = buildFaceEdges(FACE_SPANS)
 
-const INTERP_FRAMES = 6      // lerp frames between signs
 const FPS = 30
-const MS_PER_FRAME = 1000 / FPS
+const Z_SCALE = 0.7
+const INTERP_FRAMES = 6   // frames de transición entre una seña y la siguiente
 
-// ─── Three.js helpers ─────────────────────────────────────────────────────────
+// ─── Preproceso de datos ────────────────────────────────────────────────────────
+const isZeroPt = (p) => !p || (p[0] === 0 && p[1] === 0 && p[2] === 0)
+const handAllZero = (arr) => !arr || arr.every(isZeroPt)
+// Sirve tanto para manos como para cara: ¿algún frame trae puntos no-cero?
+// slim_face() en 00_capture.py siempre devuelve 124 entradas (rellenas con
+// [0,0,0] si MediaPipe no detectó cara ese frame), así que un simple
+// "length > 0" nunca detecta "no se capturó cara" — hay que mirar los valores.
+const anyNonZero = (frames, key) => frames.some((f) => !handAllZero(f[key]))
 
-function makeDots(count, color) {
-  const geo = new THREE.BufferGeometry()
-  const pos = new Float32Array(count * 3)
-  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3))
-  const mat = new THREE.PointsMaterial({ color, size: 0.025, sizeAttenuation: true })
-  return new THREE.Points(geo, mat)
-}
-
-function makeLines(connections, color) {
-  const count = connections.length * 2
-  const geo = new THREE.BufferGeometry()
-  const pos = new Float32Array(count * 3)
-  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3))
-  const mat = new THREE.LineBasicMaterial({ color })
-  return new THREE.LineSegments(geo, mat)
-}
-
-function updateDots(points, lmList) {
-  const attr = points.geometry.attributes.position
-  for (let i = 0; i < lmList.length; i++) {
-    const [x, y, z] = lmList[i]
-    attr.setXYZ(i, x, -y, z)
+function fillHand(frames, key) {
+  let last = null
+  for (const f of frames) {
+    if (!handAllZero(f[key])) last = f[key]
+    else if (last) f[key] = last.map((p) => [...p])
   }
-  attr.needsUpdate = true
-}
-
-function updateLines(lines, lmList, connections) {
-  const attr = lines.geometry.attributes.position
-  for (let i = 0; i < connections.length; i++) {
-    const [a, b] = connections[i]
-    const [ax, ay, az] = lmList[a]
-    const [bx, by, bz] = lmList[b]
-    attr.setXYZ(i * 2,     ax, -ay, az)
-    attr.setXYZ(i * 2 + 1, bx, -by, bz)
-  }
-  attr.needsUpdate = true
-}
-
-function lerp3(a, b, t) {
-  return [
-    a[0] + (b[0] - a[0]) * t,
-    a[1] + (b[1] - a[1]) * t,
-    a[2] + (b[2] - a[2]) * t,
-  ]
-}
-
-function lerpFrame(frameA, frameB, t) {
-  return {
-    lh:   frameA.lh.map((p, i) => lerp3(p, frameB.lh[i], t)),
-    rh:   frameA.rh.map((p, i) => lerp3(p, frameB.rh[i], t)),
-    pose: frameA.pose.map((p, i) => lerp3(p, frameB.pose[i], t)),
+  last = null
+  for (let i = frames.length - 1; i >= 0; i--) {
+    const f = frames[i]
+    if (!handAllZero(f[key])) last = f[key]
+    else if (last) f[key] = last.map((p) => [...p])
   }
 }
 
-// ─── Component ────────────────────────────────────────────────────────────────
+function smoothStream(frames, key, win) {
+  const n = frames.length
+  if (!n || !frames[0][key] || !frames[0][key].length) return
+  const L = frames[0][key].length
+  const h = Math.floor(win / 2)
+  const out = frames.map(() => new Array(L))
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < L; j++) {
+      let sx = 0, sy = 0, sz = 0, c = 0
+      for (let k = i - h; k <= i + h; k++) {
+        if (k < 0 || k >= n) continue
+        const p = frames[k][key][j]; sx += p[0]; sy += p[1]; sz += p[2]; c++
+      }
+      out[i][j] = [sx / c, sy / c, sz / c]
+    }
+  }
+  for (let i = 0; i < n; i++) frames[i][key] = out[i]
+}
 
-const AvatarSigner3D = forwardRef(function AvatarSigner3D(
-  { apiUrl, onSign, onFinish },
-  ref
-) {
+// Recorta coordenadas fuera de rango (glitches de MediaPipe cuando una parte
+// del cuerpo sale del cuadro) para que el esqueleto no se salga de cámara.
+const clampPt = (p) => [
+  Math.max(-0.3, Math.min(1.3, p[0])),
+  Math.max(-0.3, Math.min(1.4, p[1])),
+  Math.max(-1, Math.min(1, p[2])),
+]
+
+function preprocess(raw) {
+  const frames = raw.map((f) => ({
+    lh: f.lh, rh: f.rh,
+    pose: f.pose.map(clampPt),
+    face: (f.face || []).map(clampPt),
+  }))
+  const lhActive = anyNonZero(frames, 'lh')
+  const rhActive = anyNonZero(frames, 'rh')
+  // No basta con frames[0].face.length > 0: slim_face() rellena con ceros los
+  // frames sin cara detectada, así que la longitud siempre es 124. Hay que
+  // comprobar que al menos un frame tenga puntos reales (igual que las manos).
+  const hasFace = frames[0].face.length > 0 && anyNonZero(frames, 'face')
+  if (lhActive) { fillHand(frames, 'lh'); smoothStream(frames, 'lh', 5) }
+  if (rhActive) { fillHand(frames, 'rh'); smoothStream(frames, 'rh', 5) }
+  smoothStream(frames, 'pose', 5)
+  if (hasFace) smoothStream(frames, 'face', 3)
+  return { frames, lhActive, rhActive, hasFace }
+}
+
+const lerpArr = (a, b, t) =>
+  a.map((p, i) => [p[0] + (b[i][0] - p[0]) * t, p[1] + (b[i][1] - p[1]) * t, p[2] + (b[i][2] - p[2]) * t])
+const lerpFrame = (A, B, t) => ({
+  lh: lerpArr(A.lh, B.lh, t), rh: lerpArr(A.rh, B.rh, t),
+  pose: lerpArr(A.pose, B.pose, t), face: A.face.length ? lerpArr(A.face, B.face, t) : [],
+})
+
+// ─── Three.js ────────────────────────────────────────────────────────────────
+function makeDots(count, color, size) {
+  const g = new THREE.BufferGeometry()
+  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(count * 3), 3))
+  return new THREE.Points(g, new THREE.PointsMaterial({ color, size, sizeAttenuation: true, transparent: true, opacity: 0.95 }))
+}
+// Líneas GRUESAS reales (LineSegments2) — grosor en píxeles.
+function makeLines(color, linewidth, opacity) {
+  const geo = new LineSegmentsGeometry()
+  const mat = new LineMaterial({ color, linewidth, transparent: true, opacity, dashed: false })
+  const line = new LineSegments2(geo, mat)
+  line.frustumCulled = false
+  return line
+}
+function setDots(points, list) {
+  const a = points.geometry.attributes.position
+  for (let i = 0; i < list.length; i++) { const [x, y, z] = list[i]; a.setXYZ(i, x, -y, z * Z_SCALE) }
+  a.needsUpdate = true
+}
+function setDotsSubset(points, list, idxs) {
+  const a = points.geometry.attributes.position
+  for (let i = 0; i < idxs.length; i++) { const [x, y, z] = list[idxs[i]]; a.setXYZ(i, x, -y, z * Z_SCALE) }
+  a.needsUpdate = true
+}
+function setLines(lineObj, list, edges) {
+  const pos = new Float32Array(edges.length * 6)
+  for (let i = 0; i < edges.length; i++) {
+    const [u, v] = edges[i]; const A = list[u], B = list[v]
+    pos[i*6+0] = A[0]; pos[i*6+1] = -A[1]; pos[i*6+2] = A[2] * Z_SCALE
+    pos[i*6+3] = B[0]; pos[i*6+4] = -B[1]; pos[i*6+5] = B[2] * Z_SCALE
+  }
+  lineObj.geometry.setPositions(pos)
+}
+
+const AvatarSigner3D = forwardRef(function AvatarSigner3D({ apiUrl, onSign, onFinish }, ref) {
   const canvasRef = useRef(null)
-  const sceneRef = useRef(null)          // { scene, camera, renderer, objects }
-  const cacheRef = useRef({})            // token → frames[]
-  const queueRef = useRef([])            // pending tokens
+  const sceneRef = useRef(null)
+  const cacheRef = useRef({})
+  const queueRef = useRef([])
   const playingRef = useRef(false)
   const timerRef = useRef(null)
-
-  const [status, setStatus] = useState('idle') // idle | loading | playing | error
-
-  // ─── Fetch animation (with cache) ────────────────────────────────────────
+  const [status, setStatus] = useState('idle')
+  const [everPlayed, setEverPlayed] = useState(false)
 
   const fetchAnim = useCallback(async (token) => {
     if (cacheRef.current[token]) return cacheRef.current[token]
-    const url = `${apiUrl}/sign/${token}`
-    const res = await fetch(url)
+    const res = await fetch(`${apiUrl}/sign/${token}`)
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const data = await res.json()
-    cacheRef.current[token] = data.frames
-    return data.frames
+    const proc = preprocess(data.frames)
+    cacheRef.current[token] = proc
+    return proc
   }, [apiUrl])
 
-  // ─── Three.js init ───────────────────────────────────────────────────────
-
+  // ─── Init escena ──────────────────────────────────────────────────────────
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return
-
     const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true })
-    renderer.setPixelRatio(window.devicePixelRatio)
-    renderer.setClearColor(0x000000, 0)
-
-    const w = canvas.clientWidth
-    const h = canvas.clientHeight
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
+    const w = canvas.clientWidth, h = canvas.clientHeight
     renderer.setSize(w, h, false)
 
     const scene = new THREE.Scene()
-    const camera = new THREE.PerspectiveCamera(45, w / h, 0.01, 10)
-    camera.position.set(0.5, -0.3, 2.2)
-    camera.lookAt(0.5, -0.5, 0)
+    const camera = new THREE.PerspectiveCamera(40, w / h, 0.01, 10)
 
-    // Hand dots + lines
-    const lhDots  = makeDots(21, 0x818cf8)   // indigo-400
-    const lhLines = makeLines(HAND_CONNECTIONS, 0x6366f1)
-    const rhDots  = makeDots(21, 0xa78bfa)   // violet-400
-    const rhLines = makeLines(HAND_CONNECTIONS, 0x8b5cf6)
-    const poseDots  = makeDots(33, 0xfbbf24)  // amber-400
-    const poseLines = makeLines(POSE_CONNECTIONS, 0xd97706)
+    // Órbita: target y radio en el plano xz para el vaivén suave (percibe profundidad)
+    const target = new THREE.Vector3(0.45, -0.5, 0)
+    const R = 1.6, BASE_ANG = 0.26   // ~15°
+    camera.position.set(target.x + R * Math.sin(BASE_ANG), -0.48, target.z + R * Math.cos(BASE_ANG))
+    camera.lookAt(target)
 
-    scene.add(lhDots, lhLines, rhDots, rhLines, poseDots, poseLines)
+    const faceLines = makeLines(0x8b93a7, 1.6, 0.9)
+    const poseLines = makeLines(0x7c86a0, 3.0, 0.95)
+    const poseDots  = makeDots(POSE_POINTS.length, 0x9aa6bc, 0.02)
+    const lhLines   = makeLines(0x6366f1, 3.5, 0.98)
+    const lhDots    = makeDots(21, 0xa5b4fc, 0.022)
+    const rhLines   = makeLines(0x8b5cf6, 3.5, 0.98)
+    const rhDots    = makeDots(21, 0xc4b5fd, 0.022)
 
+    scene.add(faceLines, poseLines, poseDots, lhLines, lhDots, rhLines, rhDots)
+
+    const lineMats = [faceLines.material, poseLines.material, lhLines.material, rhLines.material]
+    const setRes = (ww, hh) => lineMats.forEach((m) => m.resolution.set(ww, hh))
+    setRes(w, h)
+
+    const t0 = performance.now()
     let animId
     const render = () => {
       animId = requestAnimationFrame(render)
+      const t = (performance.now() - t0) / 1000
+      const ang = BASE_ANG + Math.sin(t * 0.45) * 0.16   // vaivén ±~9°
+      camera.position.x = target.x + R * Math.sin(ang)
+      camera.position.z = target.z + R * Math.cos(ang)
+      camera.lookAt(target)
       renderer.render(scene, camera)
     }
     render()
 
-    sceneRef.current = { scene, camera, renderer, lhDots, lhLines, rhDots, rhLines, poseDots, poseLines }
+    sceneRef.current = { scene, camera, renderer, faceLines, poseLines, poseDots, lhLines, lhDots, rhLines, rhDots }
 
     const onResize = () => {
-      const w2 = canvas.clientWidth
-      const h2 = canvas.clientHeight
-      renderer.setSize(w2, h2, false)
-      camera.aspect = w2 / h2
-      camera.updateProjectionMatrix()
+      const w2 = canvas.clientWidth, h2 = canvas.clientHeight
+      renderer.setSize(w2, h2, false); camera.aspect = w2 / h2; camera.updateProjectionMatrix()
+      setRes(w2, h2)
     }
     window.addEventListener('resize', onResize)
-
     return () => {
-      cancelAnimationFrame(animId)
-      window.removeEventListener('resize', onResize)
-      renderer.dispose()
-      sceneRef.current = null
+      cancelAnimationFrame(animId); window.removeEventListener('resize', onResize)
+      renderer.dispose(); sceneRef.current = null
     }
   }, [])
 
-  // ─── Draw a single frame ─────────────────────────────────────────────────
-
-  const drawFrame = useCallback((frame) => {
+  const drawFrame = useCallback((f) => {
     const s = sceneRef.current
     if (!s) return
-    updateDots(s.lhDots,  frame.lh)
-    updateLines(s.lhLines, frame.lh, HAND_CONNECTIONS)
-    updateDots(s.rhDots,  frame.rh)
-    updateLines(s.rhLines, frame.rh, HAND_CONNECTIONS)
-    updateDots(s.poseDots,  frame.pose)
-    updateLines(s.poseLines, frame.pose, POSE_CONNECTIONS)
+    if (s.faceLines.visible && f.face.length) setLines(s.faceLines, f.face, FACE_EDGES)
+    setDotsSubset(s.poseDots, f.pose, POSE_POINTS); setLines(s.poseLines, f.pose, POSE_CONNECTIONS)
+    if (s.lhLines.visible) { setDots(s.lhDots, f.lh); setLines(s.lhLines, f.lh, HAND_CONNECTIONS) }
+    if (s.rhLines.visible) { setDots(s.rhDots, f.rh); setLines(s.rhLines, f.rh, HAND_CONNECTIONS) }
   }, [])
 
-  // ─── Play sequence of frames (rAF for smooth, drift-free 30fps) ──────────
-
-  const playFrames = useCallback((frames, onDone) => {
-    let i = 0
-    let lastTime = null
-
+  const playProcessed = useCallback((proc, onDone) => {
+    const { frames } = proc
+    if (!frames.length) { onDone(); return }
+    let start = null
+    let visSet = false
     const step = (now) => {
-      if (!lastTime) lastTime = now
-      const elapsed = now - lastTime
-      if (elapsed >= MS_PER_FRAME) {
-        if (i >= frames.length) { onDone(); return }
-        drawFrame(frames[i++])
-        lastTime = now - (elapsed % MS_PER_FRAME)  // absorb overshoot
+      const s = sceneRef.current
+      if (!s) { timerRef.current = requestAnimationFrame(step); return }
+      if (!visSet) {
+        s.lhLines.visible = s.lhDots.visible = proc.lhActive
+        s.rhLines.visible = s.rhDots.visible = proc.rhActive
+        s.faceLines.visible = proc.hasFace
+        visSet = true
       }
+      if (start === null) start = now
+      const pos = ((now - start) / 1000) * FPS
+      if (pos >= frames.length - 1) { drawFrame(frames[frames.length - 1]); onDone(); return }
+      const i = Math.floor(pos), t = pos - i
+      drawFrame(lerpFrame(frames[i], frames[i + 1], t))
       timerRef.current = requestAnimationFrame(step)
     }
     timerRef.current = requestAnimationFrame(step)
   }, [drawFrame])
 
-  // ─── Process queue ───────────────────────────────────────────────────────
-
   const processQueue = useCallback(async () => {
     if (playingRef.current) return
-    if (queueRef.current.length === 0) {
-      setStatus('idle')
-      if (onFinish) onFinish()
-      return
-    }
-
+    if (queueRef.current.length === 0) { setStatus('idle'); onFinish?.(); return }
     playingRef.current = true
     const token = queueRef.current.shift()
-
-    if (onSign) onSign(token)
-    setStatus('playing')
-
-    let frames
+    onSign?.(token)
     try {
       setStatus('loading')
-      frames = await fetchAnim(token)
+      const proc = await fetchAnim(token)
       setStatus('playing')
+      setEverPlayed(true)
+
+      // Si hay otra seña encolada, pre-carga su animación (sin sacarla de la
+      // cola) y añade unos frames de transición al final de esta, para evitar
+      // el salto brusco de pose entre una seña y la siguiente.
+      let framesToPlay = proc.frames
+      const nextToken = queueRef.current[0]
+      if (nextToken) {
+        try {
+          const nextProc = await fetchAnim(nextToken)
+          const lastFrame = proc.frames[proc.frames.length - 1]
+          const firstNext = nextProc.frames[0]
+          const blend = []
+          for (let k = 1; k <= INTERP_FRAMES; k++) {
+            blend.push(lerpFrame(lastFrame, firstNext, k / (INTERP_FRAMES + 1)))
+          }
+          framesToPlay = [...proc.frames, ...blend]
+        } catch { /* si falla el pre-fetch, se reproduce sin transición */ }
+      }
+
+      playProcessed({ ...proc, frames: framesToPlay }, () => { playingRef.current = false; processQueue() })
     } catch {
       playingRef.current = false
       processQueue()
-      return
     }
-
-    // If there's a next token, pre-fetch and append lerp transition
-    const nextToken = queueRef.current[0]
-    let allFrames = [...frames]
-
-    if (nextToken) {
-      try {
-        const nextFrames = await fetchAnim(nextToken)
-        const lastFrame = frames[frames.length - 1]
-        const firstNext = nextFrames[0]
-        for (let t = 1; t <= INTERP_FRAMES; t++) {
-          allFrames.push(lerpFrame(lastFrame, firstNext, t / (INTERP_FRAMES + 1)))
-        }
-      } catch { /* no interp if fetch fails */ }
-    }
-
-    playFrames(allFrames, () => {
-      playingRef.current = false
-      processQueue()
-    })
-  }, [fetchAnim, playFrames, onSign, onFinish])
-
-  // ─── Imperative handle ───────────────────────────────────────────────────
+  }, [fetchAnim, playProcessed, onSign, onFinish])
 
   useImperativeHandle(ref, () => ({
-    queue(token) {
-      if (!token) return
-      queueRef.current.push(token)
-      processQueue()
-    },
+    queue(token) { if (!token) return; queueRef.current.push(token); processQueue() },
     replace(tokens) {
       if (timerRef.current) cancelAnimationFrame(timerRef.current)
       playingRef.current = false
@@ -283,18 +333,17 @@ const AvatarSigner3D = forwardRef(function AvatarSigner3D(
   }), [processQueue])
 
   return (
-    <div className="relative w-full h-full rounded-4xl overflow-hidden bg-white border border-white/90 shadow-soft">
-      <canvas
-        ref={canvasRef}
-        className="w-full h-full"
-        style={{ display: 'block' }}
-      />
+    <div
+      className="relative w-full h-full rounded-4xl overflow-hidden border border-white/90 shadow-soft"
+      style={{ background: 'radial-gradient(120% 95% at 50% 12%, #F1EEFB 0%, #FBFAFE 55%, #F4F1FA 100%)' }}
+    >
+      <canvas ref={canvasRef} className="w-full h-full" style={{ display: 'block' }} />
       {status === 'loading' && (
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
           <span className="text-xs text-signara-navy/50">Cargando animación…</span>
         </div>
       )}
-      {status === 'idle' && (
+      {status === 'idle' && !everPlayed && (
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
           <span className="text-xs text-signara-navy/35">Avatar 3D listo</span>
         </div>

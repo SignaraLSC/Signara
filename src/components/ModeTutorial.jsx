@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useMotionExit, MODAL_EXIT_MS } from '../hooks/useMotionExit.js'
+import Icon from './Icon.jsx'
 
 const ACCENTS = {
   translate: {
@@ -282,9 +283,7 @@ function TutorialIntro({
         }
       >
         <div className="tutorial-stagger flex flex-col items-center">
-          <span className="text-6xl leading-none sm:text-7xl" aria-hidden="true">
-            {step.emoji}
-          </span>
+          <Icon name={step.icon} className="h-14 w-14 text-pastel-grape sm:h-16 sm:w-16" strokeWidth={1.75} />
           <h2
             id="mode-tutorial-title"
             className="mt-5 max-w-lg text-2xl font-extrabold tracking-tight text-pastel-ink sm:text-3xl"
@@ -362,12 +361,11 @@ function TutorialCoach({
         >
           <div key={stepIndex} className={'mx-auto max-w-2xl ' + stepEnterClass}>
             <div className="flex items-start gap-3 sm:gap-4">
-              <span
-                className="animate-tutorial-emoji-pop text-2xl leading-none sm:text-3xl"
-                aria-hidden="true"
-              >
-                {step.emoji}
-              </span>
+              <Icon
+                name={step.icon}
+                className="animate-tutorial-emoji-pop h-7 w-7 shrink-0 text-pastel-grape sm:h-8 sm:w-8"
+                strokeWidth={1.75}
+              />
               <div className="min-w-0 flex-1">
                 <h2
                   id="mode-tutorial-title"

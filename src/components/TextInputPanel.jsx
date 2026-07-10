@@ -1,11 +1,12 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react'
 import useVoiceInput from '../hooks/useVoiceInput.js'
+import Icon from './Icon.jsx'
 
 const EXAMPLES = [
-  { text: 'Hola, ¿cómo estás?', emoji: '👋' },
-  { text: 'Necesito ayuda', emoji: '🆘' },
-  { text: 'Tengo sed', emoji: '💧' },
-  { text: 'Te amo', emoji: '❤️' },
+  { text: 'Hola, ¿cómo estás?', icon: 'wave' },
+  { text: 'Necesito ayuda', icon: 'help' },
+  { text: 'Tengo sed', icon: 'droplet' },
+  { text: 'Te amo', icon: 'heart' },
 ]
 
 const TextInputPanel = forwardRef(function TextInputPanel(
@@ -172,7 +173,7 @@ const TextInputPanel = forwardRef(function TextInputPanel(
             onFocus={() => { if (listening) stop(); setInputMode('text') }}
             placeholder={
               listening
-                ? '🎤 Habla ahora — el avatar señará al instante'
+                ? 'Habla ahora — el avatar señará al instante'
                 : 'Escribe aquí tu mensaje en español…'
             }
             className="min-w-0 flex-1 bg-transparent outline-none px-1 py-2 text-base font-semibold text-pastel-ink placeholder:text-pastel-sub/70 sm:text-lg"
@@ -210,7 +211,7 @@ const TextInputPanel = forwardRef(function TextInputPanel(
             Prueba con un clic
           </p>
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-            {EXAMPLES.map(({ text, emoji }) => (
+            {EXAMPLES.map(({ text, icon }) => (
               <button
                 key={text}
                 type="button"
@@ -218,7 +219,7 @@ const TextInputPanel = forwardRef(function TextInputPanel(
                 onClick={() => runExample(text)}
                 className="group flex flex-col items-center gap-1 rounded-2xl border-2 border-pastel-ink/10 bg-white px-2 py-3 text-center transition hover:-translate-y-0.5 hover:border-pastel-green-line hover:bg-pastel-green/50 hover:shadow-[0_10px_24px_-14px_rgba(45,42,38,0.35)] disabled:opacity-50"
               >
-                <span className="text-2xl transition group-hover:scale-110">{emoji}</span>
+                <Icon name={icon} className="h-6 w-6 text-pastel-grape transition group-hover:scale-110" strokeWidth={1.75} />
                 <span className="text-[11px] font-bold leading-tight text-pastel-ink sm:text-xs">{text}</span>
               </button>
             ))}

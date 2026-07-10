@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { ResetButton, SectionLabel } from './AppShell.jsx'
 import ModeTutorial, { TutorialHelpButton } from './ModeTutorial.jsx'
+import Icon from './Icon.jsx'
 import {
   AppPage,
   AppPageFooter,
@@ -487,7 +488,7 @@ export default function InterpretScreen({ onBack, onHome }) {
 
       const status = !runningRef.current
         ? (cameraOk ? 'Listo' : 'Conectando…')
-        : (mlMode ? 'Muestra una mano' : '⚠ Servidor IA no conectado')
+        : (mlMode ? 'Muestra una mano' : 'Servidor IA no conectado')
       updateCaptureHud(0, { showHud: false, status })
 
       if (hadHands && snapshot.length >= MIN_FRAMES) {
@@ -537,7 +538,7 @@ export default function InterpretScreen({ onBack, onHome }) {
     const status = !runningRef.current
       ? (cameraOk ? 'Listo' : 'Conectando…')
       : !mlMode
-        ? '⚠ Servidor IA no conectado'
+        ? 'Servidor IA no conectado'
         : len >= LIVE_MIN_FRAMES
           ? 'Detectando…'
           : len > 0
@@ -591,7 +592,7 @@ export default function InterpretScreen({ onBack, onHome }) {
     if (cameraConsent === 'declined') return 'Cámara desactivada'
     if (!cameraOk && cameraError)  return 'Sin acceso a cámara'
     if (!running)                  return cameraOk ? 'Listo' : 'Conectando…'
-    if (!mlMode)                   return '⚠ Servidor IA no conectado'
+    if (!mlMode)                   return 'Servidor IA no conectado'
     if (!handVisible)              return 'Muestra una mano'
     if (displaySign && inCooldown) return `${displaySign.replace(/_/g, ' ')} · ${Math.round(displayConf * 100)}%`
     if (bufferLen >= LIVE_MIN_FRAMES) return 'Detectando…'
@@ -679,8 +680,8 @@ export default function InterpretScreen({ onBack, onHome }) {
                   <div className="p-4 pb-0 sm:p-5 sm:pb-0">
                     <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
                       <div>
-                        <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-pastel-ink/70">
-                          📷 Tu cámara
+                        <p className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-[0.22em] text-pastel-ink/70">
+                          <Icon name="camera" className="h-3.5 w-3.5" strokeWidth={2.25} /> Tu cámara
                         </p>
                         <p
                           ref={statusTextRef}
@@ -719,17 +720,17 @@ export default function InterpretScreen({ onBack, onHome }) {
                       style={{ transform: 'scaleX(-1)' }} />
 
                     {!scriptsLoaded && !scriptsError && (
-                      <CameraOverlay icon="⏳" title="Cargando MediaPipe…" />
+                      <CameraOverlay icon="clock" title="Cargando MediaPipe…" />
                     )}
                     {scriptsError && (
-                      <CameraOverlay icon="⚠️" title="Error cargando MediaPipe" subtitle={scriptsError} />
+                      <CameraOverlay icon="alert" title="Error cargando MediaPipe" subtitle={scriptsError} />
                     )}
                     {scriptsLoaded && cameraConsent === 'accepted' && !cameraOk && !cameraError && (
-                      <CameraOverlay icon="📷" title="Conectando cámara…" />
+                      <CameraOverlay icon="camera" title="Conectando cámara…" />
                     )}
                     {cameraError && (
                       <CameraOverlay
-                        icon="🚫"
+                        icon="ban"
                         title="No se pudo iniciar la cámara"
                         subtitle={cameraError}
                         actionLabel="Reintentar"
@@ -740,7 +741,7 @@ export default function InterpretScreen({ onBack, onHome }) {
                     {running && !mlMode && !mlConnecting && (
                       <div className="absolute inset-0 flex items-center justify-center bg-pastel-ink/75 p-6 backdrop-blur-sm">
                         <div className="max-w-sm rounded-2xl border-2 border-pastel-blue-line bg-[#FAF6EC] p-5 text-center shadow-xl">
-                          <p className="text-3xl">⚠️</p>
+                          <Icon name="alert" className="mx-auto h-9 w-9 text-pastel-grape" strokeWidth={1.75} />
                           <p className="mt-2 text-lg font-extrabold text-pastel-ink">Servidor IA no conectado</p>
                           <p className="mt-1 text-xs font-semibold text-pastel-sub">Ejecuta en una terminal:</p>
                           <code className="mt-3 block rounded-xl border-2 border-pastel-ink/10 bg-white px-3 py-2 text-left text-[11px] font-mono text-pastel-grape">
@@ -784,7 +785,7 @@ export default function InterpretScreen({ onBack, onHome }) {
                   )}
                   {scriptsLoaded && cameraConsent === 'declined' && !cameraOk && (
                     <CameraOverlay
-                      icon="📷"
+                      icon="camera"
                       title="Cámara no activada"
                       subtitle="Sin permiso de cámara no podemos interpretar tus señas. Puedes concederlo cuando quieras."
                       actionLabel="Conceder permisos"
@@ -820,13 +821,13 @@ export default function InterpretScreen({ onBack, onHome }) {
                         onChange={(e) => setAudioOn(e.target.checked)}
                         className="h-4 w-4 accent-pastel-grape"
                       />
-                      🔊 Voz alta
+                      <Icon name="volume" className="h-4 w-4" strokeWidth={2} /> Voz alta
                     </label>
                   </div>
                 </div>
 
                 {sentence.length > 0 && (
-                  <OutputCard title="Conversación" emptyIcon="💬" hasContent>
+                  <OutputCard title="Conversación" emptyIcon="message" hasContent>
                     <p className="text-xl font-extrabold leading-relaxed tracking-wide text-pastel-ink sm:text-2xl">
                       {sentence.map((s) => s.replace(/_/g, ' ')).join(' ')}
                     </p>
@@ -872,7 +873,7 @@ export default function InterpretScreen({ onBack, onHome }) {
                     </>
                   ) : (
                     <div className="mt-4 flex flex-col items-center rounded-xl border-2 border-dashed border-pastel-ink/10 bg-pastel-cream/50 px-4 py-8 text-center">
-                      <span className="text-4xl opacity-50">🤟</span>
+                      <Icon name="sign" className="h-9 w-9 text-pastel-sub/50" strokeWidth={1.5} />
                       <p className="mt-2 text-sm font-semibold text-pastel-sub">
                         Aquí aparecerá la seña reconocida
                       </p>
@@ -884,7 +885,7 @@ export default function InterpretScreen({ onBack, onHome }) {
                 <div data-tutorial="interpret-history">
                 <OutputCard
                   title="Historial reciente"
-                  emptyIcon="📋"
+                  emptyIcon="clipboard"
                   hasContent={history.length > 0}
                   empty="Cada seña reconocida aparecerá aquí."
                 >
@@ -969,7 +970,7 @@ function OutputCard({ title, empty, emptyIcon, hasContent, children }) {
       <div className="mt-3">
         {hasContent ? children : (
           <div className="flex flex-col items-center rounded-xl border-2 border-dashed border-pastel-ink/10 bg-pastel-cream/50 px-4 py-6 text-center">
-            {emptyIcon && <span className="text-3xl opacity-50">{emptyIcon}</span>}
+            {emptyIcon && <Icon name={emptyIcon} className="h-8 w-8 text-pastel-sub/50" strokeWidth={1.75} />}
             <p className="mt-2 text-sm font-semibold text-pastel-sub">{empty}</p>
           </div>
         )}
@@ -982,13 +983,12 @@ function CameraPermissionPrompt({ onAccept, onDecline }) {
   return (
     <div className="absolute inset-0 z-30 flex animate-permission-overlay-in items-center justify-center overflow-y-auto bg-pastel-ink/78 p-3 sm:p-5">
       <div className="my-auto w-full max-w-sm animate-permission-card-in rounded-2xl border-2 border-pastel-blue-line bg-[#FAF6EC] p-4 text-center shadow-xl sm:p-5">
-        <p
-          className="animate-float text-2xl sm:text-3xl"
+        <Icon
+          name="camera"
+          className="animate-float mx-auto h-8 w-8 text-pastel-grape sm:h-9 sm:w-9"
+          strokeWidth={1.75}
           style={{ animationDuration: '3.5s' }}
-          aria-hidden="true"
-        >
-          📷
-        </p>
+        />
         <p className="animate-permission-item-in mt-2 text-base font-extrabold text-pastel-ink sm:text-lg">
           Necesitamos tu cámara
         </p>
@@ -1027,9 +1027,7 @@ function CameraOverlay({ icon, title, subtitle, actionLabel, onAction }) {
   return (
     <div className="absolute inset-0 z-30 flex items-center justify-center overflow-y-auto bg-pastel-ink/78 p-3 text-center backdrop-blur-sm sm:p-5">
       <div className="my-auto w-full max-w-sm rounded-2xl border-2 border-pastel-blue-line bg-[#FAF6EC] p-4 shadow-xl sm:p-5">
-        <span className="text-3xl sm:text-4xl" aria-hidden="true">
-          {icon}
-        </span>
+        <Icon name={icon} className="mx-auto h-9 w-9 text-pastel-grape" strokeWidth={1.75} />
         <p className="mt-3 text-base font-extrabold text-pastel-ink sm:text-lg">{title}</p>
         {subtitle && (
           <p className="mt-2 text-xs font-semibold leading-relaxed text-pastel-sub sm:text-sm">{subtitle}</p>

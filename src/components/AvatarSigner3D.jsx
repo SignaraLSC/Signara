@@ -29,10 +29,17 @@ const HAND_CONNECTIONS = [
   [0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
   [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17],
 ]
-// Pose: solo hombros, codos y muñecas (la cara la dibuja la malla facial; se
-// omiten las caderas porque suelen quedar fuera de cuadro y dan valores extremos)
-const POSE_POINTS = [11, 12, 13, 14, 15, 16]
-const POSE_CONNECTIONS = [[11,12],[11,13],[13,15],[12,14],[14,16]]
+// Pose: hombros, codos, muñecas y caderas (torso completo). Los segmentos que
+// tocan un punto no detectado se ocultan en setLines(), así que si la cadera
+// queda fuera de cuadro no se dibuja nada raro. La cara la dibuja la malla facial.
+const POSE_POINTS = [11, 12, 13, 14, 15, 16, 23, 24]
+const POSE_CONNECTIONS = [
+  [11,12], [11,13], [13,15], [12,14], [14,16],   // hombros + brazos
+  [11,23], [12,24], [23,24],                      // torso (hombros→caderas)
+]
+// Índice del mentón dentro del array de cara compacto (punto 152 de MediaPipe,
+// primer grupo FACE_OVAL, posición 18) — se usa para dibujar el cuello.
+const FACE_CHIN_IDX = 18
 
 // Cara: tamaños de cada grupo de contorno (deben coincidir con slim_face() en
 // sign_ai/00_capture.py, que es quien recorta los 478 puntos de MediaPipe a
@@ -160,7 +167,15 @@ function setDotsSubset(points, list, idxs) {
 function setLines(lineObj, list, edges) {
   const pos = new Float32Array(edges.length * 6)
   for (let i = 0; i < edges.length; i++) {
-    const [u, v] = edges[i]; const A = list[u], B = list[v]
+    const [u, v] = edges[i]
+    let A = list[u], B = list[v]
+    // Oculta segmentos con un extremo no detectado ([0,0,0]) colapsándolo:
+    // así una cadera o mano ausente no dibuja una línea hacia el origen.
+    const az = !A || (A[0] === 0 && A[1] === 0 && A[2] === 0)
+    const bz = !B || (B[0] === 0 && B[1] === 0 && B[2] === 0)
+    if (az && bz) { A = B = [0, 0, 0] }
+    else if (az) A = B
+    else if (bz) B = A
     pos[i*6+0] = A[0]; pos[i*6+1] = -A[1]; pos[i*6+2] = A[2] * Z_SCALE
     pos[i*6+3] = B[0]; pos[i*6+4] = -B[1]; pos[i*6+5] = B[2] * Z_SCALE
   }
@@ -205,17 +220,18 @@ const AvatarSigner3D = forwardRef(function AvatarSigner3D({ apiUrl, onSign, onFi
     camera.position.set(target.x + R * Math.sin(BASE_ANG), -0.48, target.z + R * Math.cos(BASE_ANG))
     camera.lookAt(target)
 
-    const faceLines = makeLines(0x8b93a7, 1.6, 0.9)
-    const poseLines = makeLines(0x7c86a0, 3.0, 0.95)
+    const faceLines = makeLines(0x7e879c, 2.4, 0.95)
+    const neckLines = makeLines(0x7c86a0, 3.0, 0.95)
+    const poseLines = makeLines(0x7c86a0, 3.2, 0.96)
     const poseDots  = makeDots(POSE_POINTS.length, 0x9aa6bc, 0.02)
-    const lhLines   = makeLines(0x6366f1, 3.5, 0.98)
+    const lhLines   = makeLines(0x6366f1, 3.6, 0.98)
     const lhDots    = makeDots(21, 0xa5b4fc, 0.022)
-    const rhLines   = makeLines(0x8b5cf6, 3.5, 0.98)
+    const rhLines   = makeLines(0x8b5cf6, 3.6, 0.98)
     const rhDots    = makeDots(21, 0xc4b5fd, 0.022)
 
-    scene.add(faceLines, poseLines, poseDots, lhLines, lhDots, rhLines, rhDots)
+    scene.add(faceLines, neckLines, poseLines, poseDots, lhLines, lhDots, rhLines, rhDots)
 
-    const lineMats = [faceLines.material, poseLines.material, lhLines.material, rhLines.material]
+    const lineMats = [faceLines.material, neckLines.material, poseLines.material, lhLines.material, rhLines.material]
     const setRes = (ww, hh) => lineMats.forEach((m) => m.resolution.set(ww, hh))
     setRes(w, h)
 
@@ -232,7 +248,7 @@ const AvatarSigner3D = forwardRef(function AvatarSigner3D({ apiUrl, onSign, onFi
     }
     render()
 
-    sceneRef.current = { scene, camera, renderer, faceLines, poseLines, poseDots, lhLines, lhDots, rhLines, rhDots }
+    sceneRef.current = { scene, camera, renderer, faceLines, neckLines, poseLines, poseDots, lhLines, lhDots, rhLines, rhDots }
 
     const onResize = () => {
       const w2 = canvas.clientWidth, h2 = canvas.clientHeight
@@ -249,7 +265,15 @@ const AvatarSigner3D = forwardRef(function AvatarSigner3D({ apiUrl, onSign, onFi
   const drawFrame = useCallback((f) => {
     const s = sceneRef.current
     if (!s) return
-    if (s.faceLines.visible && f.face.length) setLines(s.faceLines, f.face, FACE_EDGES)
+    if (s.faceLines.visible && f.face.length) {
+      setLines(s.faceLines, f.face, FACE_EDGES)
+      // Cuello: de la barbilla al centro de los hombros, para que la cara no
+      // "flote" desconectada del cuerpo.
+      const chin = f.face[FACE_CHIN_IDX]
+      const L = f.pose[11], Rr = f.pose[12]
+      const sMid = [(L[0] + Rr[0]) / 2, (L[1] + Rr[1]) / 2, (L[2] + Rr[2]) / 2]
+      setLines(s.neckLines, [chin, sMid], [[0, 1]])
+    }
     setDotsSubset(s.poseDots, f.pose, POSE_POINTS); setLines(s.poseLines, f.pose, POSE_CONNECTIONS)
     if (s.lhLines.visible) { setDots(s.lhDots, f.lh); setLines(s.lhLines, f.lh, HAND_CONNECTIONS) }
     if (s.rhLines.visible) { setDots(s.rhDots, f.rh); setLines(s.rhLines, f.rh, HAND_CONNECTIONS) }
@@ -267,6 +291,7 @@ const AvatarSigner3D = forwardRef(function AvatarSigner3D({ apiUrl, onSign, onFi
         s.lhLines.visible = s.lhDots.visible = proc.lhActive
         s.rhLines.visible = s.rhDots.visible = proc.rhActive
         s.faceLines.visible = proc.hasFace
+        s.neckLines.visible = proc.hasFace
         visSet = true
       }
       if (start === null) start = now

@@ -141,8 +141,26 @@ retrain — no re-recording needed (full body is already stored in `data/raw_ful
 
 ### Working on AI Server
 - Modify `sign_ai/api.py` for endpoint changes.
-- Adjust feature extraction in `sign_ai/core/extractor.py`.
+- Adjust feature extraction in `sign_ai/00_capture.py` (`extract_full`).
 - Capture data + avatar takes with `00_capture.py`, then retrain with `06_gnn_train.py`.
+
+### Words with multiple valid signs (variants)
+Some words have more than one genuinely different way of signing them (e.g. a
+regional LSC variant), as opposed to just stylistic differences between people.
+- **Stylistic variation** (different person, speed, hand size): record under
+  the **same label** — the GNN's augmentation + multi-person data already
+  handles this.
+- **Structural variation** (a truly different movement/handshape for the same
+  word): record each one as a separate sub-label with a `_V<N>` suffix, e.g.
+  `HOLA_V1`, `HOLA_V2` (`00_capture.py`'s `normalize_label` supports typing
+  `"hola v1"`). They train as distinct classes (cleaner decision boundaries),
+  but `core/confusion.py`'s `evaluate_prediction()` sums their probabilities
+  under `canonical_label()` before deciding — so the API always returns the
+  plain word (`HOLA`), and disagreement between variants of the *same* word
+  is never treated as ambiguity (unlike disagreement between different words).
+- The avatar only needs **one** canonical take per word: `save_animation()`
+  always writes under the canonical name (strips `_V<N>`), regardless of
+  which variant you promote with `A`.
 
 ## Testing
 

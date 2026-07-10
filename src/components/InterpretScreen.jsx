@@ -39,13 +39,24 @@ const SAME_SIGN_WAIT = 30
 const MIN_FRAMES     = 8
 const MOVEMENT_MIN   = 0.003  // movimiento mínimo (x,y) para acumular frame
 
-// La predicción en vivo solo debe correr sobre una ventana COMPLETA de
-// SEQ_LEN frames reales (sin relleno). padBuffer() rellena un buffer corto
-// repitiendo el primer frame al inicio; ese patrón artificial no se parece
-// a ninguna muestra de entrenamiento y el modelo puede "estabilizarse" con
-// confianza alta sobre una seña incorrecta antes de que el usuario termine
-// el gesto. MIN_FRAMES (más bajo) se reserva para el camino de respaldo al
-// retirar la mano, donde un poco de relleno es aceptable como último recurso.
+// Frames CONSECUTIVOS de quietud (con la mano aún visible) que se interpretan
+// como "terminé la seña". Dispara una predicción inmediata con lo capturado
+// hasta ahí, sin esperar a tener SEQ_LEN frames ni a que la mano salga de
+// cuadro. A ~66-100ms por frame en el navegador, 4 frames son ~250-400ms de
+// quietud — suficiente para no confundir una pausa breve dentro del gesto
+// con el final real, pero sin sentirse lento. Ajustar si hace falta.
+const MOTION_STOP_FRAMES = 4
+
+// La predicción en vivo (ventana completa) solo debe correr sobre SEQ_LEN
+// frames reales (sin relleno). padBuffer() rellena un buffer corto repitiendo
+// el primer frame al inicio; ese patrón artificial no se parece a ninguna
+// muestra de entrenamiento y el modelo puede "estabilizarse" con confianza
+// alta sobre una seña incorrecta. Por eso el camino RÁPIDO real es otro: en
+// cuanto el movimiento se detiene (MOTION_STOP_FRAMES) o la mano sale de
+// cuadro, se predice de inmediato con los frames reales capturados hasta ese
+// punto (más info abajo, junto a runPrediction). MIN_FRAMES (más bajo) es el
+// mínimo para intentarlo; un poco de relleno ahí es aceptable como último
+// recurso si el gesto fue muy corto.
 const LIVE_MIN_FRAMES = SEQ_LEN
 
 // Conexiones MediaPipe para dibujar el esqueleto de la mano (no viene en drawing_utils).
@@ -150,6 +161,7 @@ export default function InterpretScreen({ onBack, onHome }) {
   const predHistRef       = useRef([])   // historial de predicciones para estabilidad
   const prevFrameRef      = useRef(null) // frame anterior para calcular movimiento
   const noHandCountRef    = useRef(0)    // frames consecutivos sin manos
+  const stillCountRef     = useRef(0)    // frames consecutivos quietos (mano visible)
   const cooldownRef       = useRef(0)    // cooldown frame-based
   const lastSignRef       = useRef('')   // última seña confirmada (evita repetir)
   const apiInFlightRef    = useRef(false)
@@ -342,6 +354,7 @@ export default function InterpretScreen({ onBack, onHome }) {
     landmarkBufferRef.current = []
     predHistRef.current       = []
     prevFrameRef.current      = null
+    stillCountRef.current     = 0
     lastSignRef.current       = ''
     cooldownRef.current       = 0
     apiInFlightRef.current    = false
@@ -361,6 +374,7 @@ export default function InterpretScreen({ onBack, onHome }) {
     landmarkBufferRef.current = []
     predHistRef.current       = []
     prevFrameRef.current      = null
+    stillCountRef.current     = 0
 
     setDisplaySign(prediction)
     setDisplayConf(confidence)
@@ -486,6 +500,7 @@ export default function InterpretScreen({ onBack, onHome }) {
 
       landmarkBufferRef.current = []
       prevFrameRef.current      = null
+      stillCountRef.current     = 0
       handWasVisibleRef.current = false
 
       const status = !runningRef.current
@@ -523,15 +538,31 @@ export default function InterpretScreen({ onBack, onHome }) {
         if (landmarkBufferRef.current.length > SEQ_LEN) {
           landmarkBufferRef.current.shift()
         }
+        stillCountRef.current = 0
+      } else {
+        stillCountRef.current++
       }
       len = landmarkBufferRef.current.length
 
-      // Predicción en vivo: ya no hace falta retirar la mano para detectar.
-      // Solo con ventana completa (ver LIVE_MIN_FRAMES) para no predecir
-      // sobre un buffer relleno artificialmente. runPrediction() se
-      // autolimita con apiInFlightRef (una petición a la vez) y cooldownRef,
-      // así que esto no satura la API.
-      if (!cooling && len >= LIVE_MIN_FRAMES) {
+      // Fin de gesto por quietud: la mano sigue en cuadro pero dejó de
+      // moverse (se quedó en la forma final) — es la señal real de "terminé
+      // la seña", no un conteo fijo de frames. Predice YA con lo capturado,
+      // sin esperar a llegar a SEQ_LEN. Se dispara una sola vez por parada
+      // (=== en vez de >=) para no reintentar en cada frame mientras la mano
+      // sigue quieta.
+      if (
+        !cooling && !apiInFlightRef.current &&
+        stillCountRef.current === MOTION_STOP_FRAMES &&
+        len >= MIN_FRAMES
+      ) {
+        const snapshot = [...landmarkBufferRef.current]
+        landmarkBufferRef.current = []
+        runPrediction(snapshot, { finalize: true })
+      }
+      // Predicción en vivo (respaldo): si el gesto sigue en movimiento más
+      // allá de SEQ_LEN frames sin detenerse, no hace falta esperar a que
+      // pare — se evalúa igual con la ventana completa (ver LIVE_MIN_FRAMES).
+      else if (!cooling && len >= LIVE_MIN_FRAMES) {
         runPrediction(landmarkBufferRef.current)
       }
     }

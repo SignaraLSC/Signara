@@ -10,6 +10,8 @@
  *  - Suavizado temporal (media móvil) para quitar el tembleque de MediaPipe.
  *  - Manos ausentes: se ocultan o se mantienen, en vez de saltar al origen.
  *  - Reproducción por tiempo con interpolación entre frames → fluido a 60fps.
+ *  - Transición interpolada entre señas encadenadas (sin salto de pose al
+ *    pasar de una seña a la siguiente en una frase de varias palabras).
  *
  * API imperativa (via ref): queue(token) · replace([tokens]) · clear()
  */
@@ -32,7 +34,9 @@ const HAND_CONNECTIONS = [
 const POSE_POINTS = [11, 12, 13, 14, 15, 16]
 const POSE_CONNECTIONS = [[11,12],[11,13],[13,15],[12,14],[14,16]]
 
-// Cara: tamaños de cada grupo de contorno (deben coincidir con regen_face.js)
+// Cara: tamaños de cada grupo de contorno (deben coincidir con slim_face() en
+// sign_ai/00_capture.py, que es quien recorta los 478 puntos de MediaPipe a
+// estos 124 antes de guardar la animación).
 const FACE_SPANS = [
   { count: 36, loop: true },  { count: 16, loop: true },  { count: 16, loop: true },
   { count: 5,  loop: false }, { count: 5,  loop: false }, { count: 20, loop: true },
@@ -51,11 +55,16 @@ const FACE_EDGES = buildFaceEdges(FACE_SPANS)
 
 const FPS = 30
 const Z_SCALE = 0.7
+const INTERP_FRAMES = 6   // frames de transición entre una seña y la siguiente
 
 // ─── Preproceso de datos ────────────────────────────────────────────────────────
 const isZeroPt = (p) => !p || (p[0] === 0 && p[1] === 0 && p[2] === 0)
 const handAllZero = (arr) => !arr || arr.every(isZeroPt)
-const anyHand = (frames, key) => frames.some((f) => !handAllZero(f[key]))
+// Sirve tanto para manos como para cara: ¿algún frame trae puntos no-cero?
+// slim_face() en 00_capture.py siempre devuelve 124 entradas (rellenas con
+// [0,0,0] si MediaPipe no detectó cara ese frame), así que un simple
+// "length > 0" nunca detecta "no se capturó cara" — hay que mirar los valores.
+const anyNonZero = (frames, key) => frames.some((f) => !handAllZero(f[key]))
 
 function fillHand(frames, key) {
   let last = null
@@ -104,13 +113,17 @@ function preprocess(raw) {
     pose: f.pose.map(clampPt),
     face: (f.face || []).map(clampPt),
   }))
-  const lhActive = anyHand(frames, 'lh')
-  const rhActive = anyHand(frames, 'rh')
+  const lhActive = anyNonZero(frames, 'lh')
+  const rhActive = anyNonZero(frames, 'rh')
+  // No basta con frames[0].face.length > 0: slim_face() rellena con ceros los
+  // frames sin cara detectada, así que la longitud siempre es 124. Hay que
+  // comprobar que al menos un frame tenga puntos reales (igual que las manos).
+  const hasFace = frames[0].face.length > 0 && anyNonZero(frames, 'face')
   if (lhActive) { fillHand(frames, 'lh'); smoothStream(frames, 'lh', 5) }
   if (rhActive) { fillHand(frames, 'rh'); smoothStream(frames, 'rh', 5) }
   smoothStream(frames, 'pose', 5)
-  if (frames[0].face.length) smoothStream(frames, 'face', 3)
-  return { frames, lhActive, rhActive, hasFace: frames[0].face.length > 0 }
+  if (hasFace) smoothStream(frames, 'face', 3)
+  return { frames, lhActive, rhActive, hasFace }
 }
 
 const lerpArr = (a, b, t) =>
@@ -277,7 +290,26 @@ const AvatarSigner3D = forwardRef(function AvatarSigner3D({ apiUrl, onSign, onFi
       const proc = await fetchAnim(token)
       setStatus('playing')
       setEverPlayed(true)
-      playProcessed(proc, () => { playingRef.current = false; processQueue() })
+
+      // Si hay otra seña encolada, pre-carga su animación (sin sacarla de la
+      // cola) y añade unos frames de transición al final de esta, para evitar
+      // el salto brusco de pose entre una seña y la siguiente.
+      let framesToPlay = proc.frames
+      const nextToken = queueRef.current[0]
+      if (nextToken) {
+        try {
+          const nextProc = await fetchAnim(nextToken)
+          const lastFrame = proc.frames[proc.frames.length - 1]
+          const firstNext = nextProc.frames[0]
+          const blend = []
+          for (let k = 1; k <= INTERP_FRAMES; k++) {
+            blend.push(lerpFrame(lastFrame, firstNext, k / (INTERP_FRAMES + 1)))
+          }
+          framesToPlay = [...proc.frames, ...blend]
+        } catch { /* si falla el pre-fetch, se reproduce sin transición */ }
+      }
+
+      playProcessed({ ...proc, frames: framesToPlay }, () => { playingRef.current = false; processQueue() })
     } catch {
       playingRef.current = false
       processQueue()

@@ -1,4 +1,7 @@
-[
+{
+  "normalize_inputs": true,
+  "best_val_acc": 97.83,
+  "classes": [
     "ADIOS",
     "BIEN",
     "COMO_ESTAS",
@@ -13,4 +16,5 @@
     "POR_FAVOR",
     "SED",
     "SI"
-]
+  ]
+}

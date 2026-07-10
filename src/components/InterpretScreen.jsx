@@ -841,7 +841,7 @@ export default function InterpretScreen({ onBack, onHome }) {
                       Haz cada seña con movimiento claro. Cuando termines, <strong>quita las manos</strong> del encuadre para confirmar la seña.
                     </p>
                     <p className="mt-2 text-xs font-semibold text-pastel-sub">
-                      Señas: HOLA · GRACIAS · BIEN · MAL · COMO ESTAS · SED · NECESITO AYUDA
+                      Señas: HOLA · GRACIAS · BIEN · MAL · COMO ESTAS · SED · NECESITO AYUDA · POR FAVOR · SI · NO · ADIOS · FAMILIA · PERDON
                     </p>
                   </div>
                 )}

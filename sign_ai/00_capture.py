@@ -44,6 +44,7 @@ import mediapipe as mp
 import numpy as np
 
 from core.config import SEQ_LEN
+from core.confusion import canonical_label
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -108,7 +109,16 @@ def slim_face(face):
 
 def normalize_label(raw):
     """Nombre de seña sin acentos, MAYÚSCULAS y con espacios→'_'
-    (así 'por favor' → 'POR_FAVOR', que es como lo empareja el frontend)."""
+    (así 'por favor' → 'POR_FAVOR', que es como lo empareja el frontend).
+
+    Variantes: si una palabra se puede hacer de varias formas GENUINAMENTE
+    distintas (no solo estilo/velocidad de quien graba), usa un sufijo
+    '_V<N>' al grabar: 'hola v1' -> HOLA_V1, 'hola v2' -> HOLA_V2. El modelo
+    las entrena como clases separadas, pero core/confusion.py fusiona sus
+    probabilidades a la hora de predecir, así que el resultado final para el
+    usuario siempre es la palabra canónica (HOLA), nunca la variante.
+    Si la variación es solo de estilo, NO uses sufijo: graba todas las tomas
+    bajo el mismo label (así el modelo aprende esa variedad de forma natural)."""
     s = unicodedata.normalize("NFD", raw).encode("ascii", "ignore").decode("ascii")
     s = re.sub(r"[^A-Za-z0-9]+", "_", s.strip())
     return s.upper().strip("_")
@@ -161,15 +171,20 @@ def save_raw_full(persona, label, muestra, full_frames):
 
 
 def save_animation(label, full_frames):
-    """Animación canónica del avatar. Guarda la cara RECORTADA (124 puntos de
-    contorno) que dibuja AvatarSigner3D; la cara completa queda en raw_full."""
+    """Animación del avatar. Se guarda SIEMPRE bajo el nombre canónico (sin
+    sufijo de variante _V<N>), porque el avatar solo necesita una toma por
+    palabra — sin importar cuál variante grabaste, promuévela con 'A' y
+    quedará disponible como esa palabra para el frontend.
+    Guarda la cara RECORTADA (124 puntos de contorno) que dibuja
+    AvatarSigner3D; la cara completa queda en raw_full."""
+    token = canonical_label(label)
     frames = [
         {"lh": f["lh"], "rh": f["rh"], "pose": f["pose"], "face": slim_face(f["face"])}
         for f in full_frames
     ]
-    path = os.path.join(ANIM_DIR, f"{label}.json")
+    path = os.path.join(ANIM_DIR, f"{token}.json")
     with open(path, "w", encoding="utf-8") as f:
-        json.dump({"token": label, "fps": FPS_TARGET, "frames": frames},
+        json.dump({"token": token, "fps": FPS_TARGET, "frames": frames},
                   f, separators=(",", ":"))
     print(f"⭐ Animación canónica guardada: {path}  ({len(frames)} frames)")
 

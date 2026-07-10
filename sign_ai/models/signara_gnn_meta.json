@@ -1,6 +1,6 @@
 {
   "normalize_inputs": true,
-  "best_val_acc": 97.83,
+  "best_val_acc": 95.65,
   "classes": [
     "ADIOS",
     "BIEN",

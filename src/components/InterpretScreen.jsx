@@ -37,26 +37,24 @@ const STABILITY_NEED = 3
 const NO_HAND_RESET  = 12
 const SAME_SIGN_WAIT = 30
 const MIN_FRAMES     = 8
-const MOVEMENT_MIN   = 0.003  // movimiento mínimo (x,y) para acumular frame
 
-// Frames CONSECUTIVOS de quietud (con la mano aún visible) que se interpretan
-// como "terminé la seña". Dispara una predicción inmediata con lo capturado
-// hasta ahí, sin esperar a tener SEQ_LEN frames ni a que la mano salga de
-// cuadro. A ~66-100ms por frame en el navegador, 4 frames son ~250-400ms de
-// quietud — suficiente para no confundir una pausa breve dentro del gesto
-// con el final real, pero sin sentirse lento. Ajustar si hace falta.
-const MOTION_STOP_FRAMES = 4
+// ── Detección de FIN DE SEÑA (predecir al terminar, no en un conteo fijo) ────
+// El problema con un umbral fijo de "quietud": los landmarks de MediaPipe
+// tiemblan, así que una mano quieta registra micro-movimiento que reinicia el
+// contador y nunca se detecta el final. Solución: umbral ADAPTATIVO relativo
+// al pico de movimiento de ESTA seña. Se considera "detenido" cuando el
+// movimiento cae por debajo de STOP_FRAC del pico (o por debajo de un piso
+// absoluto), durante STOP_FRAMES frames seguidos, y solo si antes hubo un
+// gesto real (el pico superó MOVED_MIN). Así funciona con señas rápidas o
+// lentas y no se engaña con el tembleque.
+const STOP_FRAMES = 3      // frames consecutivos "detenido" para confirmar el fin
+const STOP_FRAC   = 0.4    // detenido si el movimiento < 40% del pico de la seña
+const STOP_ABS    = 0.006  // …o por debajo de este piso absoluto (mano casi quieta)
+const MOVED_MIN   = 0.012  // el pico debe superar esto para contar como "hubo seña"
 
-// La predicción en vivo (ventana completa) solo debe correr sobre SEQ_LEN
-// frames reales (sin relleno). padBuffer() rellena un buffer corto repitiendo
-// el primer frame al inicio; ese patrón artificial no se parece a ninguna
-// muestra de entrenamiento y el modelo puede "estabilizarse" con confianza
-// alta sobre una seña incorrecta. Por eso el camino RÁPIDO real es otro: en
-// cuanto el movimiento se detiene (MOTION_STOP_FRAMES) o la mano sale de
-// cuadro, se predice de inmediato con los frames reales capturados hasta ese
-// punto (más info abajo, junto a runPrediction). MIN_FRAMES (más bajo) es el
-// mínimo para intentarlo; un poco de relleno ahí es aceptable como último
-// recurso si el gesto fue muy corto.
+// Predicción en vivo (respaldo): si el gesto sigue en movimiento continuo sin
+// detenerse, se evalúa la ventana completa igual (con el control de estabilidad
+// de 3 predicciones seguidas, que evita confirmar de más).
 const LIVE_MIN_FRAMES = SEQ_LEN
 
 // Conexiones MediaPipe para dibujar el esqueleto de la mano (no viene en drawing_utils).
@@ -126,11 +124,28 @@ function extractLandmarks(results) {
   ]
 }
 
-// Pad al inicio repitiendo el primer frame hasta SEQ_LEN (igual que Python).
+// Ajusta el buffer a exactamente SEQ_LEN frames para /predict.
+//  - Si sobran: se queda con los últimos SEQ_LEN.
+//  - Si faltan: REMUESTREA (interpola linealmente) la secuencia real a SEQ_LEN,
+//    en vez de rellenar repitiendo un frame. Así una seña corta se "estira"
+//    suavemente a la longitud que el modelo espera, conservando su forma real
+//    (el relleno viejo creaba un tramo congelado al inicio que no se parecía a
+//    ninguna muestra de entrenamiento).
 function padBuffer(buffer) {
-  const padded = [...buffer]
-  while (padded.length < SEQ_LEN) padded.unshift(padded[0])
-  return padded.slice(-SEQ_LEN)
+  const n = buffer.length
+  if (n >= SEQ_LEN) return buffer.slice(-SEQ_LEN)
+  if (n === 0) return buffer
+  if (n === 1) return Array.from({ length: SEQ_LEN }, () => buffer[0])
+  const out = new Array(SEQ_LEN)
+  for (let i = 0; i < SEQ_LEN; i++) {
+    const t  = (i * (n - 1)) / (SEQ_LEN - 1)  // posición en 0..n-1
+    const lo = Math.floor(t)
+    const hi = Math.min(lo + 1, n - 1)
+    const f  = t - lo
+    const a  = buffer[lo], b = buffer[hi]
+    out[i] = a.map((v, k) => v + (b[k] - v) * f)
+  }
+  return out
 }
 
 // Movimiento medio (x,y) entre dos frames — igual que mov_entre() en
@@ -161,7 +176,8 @@ export default function InterpretScreen({ onBack, onHome }) {
   const predHistRef       = useRef([])   // historial de predicciones para estabilidad
   const prevFrameRef      = useRef(null) // frame anterior para calcular movimiento
   const noHandCountRef    = useRef(0)    // frames consecutivos sin manos
-  const stillCountRef     = useRef(0)    // frames consecutivos quietos (mano visible)
+  const stillCountRef     = useRef(0)    // frames consecutivos "detenido" (mano visible)
+  const peakMovementRef   = useRef(0)    // pico de movimiento de la seña en curso (umbral adaptativo)
   const cooldownRef       = useRef(0)    // cooldown frame-based
   const lastSignRef       = useRef('')   // última seña confirmada (evita repetir)
   const apiInFlightRef    = useRef(false)
@@ -355,6 +371,7 @@ export default function InterpretScreen({ onBack, onHome }) {
     predHistRef.current       = []
     prevFrameRef.current      = null
     stillCountRef.current     = 0
+    peakMovementRef.current   = 0
     lastSignRef.current       = ''
     cooldownRef.current       = 0
     apiInFlightRef.current    = false
@@ -375,6 +392,7 @@ export default function InterpretScreen({ onBack, onHome }) {
     predHistRef.current       = []
     prevFrameRef.current      = null
     stillCountRef.current     = 0
+    peakMovementRef.current   = 0
 
     setDisplaySign(prediction)
     setDisplayConf(confidence)
@@ -501,6 +519,7 @@ export default function InterpretScreen({ onBack, onHome }) {
       landmarkBufferRef.current = []
       prevFrameRef.current      = null
       stillCountRef.current     = 0
+      peakMovementRef.current   = 0
       handWasVisibleRef.current = false
 
       const status = !runningRef.current
@@ -529,39 +548,42 @@ export default function InterpretScreen({ onBack, onHome }) {
 
     let len = 0
     if (runningRef.current) {
-      // Solo acumular frames con movimiento real (igual que 07_gnn_predict.py):
-      // evita diluir el buffer con encuadres de mano quieta y acelera la
-      // llegada a una ventana completa (LIVE_MIN_FRAMES) con movimiento
-      // útil para el modelo.
-      if (movement >= MOVEMENT_MIN) {
-        landmarkBufferRef.current.push(currFrame)
-        if (landmarkBufferRef.current.length > SEQ_LEN) {
-          landmarkBufferRef.current.shift()
-        }
-        stillCountRef.current = 0
-      } else {
-        stillCountRef.current++
+      // Acumular el frame (mientras la mano esté visible). Se limita el buffer
+      // a los últimos SEQ_LEN para no crecer sin fin en gestos largos.
+      landmarkBufferRef.current.push(currFrame)
+      if (landmarkBufferRef.current.length > SEQ_LEN) {
+        landmarkBufferRef.current.shift()
       }
       len = landmarkBufferRef.current.length
 
-      // Fin de gesto por quietud: la mano sigue en cuadro pero dejó de
-      // moverse (se quedó en la forma final) — es la señal real de "terminé
-      // la seña", no un conteo fijo de frames. Predice YA con lo capturado,
-      // sin esperar a llegar a SEQ_LEN. Se dispara una sola vez por parada
-      // (=== en vez de >=) para no reintentar en cada frame mientras la mano
-      // sigue quieta.
+      // Umbral ADAPTATIVO de "detenido": relativo al pico de movimiento de la
+      // seña en curso, con un piso absoluto. Robusto al tembleque de MediaPipe
+      // (una mano quieta que vibra un poco no cuenta como movimiento).
+      if (movement > peakMovementRef.current) peakMovementRef.current = movement
+      const stopThreshold = Math.max(STOP_ABS, peakMovementRef.current * STOP_FRAC)
+      const gestureHappened = peakMovementRef.current >= MOVED_MIN
+
+      if (movement < stopThreshold) stillCountRef.current++
+      else stillCountRef.current = 0
+
+      // Fin de seña: hubo un gesto real (el pico superó MOVED_MIN) y el
+      // movimiento lleva STOP_FRAMES por debajo del umbral → terminó. Predice
+      // YA con los frames reales capturados (padBuffer los remuestrea a SEQ_LEN),
+      // sin esperar a llenar la ventana. Se dispara una sola vez por parada.
       if (
         !cooling && !apiInFlightRef.current &&
-        stillCountRef.current === MOTION_STOP_FRAMES &&
+        gestureHappened &&
+        stillCountRef.current === STOP_FRAMES &&
         len >= MIN_FRAMES
       ) {
         const snapshot = [...landmarkBufferRef.current]
         landmarkBufferRef.current = []
+        peakMovementRef.current   = 0
         runPrediction(snapshot, { finalize: true })
       }
-      // Predicción en vivo (respaldo): si el gesto sigue en movimiento más
-      // allá de SEQ_LEN frames sin detenerse, no hace falta esperar a que
-      // pare — se evalúa igual con la ventana completa (ver LIVE_MIN_FRAMES).
+      // Respaldo: si el gesto sigue en movimiento continuo y llena la ventana
+      // sin detenerse, se evalúa igual (el control de estabilidad de 3
+      // predicciones seguidas evita confirmar de más).
       else if (!cooling && len >= LIVE_MIN_FRAMES) {
         runPrediction(landmarkBufferRef.current)
       }

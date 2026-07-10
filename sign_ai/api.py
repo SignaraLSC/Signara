@@ -10,7 +10,18 @@ Uso:
 
 import json
 import os
+import sys
 from pathlib import Path
+
+# La consola de Windows usa cp1252 por defecto y los print() con emojis (✅, ⚠)
+# lanzan UnicodeEncodeError, lo que TUMBA el arranque de la API (el evento
+# startup falla y uvicorn sale). Forzar UTF-8 en la salida lo evita sin
+# depender de la variable de entorno PYTHONIOENCODING.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass
 
 import numpy as np
 import torch

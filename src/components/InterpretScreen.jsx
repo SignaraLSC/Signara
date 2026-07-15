@@ -35,6 +35,13 @@ const HAND_COUNT     = 21
 const UMBRAL         = 0.75
 const STABILITY_NEED = 3
 const NO_HAND_RESET  = 12
+// Tolerancia a pérdida MOMENTÁNEA de tracking (parpadeo típico de MediaPipe
+// en medio de un gesto rápido). Sin esto, un solo frame sin manos detectadas
+// vaciaba el buffer entero y obligaba a reiniciar la seña desde cero — por
+// eso la primera seña (hecha con más cuidado/lentitud) se reconocía rápido
+// y las siguientes parecían "esperar hasta 24": en realidad se reiniciaban
+// varias veces hasta que por casualidad el tracking aguantaba sin cortes.
+const NO_HAND_GRACE  = 4
 const SAME_SIGN_WAIT = 30
 const MIN_FRAMES     = 8
 
@@ -265,11 +272,19 @@ export default function InterpretScreen({ onBack, onHome }) {
     })
     holistic.setOptions({
       modelComplexity:        0,
-      smoothLandmarks:        false,
+      // 00_capture.py (con el que se grabaron los datos de entrenamiento) usa
+      // el filtro de suavizado temporal de MediaPipe por defecto (True). Acá
+      // estaba apagado — eso desalinea el ruido/tembleque de los landmarks en
+      // vivo respecto a los datos con los que se entrenó el modelo.
+      smoothLandmarks:        true,
       enableSegmentation:     false,
       refineFaceLandmarks:    false,
-      minDetectionConfidence: 0.5,
-      minTrackingConfidence:  0.65,
+      // Alineado con min_detection_confidence/min_tracking_confidence=0.6 de
+      // 00_capture.py. Bajar minTrackingConfidence de 0.65 a 0.6 hace que
+      // MediaPipe no suelte el tracking de la mano ante frames ligeramente
+      // ruidosos, reduciendo el parpadeo que cortaba el buffer a la mitad.
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence:  0.6,
     })
     holistic.onResults((results) => handleResultsRef.current(results))
     holisticRef.current = holistic
@@ -511,8 +526,22 @@ export default function InterpretScreen({ onBack, onHome }) {
       setInCooldown(cooling)
     }
 
-    // ── Sin manos: vaciar buffer al instante y predecir con lo capturado ─────
+    // ── Sin manos ────────────────────────────────────────────────────────────
     if (!hasHands) {
+      noHandCountRef.current++
+
+      // Parpadeo momentáneo en medio de un gesto: no tocar el buffer, solo
+      // saltar el frame. MediaPipe casi siempre recupera el tracking en 1-3
+      // frames; tratarlo como "se acabó la seña" de una vez rompe capturas
+      // válidas a la mitad.
+      if (handWasVisibleRef.current && noHandCountRef.current < NO_HAND_GRACE) {
+        const status = mlMode ? 'Detectando…' : 'Servidor IA no conectado'
+        updateCaptureHud(landmarkBufferRef.current.length, { showHud: true, status })
+        return
+      }
+
+      // Pérdida sostenida: ahí sí se acabó la seña — predecir con lo
+      // capturado y reiniciar el pipeline.
       const hadHands = handWasVisibleRef.current
       const snapshot = hadHands ? [...landmarkBufferRef.current] : []
 
@@ -531,7 +560,6 @@ export default function InterpretScreen({ onBack, onHome }) {
         runPrediction(snapshot, { finalize: true })
       }
 
-      noHandCountRef.current++
       if (noHandCountRef.current >= NO_HAND_RESET) {
         predHistRef.current = []
       }

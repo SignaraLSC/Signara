@@ -176,7 +176,11 @@ async def predict(req: PredictRequest):
         min_conf=UMBRAL_CONFIANZA,
     )
 
-    if prediction is None:
+    # "IDLE" es una clase real de entrenamiento (mano en reposo), no lo mismo
+    # que is_idle=True (que evaluate_prediction devuelve cuando no hay
+    # confianza suficiente en NINGUNA clase). Sin este chequeo, una mano
+    # quieta se reconoce y se muestra/dice como si fuera una seña más.
+    if prediction is None or prediction == "IDLE":
         return PredictResponse(prediction="", confidence=confidence, is_idle=True)
 
     return PredictResponse(

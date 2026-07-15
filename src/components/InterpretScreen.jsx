@@ -42,7 +42,13 @@ const NO_HAND_RESET  = 12
 // y las siguientes parecían "esperar hasta 24": en realidad se reiniciaban
 // varias veces hasta que por casualidad el tracking aguantaba sin cortes.
 const NO_HAND_GRACE  = 4
-const SAME_SIGN_WAIT = 30
+// Pausa CORTA tras confirmar una seña. Antes eran 30 frames (~1 s), lo que
+// hacía imposible encadenar señas para formar frases en tiempo real: tras cada
+// palabra había un segundo muerto. Ahora es apenas un anti-rebote para no
+// disparar dos veces sobre la misma parada; la protección real contra repetir
+// una seña sin querer es el reinicio del pico (hay que volver a mover la mano
+// —superar MOVED_MIN— antes de que se pueda confirmar otra).
+const POST_CONFIRM_WAIT = 6
 const MIN_FRAMES     = 8
 
 // ── Detección de FIN DE SEÑA (predecir al terminar, no en un conteo fijo) ────
@@ -72,6 +78,69 @@ const HAND_CONNECTIONS = [
   [9, 13], [13, 14], [14, 15], [15, 16],
   [13, 17], [0, 17], [17, 18], [18, 19], [19, 20],
 ].map(([start, end]) => ({ start, end }))
+
+// ── Filtro One-Euro (anti-tembleque) ─────────────────────────────────────────
+// Los landmarks de MediaPipe tiemblan cuando la mano está casi quieta y saltan
+// cuando las dos manos se juntan (el tracker duda). El filtro One-Euro es el
+// estándar para esto: suaviza fuerte a baja velocidad (mata el tembleque) pero
+// deja pasar el movimiento rápido (no arrastra ni retrasa señas veloces), así
+// que no distorsiona la forma del gesto que ve el modelo. Se aplica por mano y
+// se REINICIA cuando la mano desaparece, para que al reaparecer salte al valor
+// nuevo en vez de interpolar desde cero.
+function makeOneEuro({ minCutoff = 1.2, beta = 0.6, dCutoff = 1.0, freq = 30 } = {}) {
+  let xPrev = null, dxPrev = null, tPrev = null
+  const alpha = (cutoff, dt) => {
+    const tau = 1 / (2 * Math.PI * cutoff)
+    return 1 / (1 + tau / dt)
+  }
+  return {
+    reset() { xPrev = null; dxPrev = null; tPrev = null },
+    filter(x, t) {
+      if (xPrev === null) {
+        xPrev = x.slice()
+        dxPrev = x.map(() => 0)
+        tPrev = t
+        return x.slice()
+      }
+      const dt = (t > tPrev) ? (t - tPrev) / 1000 : 1 / freq
+      tPrev = t
+      const aD = alpha(dCutoff, dt)
+      const out = new Array(x.length)
+      for (let i = 0; i < x.length; i++) {
+        const dx = (x[i] - xPrev[i]) / dt
+        const dxHat = dxPrev[i] + aD * (dx - dxPrev[i])
+        const cutoff = minCutoff + beta * Math.abs(dxHat)
+        const a = alpha(cutoff, dt)
+        const xHat = xPrev[i] + a * (x[i] - xPrev[i])
+        out[i] = xHat
+        xPrev[i] = xHat
+        dxPrev[i] = dxHat
+      }
+      return out
+    },
+  }
+}
+
+// 21 landmarks {x,y,z} ⇄ vector plano [63] (para pasar por el filtro).
+function landmarksToVec(lms) {
+  const v = new Array(HAND_COUNT * 3).fill(0)
+  if (lms) {
+    const n = Math.min(lms.length, HAND_COUNT)
+    for (let i = 0; i < n; i++) {
+      v[i * 3]     = lms[i]?.x ?? 0
+      v[i * 3 + 1] = lms[i]?.y ?? 0
+      v[i * 3 + 2] = lms[i]?.z ?? 0
+    }
+  }
+  return v
+}
+function vecToLandmarks(v) {
+  const out = new Array(HAND_COUNT)
+  for (let i = 0; i < HAND_COUNT; i++) {
+    out[i] = { x: v[i * 3], y: v[i * 3 + 1], z: v[i * 3 + 2] }
+  }
+  return out
+}
 
 // ── Script loader ─────────────────────────────────────────────────────────────
 
@@ -187,6 +256,10 @@ export default function InterpretScreen({ onBack, onHome }) {
   const peakMovementRef   = useRef(0)    // pico de movimiento de la seña en curso (umbral adaptativo)
   const cooldownRef       = useRef(0)    // cooldown frame-based
   const lastSignRef       = useRef('')   // última seña confirmada (evita repetir)
+  const lhFilterRef       = useRef(null) // One-Euro mano izq (navegador: right)
+  const rhFilterRef       = useRef(null) // One-Euro mano der (navegador: left)
+  if (!lhFilterRef.current) lhFilterRef.current = makeOneEuro()
+  if (!rhFilterRef.current) rhFilterRef.current = makeOneEuro()
   const apiInFlightRef    = useRef(false)
   const mlAvailableRef    = useRef(false)
   const sentenceClearRef  = useRef(null)
@@ -391,6 +464,8 @@ export default function InterpretScreen({ onBack, onHome }) {
     cooldownRef.current       = 0
     apiInFlightRef.current    = false
     handVisibleRef.current    = false
+    lhFilterRef.current?.reset()
+    rhFilterRef.current?.reset()
     setHandVisible(false)
     setBufferLen(0)
     setInCooldown(false)
@@ -402,7 +477,7 @@ export default function InterpretScreen({ onBack, onHome }) {
 
   function confirmSign(prediction, confidence) {
     lastSignRef.current       = prediction
-    cooldownRef.current       = SAME_SIGN_WAIT
+    cooldownRef.current       = POST_CONFIRM_WAIT
     landmarkBufferRef.current = []
     predHistRef.current       = []
     prevFrameRef.current      = null
@@ -490,21 +565,40 @@ export default function InterpretScreen({ onBack, onHome }) {
     const hasRight = !!results.rightHandLandmarks
     const hasHands = hasLeft || hasRight
 
+    // ── Suavizado One-Euro (anti-tembleque) ─────────────────────────────────
+    // Se filtran los landmarks crudos de cada mano ANTES de dibujar y de
+    // reconocer, así el suavizado es consistente en pantalla y en el modelo.
+    // Se reinicia el filtro de la mano que no está presente para que al
+    // reaparecer no interpole desde el frame viejo.
+    const now = (typeof performance !== 'undefined' ? performance.now() : Date.now())
+    let leftLm = null, rightLm = null
+    if (hasLeft) {
+      leftLm = vecToLandmarks(rhFilterRef.current.filter(landmarksToVec(results.leftHandLandmarks), now))
+    } else {
+      rhFilterRef.current.reset()
+    }
+    if (hasRight) {
+      rightLm = vecToLandmarks(lhFilterRef.current.filter(landmarksToVec(results.rightHandLandmarks), now))
+    } else {
+      lhFilterRef.current.reset()
+    }
+    const fResults = { leftHandLandmarks: leftLm, rightHandLandmarks: rightLm }
+
     // ── Solo dibuja manos (igual que 07_gnn_predict.py) ─────────────────────
     const drawConn = window.drawConnectors
     const drawLm   = window.drawLandmarks
     if (drawConn && drawLm) {
       try {
-        if (hasLeft) {
-          drawConn(ctx, results.leftHandLandmarks, HAND_CONNECTIONS,
+        if (leftLm) {
+          drawConn(ctx, leftLm, HAND_CONNECTIONS,
             { color: '#3b82f6', lineWidth: 3 })
-          drawLm(ctx, results.leftHandLandmarks,
+          drawLm(ctx, leftLm,
             { color: '#60a5fa', lineWidth: 1, radius: 3 })
         }
-        if (hasRight) {
-          drawConn(ctx, results.rightHandLandmarks, HAND_CONNECTIONS,
+        if (rightLm) {
+          drawConn(ctx, rightLm, HAND_CONNECTIONS,
             { color: '#9333ea', lineWidth: 3 })
-          drawLm(ctx, results.rightHandLandmarks,
+          drawLm(ctx, rightLm,
             { color: '#c084fc', lineWidth: 1, radius: 3 })
         }
       } catch (e) {
@@ -570,7 +664,7 @@ export default function InterpretScreen({ onBack, onHome }) {
     noHandCountRef.current    = 0
     handWasVisibleRef.current = true
 
-    const currFrame = extractLandmarks(results)
+    const currFrame = extractLandmarks(fResults)
     const movement  = frameMovement(prevFrameRef.current, currFrame)
     prevFrameRef.current = currFrame
 
@@ -587,9 +681,17 @@ export default function InterpretScreen({ onBack, onHome }) {
       // Umbral ADAPTATIVO de "detenido": relativo al pico de movimiento de la
       // seña en curso, con un piso absoluto. Robusto al tembleque de MediaPipe
       // (una mano quieta que vibra un poco no cuenta como movimiento).
+      const wasGesture = peakMovementRef.current >= MOVED_MIN
       if (movement > peakMovementRef.current) peakMovementRef.current = movement
       const stopThreshold = Math.max(STOP_ABS, peakMovementRef.current * STOP_FRAC)
       const gestureHappened = peakMovementRef.current >= MOVED_MIN
+
+      // Al ARRANCAR una seña nueva (el pico cruza MOVED_MIN tras una parada),
+      // se limpia la guarda de "no repetir la última seña". Así se puede
+      // encadenar la MISMA palabra varias veces en una frase (SI · SI) siempre
+      // que sea un gesto nuevo de verdad — la guarda solo evita el doble
+      // disparo sobre una misma seña sostenida.
+      if (!wasGesture && gestureHappened) lastSignRef.current = ''
 
       if (movement < stopThreshold) stillCountRef.current++
       else stillCountRef.current = 0

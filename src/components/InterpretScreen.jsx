@@ -565,11 +565,14 @@ export default function InterpretScreen({ onBack, onHome }) {
     const hasRight = !!results.rightHandLandmarks
     const hasHands = hasLeft || hasRight
 
-    // ── Suavizado One-Euro (anti-tembleque) ─────────────────────────────────
-    // Se filtran los landmarks crudos de cada mano ANTES de dibujar y de
-    // reconocer, así el suavizado es consistente en pantalla y en el modelo.
-    // Se reinicia el filtro de la mano que no está presente para que al
-    // reaparecer no interpole desde el frame viejo.
+    // ── Suavizado One-Euro (anti-tembleque) — SOLO para DIBUJAR ──────────────
+    // Importante: el filtro se aplica únicamente a lo que se ve en pantalla,
+    // NO a lo que recibe el modelo. El modelo se entrenó con el suavizado
+    // propio de MediaPipe (00_capture.py), no con One-Euro encima; filtrarle
+    // la entrada le bajaba los picos de movimiento y le corría la señal, y
+    // empeoraba el reconocimiento. El reconocedor usa los landmarks crudos.
+    // Se reinicia el filtro de la mano ausente para que al reaparecer no
+    // interpole desde el frame viejo.
     const now = (typeof performance !== 'undefined' ? performance.now() : Date.now())
     let leftLm = null, rightLm = null
     if (hasLeft) {
@@ -582,7 +585,6 @@ export default function InterpretScreen({ onBack, onHome }) {
     } else {
       lhFilterRef.current.reset()
     }
-    const fResults = { leftHandLandmarks: leftLm, rightHandLandmarks: rightLm }
 
     // ── Solo dibuja manos (igual que 07_gnn_predict.py) ─────────────────────
     const drawConn = window.drawConnectors
@@ -664,7 +666,7 @@ export default function InterpretScreen({ onBack, onHome }) {
     noHandCountRef.current    = 0
     handWasVisibleRef.current = true
 
-    const currFrame = extractLandmarks(fResults)
+    const currFrame = extractLandmarks(results)   // crudo: alineado con el entrenamiento
     const movement  = frameMovement(prevFrameRef.current, currFrame)
     prevFrameRef.current = currFrame
 

@@ -29,6 +29,8 @@ BATCH_SIZE       = 16
 LR               = 1e-3
 PATIENCE         = 15
 AUGMENT_COPIES   = 2
+DURATION_COPIES  = 3       # copias con remuestreo de duración (ver augment_duration)
+MIN_FRAMES       = 8       # debe coincidir con MIN_FRAMES en InterpretScreen.jsx
 NORMALIZE_INPUTS = True
 DEVICE           = "cuda" if torch.cuda.is_available() else "cpu"
 MODEL_PATH       = "models/signara_gnn.pt"
@@ -99,6 +101,42 @@ def augment_sample(x: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     return out
 
 
+def resample_frames(x: np.ndarray, target_len: int) -> np.ndarray:
+    """Interpolación lineal a target_len frames — idéntica a padBuffer() en
+    InterpretScreen.jsx, para que el modelo vea exactamente el mismo tipo de
+    entrada que produce Interpretar cuando remuestrea una captura corta."""
+    n = x.shape[0]
+    if n == target_len:
+        return x
+    if n == 1:
+        return np.repeat(x, target_len, axis=0)
+    out = np.zeros((target_len,) + x.shape[1:], dtype=x.dtype)
+    for i in range(target_len):
+        t  = i * (n - 1) / (target_len - 1)
+        lo = int(np.floor(t))
+        hi = min(lo + 1, n - 1)
+        f  = t - lo
+        out[i] = x[lo] + (x[hi] - x[lo]) * f
+    return out
+
+
+def augment_duration(x: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Simula una detección de fin de seña que capturó menos frames reales
+    (seña más rápida, o cámara con menos fps efectivos) y que Interpretar
+    luego estira a SEQ_LEN con padBuffer(). Sin este caso en el entrenamiento,
+    el modelo solo conoce secuencias de SEQ_LEN frames reales — cualquier
+    seña remuestreada le resulta "rara" y su confianza cae debajo del umbral,
+    así que la detección de fin de seña temprana nunca llega a confirmar y
+    todo termina esperando la ventana completa igual."""
+    n = int(rng.integers(MIN_FRAMES, SEQ_LEN))          # frames reales simulados
+    idx = np.round(np.linspace(0, x.shape[0] - 1, n)).astype(int)
+    short = x[idx]
+    out = resample_frames(short, SEQ_LEN)
+    if NORMALIZE_INPUTS:
+        out = normalize_sequence(out)
+    return out
+
+
 class SignGraphDataset(Dataset):
     def __init__(self, samples, labels):
         self.samples = samples   # lista de arrays (30, 42, 4)
@@ -164,6 +202,9 @@ for x, y in zip(X_train_raw, y_train_raw):
     for _ in range(AUGMENT_COPIES):
         X_train.append(augment_sample(x, rng))
         y_train.append(y)
+    for _ in range(DURATION_COPIES):
+        X_train.append(augment_duration(x, rng))
+        y_train.append(y)
 
 train_ds = SignGraphDataset(X_train, y_train)
 test_ds  = SignGraphDataset(X_test,  y_test)
@@ -196,7 +237,7 @@ criterion = nn.CrossEntropyLoss(weight=weight_tensor)
 # ─── Entrenamiento ────────────────────────────────────────────────────────────
 
 print(f"\n🚀 Iniciando entrenamiento ({EPOCHS} épocas)...")
-print(f"   Normalización: {NORMALIZE_INPUTS} | Augment x{AUGMENT_COPIES + 1} train\n")
+print(f"   Normalización: {NORMALIZE_INPUTS} | Augment x{AUGMENT_COPIES + 1} + duración x{DURATION_COPIES} train\n")
 
 best_val_acc = 0.0
 epochs_no_improve = 0

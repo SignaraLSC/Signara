@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Signara · Prueba avatar VRM</title>
+  <style>
+    * { margin: 0; box-sizing: border-box; }
+    html, body { height: 100%; background: #0b1120; color: #e6ecff; font-family: system-ui, sans-serif; overflow: hidden; }
+    #app { position: fixed; inset: 0; }
+    canvas { display: block; }
+    .panel {
+      position: fixed; left: 16px; top: 16px; z-index: 10;
+      background: rgba(12,18,34,.82); border: 1px solid #26324d; border-radius: 16px;
+      padding: 16px 18px; max-width: 320px; backdrop-filter: blur(6px);
+      max-height: calc(100vh - 32px); overflow-y: auto;
+    }
+    .panel h1 { font-size: 15px; letter-spacing: .02em; margin-bottom: 4px; }
+    .panel p  { font-size: 12px; color: #93a2c6; margin-bottom: 12px; line-height: 1.4; }
+    .row { display: flex; flex-wrap: wrap; gap: 8px; }
+    button {
+      background: #6366f1; color: #fff; border: 0; border-radius: 10px;
+      padding: 8px 12px; font-size: 13px; font-weight: 700; cursor: pointer;
+    }
+    button:hover { filter: brightness(1.1); }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    #status {
+      margin-top: 12px; font-size: 12px; font-weight: 700;
+      padding: 8px 10px; border-radius: 8px; background: #16203a; color: #c7d2fe;
+    }
+    #status.err { background: #3a1620; color: #fecaca; }
+    #status.ok  { background: #16321f; color: #bbf7d0; }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three":            "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/":    "https://unpkg.com/three@0.160.0/examples/jsm/",
+      "@pixiv/three-vrm": "https://cdn.jsdelivr.net/npm/@pixiv/three-vrm@2/lib/three-vrm.module.min.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="app"></div>
+  <div class="panel">
+    <h1>Prueba avatar VRM</h1>
+    <p><b>A) Hechas a mano</b> (su diccionario de poses VRM). Así se ve la calidad máxima:</p>
+    <div class="row" id="signsHand"></div>
+    <p style="margin-top:14px"><b>C) Nuestro conversor</b> (grabaciones reales → huesos, geometría propia):</p>
+    <div class="row" id="signsAuto"></div>
+
+    <p style="margin-top:14px; color:#fbbf24"><b>🔧 Calibrar ejes</b> — dime cuál DOBLA EL CODO (antebrazo se pliega) y cuál sube el brazo AL FRENTE:</p>
+    <div class="row" id="probeRow"></div>
+    <div id="status">Cargando…</div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+    import { VRMLoaderPlugin } from '@pixiv/three-vrm';
+    import { setIdlePose, translateToLSC, playKeyframes } from './animations.js?v=lab3';
+    import { frameToArmDirs, frameFingers, frameHandFwd, activeArms, smoothPoseSeq } from './solver.js?v=lab11';
+
+    const statusEl = document.getElementById('status');
+    const setStatus = (msg, kind = '') => { statusEl.textContent = msg; statusEl.className = kind; };
+
+    // ── Escena ────────────────────────────────────────────────────────────────
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b1120);
+    const camera = new THREE.PerspectiveCamera(45, innerWidth / innerHeight, 0.1, 100);
+    camera.position.set(0, 1.25, 2.4);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    document.getElementById('app').appendChild(renderer.domElement);
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+    const key = new THREE.DirectionalLight(0xfff5e8, 1.0); key.position.set(1.5, 3, 4); scene.add(key);
+    const fill = new THREE.DirectionalLight(0x88aaff, 0.35); fill.position.set(-3, 1, -2); scene.add(fill);
+
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.enableDamping = true; controls.target.set(0, 1.05, 0);
+    controls.minDistance = 1.2; controls.maxDistance = 5; controls.enablePan = false;
+    controls.maxPolarAngle = Math.PI * 0.72;
+
+    addEventListener('resize', () => {
+      camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+
+    // ── Carga del VRM ───────────────────────────────────────────────────────────
+    let vrm = null, busy = false;
+
+    async function boot() {
+      try {
+        setStatus('Cargando avatar VRM…');
+        const loader = new GLTFLoader();
+        loader.register((parser) => new VRMLoaderPlugin(parser));
+        const gltf = await loader.loadAsync('./avatar.vrm');
+        vrm = gltf.userData.vrm;
+        scene.add(vrm.scene);
+        // El VRM ya mira hacia la cámara (+Z) por defecto en three-vrm; no
+        // rotar. (El Math.PI anterior lo ponía de espaldas.)
+        setIdlePose(vrm);
+
+        buildButtons();
+        setStatus('Listo — pulsa una seña', 'ok');
+
+        // Hook de depuración (para inspeccionar el rig sin screenshot):
+        // aplica el frame `frac` (0..1) de la seña resuelta y devuelve posiciones
+        // de huesos en mundo, para verificar elevación/cruce/quietud numéricamente.
+        window.__dbg = {
+          rot(name) {
+            const b = vrm.humanoid.getNormalizedBoneNode(name);
+            if (!b) return null;
+            return { x: +b.rotation.x.toFixed(2), y: +b.rotation.y.toFixed(2), z: +b.rotation.z.toFixed(2) };
+          },
+          async pose(sign, frac = 0.5) {
+            const res = await fetch(`anim/${sign}.json`);
+            const kf = bakeSolver(await res.json());
+            const i = Math.max(0, Math.min(kf.length - 1, Math.round(frac * (kf.length - 1))));
+            setIdlePose(vrm);
+            const pose = kf[i].pose;
+            for (const [n, r] of Object.entries(pose)) {
+              const b = vrm.humanoid.getNormalizedBoneNode(n);
+              if (!b) continue;
+              if (r.x !== undefined) b.rotation.x = r.x;
+              if (r.y !== undefined) b.rotation.y = r.y;
+              if (r.z !== undefined) b.rotation.z = r.z;
+            }
+            vrm.update(0);
+            const wp = (n) => {
+              const b = vrm.humanoid.getNormalizedBoneNode(n);
+              if (!b) return null;
+              const v = new THREE.Vector3(); b.getWorldPosition(v);
+              return { x: +v.x.toFixed(3), y: +v.y.toFixed(3), z: +v.z.toFixed(3) };
+            };
+            return {
+              sign, frame: i, bonesSet: Object.keys(pose),
+              rWrist: wp('rightHand'), lWrist: wp('leftHand'),
+              rElbow: wp('rightLowerArm'), lElbow: wp('leftLowerArm'),
+              rShoulder: wp('rightUpperArm'), lShoulder: wp('leftUpperArm'),
+              head: wp('head'), chest: wp('chest'), hips: wp('hips'),
+            };
+          },
+        };
+      } catch (e) {
+        console.error(e);
+        setStatus('Error: ' + (e?.message || e), 'err');
+      }
+    }
+
+    // A) Señas hechas a mano (diccionario VRM). B) Nuestras grabaciones (Kalidokit).
+    const SIGNS_HAND = ['hola', 'hola2', 'gracias', 'bien', 'sí', 'no', 'por favor', 'amor', 'ayuda', 'nombre'];
+    const HAND_LABELS = { hola: 'HOLA (orig)', hola2: 'HOLA ✨ mejorada' };
+    const SIGNS_AUTO = ['HOLA', 'GRACIAS', 'BIEN', 'MAL', 'NO', 'SI', 'POR_FAVOR'];
+
+    function buildButtons() {
+      const hand = document.getElementById('signsHand');
+      hand.innerHTML = '';
+      for (const w of SIGNS_HAND) {
+        const b = document.createElement('button');
+        b.textContent = HAND_LABELS[w] || w.toUpperCase();
+        if (w === 'hola2') b.style.background = '#22c55e';
+        b.onclick = () => playHand(w);
+        hand.appendChild(b);
+      }
+      const auto = document.getElementById('signsAuto');
+      auto.innerHTML = '';
+      for (const s of SIGNS_AUTO) {
+        const b = document.createElement('button');
+        b.style.background = '#3b82f6';
+        b.textContent = s.replace(/_/g, ' ');
+        b.onclick = () => playAuto(s);
+        auto.appendChild(b);
+      }
+      buildProbes();
+    }
+
+    // ── Calibración de ejes ────────────────────────────────────────────────
+    // Aísla UN hueso y le aplica una rotación grande en UN eje, desde una pose
+    // base con el brazo al frente, para descubrir qué eje/signo hace qué en
+    // ESTE modelo (la doc de los compas no cuadra con este VRM).
+    const PROBES = [
+      { label: 'Reset',        bone: null },
+      { label: 'Antebrazo X+', bone: 'rightLowerArm', axis: 'x', val:  1.4 },
+      { label: 'Antebrazo X−', bone: 'rightLowerArm', axis: 'x', val: -1.4 },
+      { label: 'Antebrazo Y+', bone: 'rightLowerArm', axis: 'y', val:  1.4 },
+      { label: 'Antebrazo Y−', bone: 'rightLowerArm', axis: 'y', val: -1.4 },
+      { label: 'Antebrazo Z+', bone: 'rightLowerArm', axis: 'z', val:  1.4 },
+      { label: 'Antebrazo Z−', bone: 'rightLowerArm', axis: 'z', val: -1.4 },
+      { label: 'Brazo X+',     bone: 'rightUpperArm', axis: 'x', val:  1.2 },
+      { label: 'Brazo X−',     bone: 'rightUpperArm', axis: 'x', val: -1.2 },
+      { label: 'Brazo Y+',     bone: 'rightUpperArm', axis: 'y', val:  1.2 },
+      { label: 'Brazo Y−',     bone: 'rightUpperArm', axis: 'y', val: -1.2 },
+      { label: 'Brazo Z+',     bone: 'rightUpperArm', axis: 'z', val:  1.2 },
+      { label: 'Brazo Z−',     bone: 'rightUpperArm', axis: 'z', val: -1.2 },
+    ];
+
+    function buildProbes() {
+      const row = document.getElementById('probeRow');
+      row.innerHTML = '';
+      for (const p of PROBES) {
+        const b = document.createElement('button');
+        b.style.background = p.bone ? '#a16207' : '#64748b';
+        b.style.fontSize = '11px';
+        b.style.padding = '6px 9px';
+        b.textContent = p.label;
+        b.onclick = () => probe(p);
+        row.appendChild(b);
+      }
+    }
+
+    // Pose base para probar: brazo derecho horizontal al frente, codo recto.
+    function baseProbePose() {
+      setIdlePose(vrm);
+      const up = vrm.humanoid.getNormalizedBoneNode('rightUpperArm');
+      const lo = vrm.humanoid.getNormalizedBoneNode('rightLowerArm');
+      if (up) up.rotation.set(0, 0, 0);
+      if (lo) lo.rotation.set(0, 0, 0);
+    }
+
+    function probe(p) {
+      if (!vrm) return;
+      baseProbePose();
+      if (!p.bone) { setStatus('Reset (brazo en T-pose)'); return; }
+      const b = vrm.humanoid.getNormalizedBoneNode(p.bone);
+      if (b) b.rotation[p.axis] = p.val;
+      setStatus(`🔧 ${p.label}  (${p.bone}.${p.axis}=${p.val})`);
+    }
+
+    // ── Baker: direcciones del solver → huesos (aiming con cuaterniones) ─────
+    const getBone = (n) => vrm.humanoid.getNormalizedBoneNode(n);
+
+    // Apunta `bone` para que su "hacia el hijo" mire a targetWorld (Vector3).
+    function aimBone(bone, childBone, targetWorld) {
+      if (!bone || !childBone) return;
+      const fBone = childBone.position.clone().normalize();       // forward local en reposo
+      const pq = new THREE.Quaternion();
+      bone.parent.getWorldQuaternion(pq);                          // rotación mundo del padre
+      const tLocal = targetWorld.clone().applyQuaternion(pq.clone().invert()).normalize();
+      bone.quaternion.setFromUnitVectors(fBone, tLocal);
+    }
+
+    function eulerOf(b) { return { x: b.rotation.x, y: b.rotation.y, z: b.rotation.z }; }
+
+    function bakeSolver(dataset) {
+      const arms = activeArms(dataset);
+      const R = { up: getBone('rightUpperArm'), lo: getBone('rightLowerArm'),
+                  hd: getBone('rightHand'), mid: getBone('rightMiddleProximal') };
+      const L = { up: getBone('leftUpperArm'),  lo: getBone('leftLowerArm'),
+                  hd: getBone('leftHand'), mid: getBone('leftMiddleProximal') };
+      const poses = [];
+      for (const f of (dataset.frames || [])) {
+        const dirs = frameToArmDirs(f, arms);
+        const hands = frameHandFwd(f, arms);
+        setIdlePose(vrm);                    // brazos inactivos quedan en reposo
+        vrm.scene.updateMatrixWorld(true);
+        const pose = {};
+        const doSide = (B, d, handFwd, name) => {
+          if (!d) return;
+          aimBone(B.up, B.lo, new THREE.Vector3(...d.upper));
+          vrm.scene.updateMatrixWorld(true);            // el antebrazo usa el brazo ya girado
+          aimBone(B.lo, B.hd, new THREE.Vector3(...d.lower));
+          pose[name + 'UpperArm'] = eulerOf(B.up);
+          pose[name + 'LowerArm'] = eulerOf(B.lo);
+          // Muñeca: orienta la mano hacia donde apuntan los dedos (aprox.).
+          if (handFwd) {
+            vrm.scene.updateMatrixWorld(true);
+            aimBone(B.hd, B.mid, new THREE.Vector3(...handFwd));
+            pose[name + 'Hand'] = eulerOf(B.hd);
+          }
+        };
+        doSide(R, dirs.right, hands.right, 'right');
+        doSide(L, dirs.left,  hands.left,  'left');
+        // Dedos (Fase 2): se calculan directo como rotación .z, sin aiming.
+        Object.assign(pose, frameFingers(f, arms));
+        poses.push(pose);
+      }
+      const fps = dataset.fps || 30;
+      const dur = Math.round(1000 / fps);
+      return smoothPoseSeq(poses).map((p) => ({ duration: dur, pose: p }));
+    }
+
+    function playHand(word) {
+      if (!vrm || busy) return;
+      busy = true;
+      setStatus('A) ' + word.toUpperCase() + ' (hecha a mano)…');
+      translateToLSC(vrm, word, () => {
+        busy = false;
+        setStatus('Listo — pulsa una seña', 'ok');
+      });
+    }
+
+    async function playAuto(sign) {
+      if (!vrm || busy) return;
+      busy = true;
+      setStatus('C) ' + sign.replace(/_/g, ' ') + ' (conversor propio)…');
+      try {
+        const res = await fetch(`anim/${sign}.json`);
+        const dataset = await res.json();
+        const keyframes = bakeSolver(dataset);
+        setIdlePose(vrm);
+        playKeyframes(vrm, keyframes, () => {
+          busy = false;
+          setStatus('Listo — pulsa una seña', 'ok');
+        });
+      } catch (e) {
+        console.error(e);
+        busy = false;
+        setStatus('Error reproduciendo ' + sign + ': ' + (e?.message || e), 'err');
+      }
+    }
+
+    // ── Render loop ─────────────────────────────────────────────────────────────
+    const clock = new THREE.Clock();
+    let __raf = null, __stopped = false;
+    function loop() {
+      if (__stopped) return;
+      __raf = requestAnimationFrame(loop);
+      const dt = clock.getDelta();
+      controls.update();
+      if (vrm) vrm.update(dt);
+      renderer.render(scene, camera);
+    }
+    loop();
+    // Para capturas: detiene el rAF (el WebGL continuo cuelga el screenshot).
+    window.__render = {
+      stop() { __stopped = true; if (__raf) cancelAnimationFrame(__raf); },
+      resume() { if (__stopped) { __stopped = false; loop(); } },
+      once() { if (vrm) vrm.update(0); renderer.render(scene, camera); },
+    };
+
+    boot();
+  </script>
+</body>
+</html>

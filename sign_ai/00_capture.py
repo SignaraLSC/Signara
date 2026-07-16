@@ -53,6 +53,11 @@ RAW_FULL_DIR = os.path.join(DATA_DIR, "raw_full")
 ANIM_DIR     = "animations"
 FPS_TARGET   = 30
 
+# Captura de duración natural: se graba hasta que pulsas S de nuevo y luego se
+# remuestrea a SEQ_LEN. Estos límites solo son barreras de seguridad.
+MIN_CAPTURE_FRAMES = 6     # menos que esto = seña demasiado corta, se descarta
+MAX_CAPTURE_FRAMES = 150   # ~5 s: cierra sola para no crecer sin fin
+
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(ANIM_DIR, exist_ok=True)
 
@@ -79,12 +84,21 @@ def lm_to_list(landmarks, n):
 
 
 def extract_full(results):
-    """Cuerpo completo crudo de un frame (para avatar y respaldo escalable)."""
+    """Cuerpo completo crudo de un frame (para avatar y respaldo escalable).
+
+    `pose` son landmarks de IMAGEN (x,y normalizados a la cámara; z de
+    profundidad poco fiable) — sirven para reconocer.
+    `pose_world` son landmarks 3D MÉTRICOS (metros, origen en la cadera, con
+    profundidad REAL) — necesarios para mover el avatar 3D correctamente: sin
+    esto, una seña hacia la cámara se ve como que "sube" y las dos manos no se
+    juntan. Ambos vienen del mismo `holistic.process()`.
+    """
     return {
         "face": lm_to_list(results.face_landmarks, 478),
         "lh":   lm_to_list(results.left_hand_landmarks, 21),
         "rh":   lm_to_list(results.right_hand_landmarks, 21),
         "pose": lm_to_list(results.pose_landmarks, 33),
+        "pose_world": lm_to_list(results.pose_world_landmarks, 33),
     }
 
 
@@ -170,6 +184,37 @@ def save_raw_full(persona, label, muestra, full_frames):
         )
 
 
+def _lerp_lm(a, b, f):
+    """Interpola dos listas de landmarks [[x,y,z],...] del mismo largo."""
+    return [[a[j][0] + (b[j][0] - a[j][0]) * f,
+             a[j][1] + (b[j][1] - a[j][1]) * f,
+             a[j][2] + (b[j][2] - a[j][2]) * f] for j in range(len(a))]
+
+
+def _lerp_frame(A, B, f):
+    return {k: _lerp_lm(A[k], B[k], f) for k in A}
+
+
+def resample_frames(frames, n):
+    """Remuestrea (interpola linealmente) una lista de frames a EXACTAMENTE n.
+    Igual que padBuffer() en InterpretScreen.jsx y resample_frames en
+    06_gnn_train.py: una seña corta se estira y una larga se comprime a n,
+    conservando su forma real, sin relleno de quietud ni cortes. Así la
+    muestra de entrenamiento coincide con lo que ve el modelo en vivo."""
+    m = len(frames)
+    if m == 0 or m == n:
+        return frames
+    if m == 1:
+        return [frames[0] for _ in range(n)]
+    out = []
+    for i in range(n):
+        t = i * (m - 1) / (n - 1)
+        lo = int(t)
+        hi = min(lo + 1, m - 1)
+        out.append(_lerp_frame(frames[lo], frames[hi], t - lo))
+    return out
+
+
 def save_animation(label, full_frames):
     """Animación del avatar. Se guarda SIEMPRE bajo el nombre canónico (sin
     sufijo de variante _V<N>), porque el avatar solo necesita una toma por
@@ -179,7 +224,9 @@ def save_animation(label, full_frames):
     AvatarSigner3D; la cara completa queda en raw_full."""
     token = canonical_label(label)
     frames = [
-        {"lh": f["lh"], "rh": f["rh"], "pose": f["pose"], "face": slim_face(f["face"])}
+        {"lh": f["lh"], "rh": f["rh"], "pose": f["pose"],
+         "pose_world": f.get("pose_world", [[0.0, 0.0, 0.0]] * 33),
+         "face": slim_face(f["face"])}
         for f in full_frames
     ]
     path = os.path.join(ANIM_DIR, f"{token}.json")
@@ -215,7 +262,8 @@ def main():
 
     print(f"\n🎥 Captura única — persona: {persona} | seña: {label}")
     print(f"   Muestras se guardan en: {csv_path} (empezando en #{muestra})")
-    print("   S   → grabar una muestra (30 frames)")
+    print("   S   → EMPEZAR a grabar / S otra vez → TERMINAR (duración natural)")
+    print(f"        la seña se remuestrea a {SEQ_LEN} frames (corta o larga, sin quietud ni cortes)")
     print("   A   → marcar la ÚLTIMA muestra como animación del avatar")
     print("   ESC → salir\n")
 
@@ -238,18 +286,8 @@ def main():
 
         if grabando:
             buffer_frames.append(extract_full(results))
-            cv2.putText(frame, f"CAPTURANDO {len(buffer_frames)}/{SEQ_LEN}", (20, 50),
+            cv2.putText(frame, f"GRABANDO {len(buffer_frames)}f  (S=terminar)", (20, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-
-            if len(buffer_frames) >= SEQ_LEN:
-                append_raw_csv(csv_path, label, persona, muestra, buffer_frames)
-                save_raw_full(persona, label, muestra, buffer_frames)
-                last_sample = buffer_frames
-                total_guardadas += 1
-                print(f"✅ Muestra #{muestra} guardada ({SEQ_LEN} frames) — total sesión: {total_guardadas}")
-                muestra += 1
-                grabando = False
-                buffer_frames = []
         else:
             msg = (f"LISTO [{total_guardadas} muestra(s)] | S=grabar A=avatar"
                    if total_guardadas else "LISTO | S=grabar")
@@ -258,11 +296,34 @@ def main():
         cv2.imshow(f"Signara Captura — {label}", frame)
         key = cv2.waitKey(1) & 0xFF
 
+        # Tope de seguridad: si la grabación se pasa de largo, ciérrala sola
+        # (mismo camino que pulsar S para terminar).
+        if grabando and len(buffer_frames) >= MAX_CAPTURE_FRAMES:
+            print(f"⚠  Tope de {MAX_CAPTURE_FRAMES} frames alcanzado; cerrando la muestra.")
+            key = ord("s")
+
         if key == ord("s"):
             if not grabando:
                 grabando = True
                 buffer_frames = []
-                print("🔴 Grabando muestra...")
+                print("🔴 Grabando… (S de nuevo para terminar)")
+            else:
+                # TERMINAR: remuestrea la seña real a SEQ_LEN y guarda.
+                grabando = False
+                real = len(buffer_frames)
+                if real < MIN_CAPTURE_FRAMES:
+                    print(f"⚠  Muy corta ({real} frames < {MIN_CAPTURE_FRAMES}); descartada.")
+                    buffer_frames = []
+                    continue
+                sample = resample_frames(buffer_frames, SEQ_LEN)
+                append_raw_csv(csv_path, label, persona, muestra, sample)
+                save_raw_full(persona, label, muestra, sample)
+                last_sample = sample
+                total_guardadas += 1
+                print(f"✅ Muestra #{muestra} guardada — {real} frames reales → {SEQ_LEN} "
+                      f"(remuestreada) — total sesión: {total_guardadas}")
+                muestra += 1
+                buffer_frames = []
 
         elif key == ord("a"):
             if last_sample:

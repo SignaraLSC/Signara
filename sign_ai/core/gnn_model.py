@@ -20,7 +20,8 @@ N_FEATURES = 4
 # Debe coincidir con core/config.SEQ_LEN (captura) y con SEQ_LEN en
 # src/components/InterpretScreen.jsx (navegador) — los tres deben ir
 # sincronizados o /predict rechaza el shape (422) o el modelo entrena mal.
-SEQ_LEN   = 40
+# Bajado de 40 a 24 — ver comentario en core/config.py (ablación validada).
+SEQ_LEN   = 24
 
 HAND_CONNECTIONS = [
     (0,1),(1,2),(2,3),(3,4),

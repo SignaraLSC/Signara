@@ -28,22 +28,46 @@ const MP_SCRIPTS = [
 // ── Parámetros (alineados con sign_ai/07_gnn_predict.py) ─────────────────────
 // SEQ_LEN debe coincidir exactamente con sign_ai/core/gnn_model.SEQ_LEN y
 // sign_ai/core/config.SEQ_LEN — si no coinciden, /predict rechaza el shape.
-const SEQ_LEN        = 40
+// Bajado de 40 a 24 (validado: misma val acc, 97.8%, con datos reales) para
+// que Interpretar reconozca ~40% más rápido sin perder precisión.
+const SEQ_LEN        = 24
 const HAND_COUNT     = 21
 const UMBRAL         = 0.75
 const STABILITY_NEED = 3
 const NO_HAND_RESET  = 12
-const SAME_SIGN_WAIT = 30
+// Tolerancia a pérdida MOMENTÁNEA de tracking (parpadeo típico de MediaPipe
+// en medio de un gesto rápido). Sin esto, un solo frame sin manos detectadas
+// vaciaba el buffer entero y obligaba a reiniciar la seña desde cero — por
+// eso la primera seña (hecha con más cuidado/lentitud) se reconocía rápido
+// y las siguientes parecían "esperar hasta 24": en realidad se reiniciaban
+// varias veces hasta que por casualidad el tracking aguantaba sin cortes.
+const NO_HAND_GRACE  = 4
+// Pausa CORTA tras confirmar una seña. Antes eran 30 frames (~1 s), lo que
+// hacía imposible encadenar señas para formar frases en tiempo real: tras cada
+// palabra había un segundo muerto. Ahora es apenas un anti-rebote para no
+// disparar dos veces sobre la misma parada; la protección real contra repetir
+// una seña sin querer es el reinicio del pico (hay que volver a mover la mano
+// —superar MOVED_MIN— antes de que se pueda confirmar otra).
+const POST_CONFIRM_WAIT = 6
 const MIN_FRAMES     = 8
-const MOVEMENT_MIN   = 0.003  // movimiento mínimo (x,y) para acumular frame
 
-// La predicción en vivo solo debe correr sobre una ventana COMPLETA de
-// SEQ_LEN frames reales (sin relleno). padBuffer() rellena un buffer corto
-// repitiendo el primer frame al inicio; ese patrón artificial no se parece
-// a ninguna muestra de entrenamiento y el modelo puede "estabilizarse" con
-// confianza alta sobre una seña incorrecta antes de que el usuario termine
-// el gesto. MIN_FRAMES (más bajo) se reserva para el camino de respaldo al
-// retirar la mano, donde un poco de relleno es aceptable como último recurso.
+// ── Detección de FIN DE SEÑA (predecir al terminar, no en un conteo fijo) ────
+// El problema con un umbral fijo de "quietud": los landmarks de MediaPipe
+// tiemblan, así que una mano quieta registra micro-movimiento que reinicia el
+// contador y nunca se detecta el final. Solución: umbral ADAPTATIVO relativo
+// al pico de movimiento de ESTA seña. Se considera "detenido" cuando el
+// movimiento cae por debajo de STOP_FRAC del pico (o por debajo de un piso
+// absoluto), durante STOP_FRAMES frames seguidos, y solo si antes hubo un
+// gesto real (el pico superó MOVED_MIN). Así funciona con señas rápidas o
+// lentas y no se engaña con el tembleque.
+const STOP_FRAMES = 3      // frames consecutivos "detenido" para confirmar el fin
+const STOP_FRAC   = 0.4    // detenido si el movimiento < 40% del pico de la seña
+const STOP_ABS    = 0.006  // …o por debajo de este piso absoluto (mano casi quieta)
+const MOVED_MIN   = 0.012  // el pico debe superar esto para contar como "hubo seña"
+
+// Predicción en vivo (respaldo): si el gesto sigue en movimiento continuo sin
+// detenerse, se evalúa la ventana completa igual (con el control de estabilidad
+// de 3 predicciones seguidas, que evita confirmar de más).
 const LIVE_MIN_FRAMES = SEQ_LEN
 
 // Conexiones MediaPipe para dibujar el esqueleto de la mano (no viene en drawing_utils).
@@ -54,6 +78,69 @@ const HAND_CONNECTIONS = [
   [9, 13], [13, 14], [14, 15], [15, 16],
   [13, 17], [0, 17], [17, 18], [18, 19], [19, 20],
 ].map(([start, end]) => ({ start, end }))
+
+// ── Filtro One-Euro (anti-tembleque) ─────────────────────────────────────────
+// Los landmarks de MediaPipe tiemblan cuando la mano está casi quieta y saltan
+// cuando las dos manos se juntan (el tracker duda). El filtro One-Euro es el
+// estándar para esto: suaviza fuerte a baja velocidad (mata el tembleque) pero
+// deja pasar el movimiento rápido (no arrastra ni retrasa señas veloces), así
+// que no distorsiona la forma del gesto que ve el modelo. Se aplica por mano y
+// se REINICIA cuando la mano desaparece, para que al reaparecer salte al valor
+// nuevo en vez de interpolar desde cero.
+function makeOneEuro({ minCutoff = 1.2, beta = 0.6, dCutoff = 1.0, freq = 30 } = {}) {
+  let xPrev = null, dxPrev = null, tPrev = null
+  const alpha = (cutoff, dt) => {
+    const tau = 1 / (2 * Math.PI * cutoff)
+    return 1 / (1 + tau / dt)
+  }
+  return {
+    reset() { xPrev = null; dxPrev = null; tPrev = null },
+    filter(x, t) {
+      if (xPrev === null) {
+        xPrev = x.slice()
+        dxPrev = x.map(() => 0)
+        tPrev = t
+        return x.slice()
+      }
+      const dt = (t > tPrev) ? (t - tPrev) / 1000 : 1 / freq
+      tPrev = t
+      const aD = alpha(dCutoff, dt)
+      const out = new Array(x.length)
+      for (let i = 0; i < x.length; i++) {
+        const dx = (x[i] - xPrev[i]) / dt
+        const dxHat = dxPrev[i] + aD * (dx - dxPrev[i])
+        const cutoff = minCutoff + beta * Math.abs(dxHat)
+        const a = alpha(cutoff, dt)
+        const xHat = xPrev[i] + a * (x[i] - xPrev[i])
+        out[i] = xHat
+        xPrev[i] = xHat
+        dxPrev[i] = dxHat
+      }
+      return out
+    },
+  }
+}
+
+// 21 landmarks {x,y,z} ⇄ vector plano [63] (para pasar por el filtro).
+function landmarksToVec(lms) {
+  const v = new Array(HAND_COUNT * 3).fill(0)
+  if (lms) {
+    const n = Math.min(lms.length, HAND_COUNT)
+    for (let i = 0; i < n; i++) {
+      v[i * 3]     = lms[i]?.x ?? 0
+      v[i * 3 + 1] = lms[i]?.y ?? 0
+      v[i * 3 + 2] = lms[i]?.z ?? 0
+    }
+  }
+  return v
+}
+function vecToLandmarks(v) {
+  const out = new Array(HAND_COUNT)
+  for (let i = 0; i < HAND_COUNT; i++) {
+    out[i] = { x: v[i * 3], y: v[i * 3 + 1], z: v[i * 3 + 2] }
+  }
+  return out
+}
 
 // ── Script loader ─────────────────────────────────────────────────────────────
 
@@ -113,11 +200,28 @@ function extractLandmarks(results) {
   ]
 }
 
-// Pad al inicio repitiendo el primer frame hasta SEQ_LEN (igual que Python).
+// Ajusta el buffer a exactamente SEQ_LEN frames para /predict.
+//  - Si sobran: se queda con los últimos SEQ_LEN.
+//  - Si faltan: REMUESTREA (interpola linealmente) la secuencia real a SEQ_LEN,
+//    en vez de rellenar repitiendo un frame. Así una seña corta se "estira"
+//    suavemente a la longitud que el modelo espera, conservando su forma real
+//    (el relleno viejo creaba un tramo congelado al inicio que no se parecía a
+//    ninguna muestra de entrenamiento).
 function padBuffer(buffer) {
-  const padded = [...buffer]
-  while (padded.length < SEQ_LEN) padded.unshift(padded[0])
-  return padded.slice(-SEQ_LEN)
+  const n = buffer.length
+  if (n >= SEQ_LEN) return buffer.slice(-SEQ_LEN)
+  if (n === 0) return buffer
+  if (n === 1) return Array.from({ length: SEQ_LEN }, () => buffer[0])
+  const out = new Array(SEQ_LEN)
+  for (let i = 0; i < SEQ_LEN; i++) {
+    const t  = (i * (n - 1)) / (SEQ_LEN - 1)  // posición en 0..n-1
+    const lo = Math.floor(t)
+    const hi = Math.min(lo + 1, n - 1)
+    const f  = t - lo
+    const a  = buffer[lo], b = buffer[hi]
+    out[i] = a.map((v, k) => v + (b[k] - v) * f)
+  }
+  return out
 }
 
 // Movimiento medio (x,y) entre dos frames — igual que mov_entre() en
@@ -148,8 +252,14 @@ export default function InterpretScreen({ onBack, onHome }) {
   const predHistRef       = useRef([])   // historial de predicciones para estabilidad
   const prevFrameRef      = useRef(null) // frame anterior para calcular movimiento
   const noHandCountRef    = useRef(0)    // frames consecutivos sin manos
+  const stillCountRef     = useRef(0)    // frames consecutivos "detenido" (mano visible)
+  const peakMovementRef   = useRef(0)    // pico de movimiento de la seña en curso (umbral adaptativo)
   const cooldownRef       = useRef(0)    // cooldown frame-based
   const lastSignRef       = useRef('')   // última seña confirmada (evita repetir)
+  const lhFilterRef       = useRef(null) // One-Euro mano izq (navegador: right)
+  const rhFilterRef       = useRef(null) // One-Euro mano der (navegador: left)
+  if (!lhFilterRef.current) lhFilterRef.current = makeOneEuro()
+  if (!rhFilterRef.current) rhFilterRef.current = makeOneEuro()
   const apiInFlightRef    = useRef(false)
   const mlAvailableRef    = useRef(false)
   const sentenceClearRef  = useRef(null)
@@ -235,11 +345,19 @@ export default function InterpretScreen({ onBack, onHome }) {
     })
     holistic.setOptions({
       modelComplexity:        0,
-      smoothLandmarks:        false,
+      // 00_capture.py (con el que se grabaron los datos de entrenamiento) usa
+      // el filtro de suavizado temporal de MediaPipe por defecto (True). Acá
+      // estaba apagado — eso desalinea el ruido/tembleque de los landmarks en
+      // vivo respecto a los datos con los que se entrenó el modelo.
+      smoothLandmarks:        true,
       enableSegmentation:     false,
       refineFaceLandmarks:    false,
-      minDetectionConfidence: 0.5,
-      minTrackingConfidence:  0.65,
+      // Alineado con min_detection_confidence/min_tracking_confidence=0.6 de
+      // 00_capture.py. Bajar minTrackingConfidence de 0.65 a 0.6 hace que
+      // MediaPipe no suelte el tracking de la mano ante frames ligeramente
+      // ruidosos, reduciendo el parpadeo que cortaba el buffer a la mitad.
+      minDetectionConfidence: 0.6,
+      minTrackingConfidence:  0.6,
     })
     holistic.onResults((results) => handleResultsRef.current(results))
     holisticRef.current = holistic
@@ -340,10 +458,14 @@ export default function InterpretScreen({ onBack, onHome }) {
     landmarkBufferRef.current = []
     predHistRef.current       = []
     prevFrameRef.current      = null
+    stillCountRef.current     = 0
+    peakMovementRef.current   = 0
     lastSignRef.current       = ''
     cooldownRef.current       = 0
     apiInFlightRef.current    = false
     handVisibleRef.current    = false
+    lhFilterRef.current?.reset()
+    rhFilterRef.current?.reset()
     setHandVisible(false)
     setBufferLen(0)
     setInCooldown(false)
@@ -355,10 +477,12 @@ export default function InterpretScreen({ onBack, onHome }) {
 
   function confirmSign(prediction, confidence) {
     lastSignRef.current       = prediction
-    cooldownRef.current       = SAME_SIGN_WAIT
+    cooldownRef.current       = POST_CONFIRM_WAIT
     landmarkBufferRef.current = []
     predHistRef.current       = []
     prevFrameRef.current      = null
+    stillCountRef.current     = 0
+    peakMovementRef.current   = 0
 
     setDisplaySign(prediction)
     setDisplayConf(confidence)
@@ -441,21 +565,42 @@ export default function InterpretScreen({ onBack, onHome }) {
     const hasRight = !!results.rightHandLandmarks
     const hasHands = hasLeft || hasRight
 
+    // ── Suavizado One-Euro (anti-tembleque) — SOLO para DIBUJAR ──────────────
+    // Importante: el filtro se aplica únicamente a lo que se ve en pantalla,
+    // NO a lo que recibe el modelo. El modelo se entrenó con el suavizado
+    // propio de MediaPipe (00_capture.py), no con One-Euro encima; filtrarle
+    // la entrada le bajaba los picos de movimiento y le corría la señal, y
+    // empeoraba el reconocimiento. El reconocedor usa los landmarks crudos.
+    // Se reinicia el filtro de la mano ausente para que al reaparecer no
+    // interpole desde el frame viejo.
+    const now = (typeof performance !== 'undefined' ? performance.now() : Date.now())
+    let leftLm = null, rightLm = null
+    if (hasLeft) {
+      leftLm = vecToLandmarks(rhFilterRef.current.filter(landmarksToVec(results.leftHandLandmarks), now))
+    } else {
+      rhFilterRef.current.reset()
+    }
+    if (hasRight) {
+      rightLm = vecToLandmarks(lhFilterRef.current.filter(landmarksToVec(results.rightHandLandmarks), now))
+    } else {
+      lhFilterRef.current.reset()
+    }
+
     // ── Solo dibuja manos (igual que 07_gnn_predict.py) ─────────────────────
     const drawConn = window.drawConnectors
     const drawLm   = window.drawLandmarks
     if (drawConn && drawLm) {
       try {
-        if (hasLeft) {
-          drawConn(ctx, results.leftHandLandmarks, HAND_CONNECTIONS,
+        if (leftLm) {
+          drawConn(ctx, leftLm, HAND_CONNECTIONS,
             { color: '#3b82f6', lineWidth: 3 })
-          drawLm(ctx, results.leftHandLandmarks,
+          drawLm(ctx, leftLm,
             { color: '#60a5fa', lineWidth: 1, radius: 3 })
         }
-        if (hasRight) {
-          drawConn(ctx, results.rightHandLandmarks, HAND_CONNECTIONS,
+        if (rightLm) {
+          drawConn(ctx, rightLm, HAND_CONNECTIONS,
             { color: '#9333ea', lineWidth: 3 })
-          drawLm(ctx, results.rightHandLandmarks,
+          drawLm(ctx, rightLm,
             { color: '#c084fc', lineWidth: 1, radius: 3 })
         }
       } catch (e) {
@@ -477,13 +622,29 @@ export default function InterpretScreen({ onBack, onHome }) {
       setInCooldown(cooling)
     }
 
-    // ── Sin manos: vaciar buffer al instante y predecir con lo capturado ─────
+    // ── Sin manos ────────────────────────────────────────────────────────────
     if (!hasHands) {
+      noHandCountRef.current++
+
+      // Parpadeo momentáneo en medio de un gesto: no tocar el buffer, solo
+      // saltar el frame. MediaPipe casi siempre recupera el tracking en 1-3
+      // frames; tratarlo como "se acabó la seña" de una vez rompe capturas
+      // válidas a la mitad.
+      if (handWasVisibleRef.current && noHandCountRef.current < NO_HAND_GRACE) {
+        const status = mlMode ? 'Detectando…' : 'Servidor IA no conectado'
+        updateCaptureHud(landmarkBufferRef.current.length, { showHud: true, status })
+        return
+      }
+
+      // Pérdida sostenida: ahí sí se acabó la seña — predecir con lo
+      // capturado y reiniciar el pipeline.
       const hadHands = handWasVisibleRef.current
       const snapshot = hadHands ? [...landmarkBufferRef.current] : []
 
       landmarkBufferRef.current = []
       prevFrameRef.current      = null
+      stillCountRef.current     = 0
+      peakMovementRef.current   = 0
       handWasVisibleRef.current = false
 
       const status = !runningRef.current
@@ -495,7 +656,6 @@ export default function InterpretScreen({ onBack, onHome }) {
         runPrediction(snapshot, { finalize: true })
       }
 
-      noHandCountRef.current++
       if (noHandCountRef.current >= NO_HAND_RESET) {
         predHistRef.current = []
       }
@@ -506,30 +666,57 @@ export default function InterpretScreen({ onBack, onHome }) {
     noHandCountRef.current    = 0
     handWasVisibleRef.current = true
 
-    const currFrame = extractLandmarks(results)
+    const currFrame = extractLandmarks(results)   // crudo: alineado con el entrenamiento
     const movement  = frameMovement(prevFrameRef.current, currFrame)
     prevFrameRef.current = currFrame
 
     let len = 0
     if (runningRef.current) {
-      // Solo acumular frames con movimiento real (igual que 07_gnn_predict.py):
-      // evita diluir el buffer con encuadres de mano quieta y acelera la
-      // llegada a una ventana completa (LIVE_MIN_FRAMES) con movimiento
-      // útil para el modelo.
-      if (movement >= MOVEMENT_MIN) {
-        landmarkBufferRef.current.push(currFrame)
-        if (landmarkBufferRef.current.length > SEQ_LEN) {
-          landmarkBufferRef.current.shift()
-        }
+      // Acumular el frame (mientras la mano esté visible). Se limita el buffer
+      // a los últimos SEQ_LEN para no crecer sin fin en gestos largos.
+      landmarkBufferRef.current.push(currFrame)
+      if (landmarkBufferRef.current.length > SEQ_LEN) {
+        landmarkBufferRef.current.shift()
       }
       len = landmarkBufferRef.current.length
 
-      // Predicción en vivo: ya no hace falta retirar la mano para detectar.
-      // Solo con ventana completa (ver LIVE_MIN_FRAMES) para no predecir
-      // sobre un buffer relleno artificialmente. runPrediction() se
-      // autolimita con apiInFlightRef (una petición a la vez) y cooldownRef,
-      // así que esto no satura la API.
-      if (!cooling && len >= LIVE_MIN_FRAMES) {
+      // Umbral ADAPTATIVO de "detenido": relativo al pico de movimiento de la
+      // seña en curso, con un piso absoluto. Robusto al tembleque de MediaPipe
+      // (una mano quieta que vibra un poco no cuenta como movimiento).
+      const wasGesture = peakMovementRef.current >= MOVED_MIN
+      if (movement > peakMovementRef.current) peakMovementRef.current = movement
+      const stopThreshold = Math.max(STOP_ABS, peakMovementRef.current * STOP_FRAC)
+      const gestureHappened = peakMovementRef.current >= MOVED_MIN
+
+      // Al ARRANCAR una seña nueva (el pico cruza MOVED_MIN tras una parada),
+      // se limpia la guarda de "no repetir la última seña". Así se puede
+      // encadenar la MISMA palabra varias veces en una frase (SI · SI) siempre
+      // que sea un gesto nuevo de verdad — la guarda solo evita el doble
+      // disparo sobre una misma seña sostenida.
+      if (!wasGesture && gestureHappened) lastSignRef.current = ''
+
+      if (movement < stopThreshold) stillCountRef.current++
+      else stillCountRef.current = 0
+
+      // Fin de seña: hubo un gesto real (el pico superó MOVED_MIN) y el
+      // movimiento lleva STOP_FRAMES por debajo del umbral → terminó. Predice
+      // YA con los frames reales capturados (padBuffer los remuestrea a SEQ_LEN),
+      // sin esperar a llenar la ventana. Se dispara una sola vez por parada.
+      if (
+        !cooling && !apiInFlightRef.current &&
+        gestureHappened &&
+        stillCountRef.current === STOP_FRAMES &&
+        len >= MIN_FRAMES
+      ) {
+        const snapshot = [...landmarkBufferRef.current]
+        landmarkBufferRef.current = []
+        peakMovementRef.current   = 0
+        runPrediction(snapshot, { finalize: true })
+      }
+      // Respaldo: si el gesto sigue en movimiento continuo y llena la ventana
+      // sin detenerse, se evalúa igual (el control de estabilidad de 3
+      // predicciones seguidas evita confirmar de más).
+      else if (!cooling && len >= LIVE_MIN_FRAMES) {
         runPrediction(landmarkBufferRef.current)
       }
     }
@@ -841,7 +1028,7 @@ export default function InterpretScreen({ onBack, onHome }) {
                       Haz cada seña con movimiento claro. Cuando termines, <strong>quita las manos</strong> del encuadre para confirmar la seña.
                     </p>
                     <p className="mt-2 text-xs font-semibold text-pastel-sub">
-                      Señas: HOLA · GRACIAS · BIEN · MAL · COMO ESTAS · SED · NECESITO AYUDA
+                      Señas: HOLA · GRACIAS · BIEN · MAL · COMO ESTAS · SED · NECESITO AYUDA · POR FAVOR · SI · NO · ADIOS · FAMILIA · PERDON
                     </p>
                   </div>
                 )}

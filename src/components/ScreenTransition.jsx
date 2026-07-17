@@ -48,9 +48,18 @@ export default function ScreenTransition({ screen, enterClass, render }) {
 
   return (
     <div className="relative min-h-screen w-full">
-      {layers.map((layer, index) => (
+      {layers.map((layer) => (
         <div
-          key={`${layer.screen}-${layer.phase}-${index}`}
+          // Clave SOLO por pantalla (no por fase). Antes la clave incluía la
+          // fase, así que al terminar la transición (enter → idle) la clave
+          // cambiaba y React DESMONTABA y RE-MONTABA la pantalla entera,
+          // re-disparando todas sus animaciones de entrada → se veía "cargar
+          // dos veces". Con la clave estable, la capa que entra y la capa idle
+          // son el MISMO elemento: la animación de entrada corre una sola vez.
+          // fromScreen y toScreen siempre difieren (si son iguales, el efecto
+          // sale temprano y no se crea capa de salida), así que no hay choque
+          // de claves entre las dos capas simultáneas.
+          key={layer.screen}
           className={
             'absolute inset-0 min-h-screen w-full ' +
             (layer.phase === 'idle' ? '' : layer.className + ' ') +

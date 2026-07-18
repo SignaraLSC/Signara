@@ -62,6 +62,9 @@
 
     <p style="margin-top:14px; color:#fbbf24"><b>🔧 Calibrar ejes</b> — dime cuál DOBLA EL CODO (antebrazo se pliega) y cuál sube el brazo AL FRENTE:</p>
     <div class="row" id="probeRow"></div>
+
+    <p style="margin-top:14px; color:#f472b6"><b>🗣️ Cabeza (SI/NO)</b> — dime cuál GIRA de lado a lado y cuál ASIENTE arriba/abajo:</p>
+    <div class="row" id="headProbeRow"></div>
     <div id="status">Cargando…</div>
   </div>
 
@@ -71,7 +74,7 @@
     import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
     import { VRMLoaderPlugin } from '@pixiv/three-vrm';
     import { setIdlePose, translateToLSC, playKeyframes } from './animations.js?v=lab3';
-    import { frameToArmDirs, frameFingers, frameWristBasis, frameHandBasis, activeArms, smoothPoseSeq, smoothVecSeq, trimLeadIn, trimTrailOut, CONFIG } from './solver.js?v=lab23';
+    import { frameToArmDirs, frameFingers, frameWristBasis, frameHandBasis, frameHeadRotation, smoothHeadSeq, activeArms, smoothPoseSeq, smoothVecSeq, trimLeadIn, trimTrailOut, CONFIG } from './solver.js?v=lab24';
 
     const statusEl = document.getElementById('status');
     const setStatus = (msg, kind = '') => { statusEl.textContent = msg; statusEl.className = kind; };
@@ -232,6 +235,7 @@
       renderAutoButtons();
       loadAutoSigns();
       buildProbes();
+      buildHeadProbes();
       buildRolls();
       buildFwds();
     }
@@ -345,6 +349,38 @@
       const b = vrm.humanoid.getNormalizedBoneNode(p.bone);
       if (b) b.rotation[p.axis] = p.val;
       setStatus(`🔧 ${p.label}  (${p.bone}.${p.axis}=${p.val})`);
+    }
+
+    // Calibración de la cabeza: gira SOLO el hueso 'head' en un eje, desde
+    // reposo, para descubrir qué eje gira (NO) y cuál asiente (SÍ) en ESTE VRM.
+    const HEAD_PROBES = [
+      { label: 'Reset',      bone: null },
+      { label: 'Cabeza X+',  axis: 'x', val:  0.5 },
+      { label: 'Cabeza X−',  axis: 'x', val: -0.5 },
+      { label: 'Cabeza Y+',  axis: 'y', val:  0.5 },
+      { label: 'Cabeza Y−',  axis: 'y', val: -0.5 },
+      { label: 'Cabeza Z+',  axis: 'z', val:  0.5 },
+      { label: 'Cabeza Z−',  axis: 'z', val: -0.5 },
+    ];
+    function buildHeadProbes() {
+      const row = document.getElementById('headProbeRow');
+      row.innerHTML = '';
+      for (const p of HEAD_PROBES) {
+        const b = document.createElement('button');
+        b.style.background = p.axis ? '#be185d' : '#64748b';
+        b.style.fontSize = '11px';
+        b.style.padding = '6px 9px';
+        b.textContent = p.label;
+        b.onclick = () => {
+          setIdlePose(vrm);
+          const h = vrm.humanoid.getNormalizedBoneNode('head');
+          if (!h) { setStatus('⚠ este VRM no tiene hueso "head"'); return; }
+          h.rotation.set(0, 0, 0);
+          if (p.axis) h.rotation[p.axis] = p.val;
+          setStatus(p.axis ? `🗣️ ${p.label} (head.${p.axis}=${p.val})` : 'Reset cabeza');
+        };
+        row.appendChild(b);
+      }
     }
 
     // ── Baker: direcciones del solver → huesos (aiming con cuaterniones) ─────
@@ -489,6 +525,31 @@
       const C_avatar = new THREE.Vector3()
         .addVectors(R.up.getWorldPosition(new THREE.Vector3()), L.up.getWorldPosition(new THREE.Vector3()))
         .multiplyScalar(0.5);
+
+      // ── Evitar que la muñeca atraviese el torso ─────────────────────────────
+      // El IK no "sabe" que hay un cuerpo — solo apunta hacia el objetivo, así
+      // que en señas de dos manos que se juntan cerca del pecho (GRACIAS) el
+      // objetivo puede caer DETRÁS de donde está el torso y la mano lo
+      // atraviesa. Se define una caja simple alrededor del torso (ancho a
+      // partir de los hombros, medido en ESTE avatar) y si el objetivo cae
+      // dentro en X/Y pero muy atrás en Z, se empuja hacia adelante justo lo
+      // necesario para quedar por delante del pecho. General: aplica a
+      // cualquier seña, no solo GRACIAS.
+      const shoulderHalfW = C_avatar.distanceTo(R.up.getWorldPosition(new THREE.Vector3()));
+      const TORSO_HALF_WIDTH = shoulderHalfW * 0.75;   // ancho del torso (X)
+      const TORSO_UP         = shoulderHalfW * 0.35;   // cuánto sube sobre los hombros (Y)
+      const TORSO_DOWN       = shoulderHalfW * 2.0;    // cuánto baja hacia la cadera (Y)
+      const TORSO_MIN_FWD    = shoulderHalfW * 0.4;    // grosor del pecho — clearance mínimo (Z)
+      function avoidTorso(T) {
+        const off = T.clone().sub(C_avatar);
+        const insideWidth = Math.abs(off.x) < TORSO_HALF_WIDTH;
+        const insideHeight = off.y < TORSO_UP && off.y > -TORSO_DOWN;
+        if (insideWidth && insideHeight && off.z < TORSO_MIN_FWD) {
+          off.z = TORSO_MIN_FWD;
+          return C_avatar.clone().add(off);
+        }
+        return T;
+      }
       const frames = dataset.frames || [];
       // 1) Datos crudos por frame: IK (wristDir, reachFrac, pole) + muñeca + dedos.
       const rawDirs = frames.map((f) => frameToArmDirs(f, arms));
@@ -516,6 +577,20 @@
         return out;
       });
       const rawFing = frames.map((f) => frameFingers(f, arms));
+      // Cabeza (Fase 3): nariz/orejas de pose_world → yaw/pitch. Huecos (mano
+      // tapando la cara, detección floja) heredan el último valor válido, igual
+      // que el blindaje de bordes de los brazos — nunca deja el canal "vacío".
+      let lastHeadRaw = null;
+      const rawHead = frames.map((f) => {
+        const r = frameHeadRotation(f);
+        if (r) lastHeadRaw = r;
+        return r || lastHeadRaw;
+      });
+      const headSmooth = smoothHeadSeq(rawHead);
+      const headEuler = (h) => !h ? { x: 0, y: 0, z: 0 } : {
+        [CONFIG.headYawAxis]:   h.yaw,
+        [CONFIG.headPitchAxis]: h.pitch,
+      };
 
       // 2) Suavizar antes de orientar (mata tembleque/saltos).
       const pick = (arr, side, key) => arr.map((r) => (r[side] ? r[side][key] : null));
@@ -569,7 +644,8 @@
           if (!d) continue;
           const S = B.up.getWorldPosition(new THREE.Vector3());   // hombro (fijo, no depende de la pose)
           const scale = (B.L1 + B.L2) / (armLenRef[name] || d.recArmLen);
-          const T = C_avatar.clone().addScaledVector(new THREE.Vector3(...d.wristOffset), scale);
+          let T = C_avatar.clone().addScaledVector(new THREE.Vector3(...d.wristOffset), scale);
+          T = avoidTorso(T);
           tg[name] = { B, d, S, T };
         }
         if (tg.right && tg.left) {
@@ -580,6 +656,10 @@
             const pull = CONFIG.handAttract * (1 - gap / near);
             tg.right.T.lerp(mid, pull);
             tg.left.T.lerp(mid, pull);
+            // La atracción puede volver a meter la mano al torso (ej. al
+            // juntarlas cerca del pecho) — re-chequear tras el jalón.
+            tg.right.T.copy(avoidTorso(tg.right.T));
+            tg.left.T.copy(avoidTorso(tg.left.T));
           }
         }
         for (const name of ['right', 'left']) {
@@ -629,6 +709,7 @@
           }
         }
         Object.assign(pose, fingSmooth[i]);   // dedos ya suavizados
+        pose.head = headEuler(headSmooth[i]);  // cabeza (asentir/girar), independiente de brazos
         poses.push(pose);
       }
       // Blindaje de bordes: si un brazo activo en la seña no se detectó en el
@@ -661,8 +742,16 @@
 
       const fps = (dataset.fps > 0 && dataset.fps < 240) ? dataset.fps : 30;   // valor sano
       const dur = Math.round(1000 / fps * SIGN_SLOWDOWN);   // más lento = natural
-      const signKfs = poses.map((p) => ({ duration: dur, pose: p }));
-      if (!poses.length) return signKfs;
+      if (!poses.length) return [];
+      // NOTA: se intentó comprimir automáticamente señas "quietas" (ej. BIEN)
+      // para que no demoren sosteniendo una pose fija — primero por rango total
+      // (rompió SI: su asentir real quedaba por debajo del umbral de posición),
+      // después por salto frame-a-frame (tampoco: medido, BIEN y SI tienen la
+      // MISMA magnitud de cambio entre frames vecinos — ambas ~0.02-0.05 rad,
+      // indistinguibles con los datos actuales). Cualquier heurística automática
+      // aquí arriesga romper señas reales para "arreglar" una demora cosmética.
+      // Se descartó — sin compresión, todos los frames grabados se respetan tal
+      // cual.
 
       // ── Reposo natural: muñeca neutra + dedos ligeramente relajados ──────────
       const NEUTRAL = { x: 0, y: 0, z: 0 };
@@ -728,7 +817,7 @@
       // frena/acelera en reposo sin anular la velocidad justo en el empalme.
       const TRANS_STEPS = 8;
       const smoothstep = (t) => t * t * (3 - 2 * t);
-      const transition = (sideData, fingerA, fingerB, steps, stepMs) => {
+      const transition = (sideData, fingerA, fingerB, steps, stepMs, headA, headB) => {
         const activeSides = Object.keys(sideData);
         const out = [];
         for (let s = 1; s <= steps; s++) {
@@ -746,6 +835,7 @@
           }
           const bones = new Set([...Object.keys(fingerA), ...Object.keys(fingerB)]);
           bones.forEach((k) => { pose[k] = lerpEuler(fingerA[k], fingerB[k], a); });
+          if (headA || headB) pose.head = slerpEuler(headA, headB, a);
           out.push({ duration: stepMs, pose });
         }
         return out;
@@ -762,6 +852,7 @@
             Object.assign(pose, frozenFingerRest(side));
           }
         }
+        pose.head = NEUTRAL;
         return pose;
       };
 
@@ -785,14 +876,14 @@
       const transSteps = TRANS_STEPS - 1;
       const entryStepMs = LEAD_IN_MS / TRANS_STEPS;
       const exitStepMs = 480 / TRANS_STEPS;
-      const entryKfs = transition(entrySides, restFingers, fingersOf(first), transSteps, entryStepMs);
+      const entryKfs = transition(entrySides, restFingers, fingersOf(first), transSteps, entryStepMs, NEUTRAL, first.head);
       // Empalme exacto con frame 0: mismo pose y duración del primer frame de la
       // seña, sin duplicar keyframe (evita micro-pausa por tramo de delta cero).
       entryKfs.push({ duration: dur, pose: { ...first } });
       const signKfsBody = poses.length > 1
         ? poses.slice(1).map((p) => ({ duration: dur, pose: p }))
         : [];
-      const exitKfs = transition(exitSides, fingersOf(last), restFingers, transSteps, exitStepMs);
+      const exitKfs = transition(exitSides, fingersOf(last), restFingers, transSteps, exitStepMs, last.head, NEUTRAL);
       exitKfs.push({ duration: exitStepMs, pose: buildExactRestPose(activeSides) });
       const all = [...entryKfs, ...signKfsBody, ...exitKfs];
 

@@ -24,10 +24,24 @@ export const CONFIG = {
   dirSmooth: 0.20, // EMA general de direcciones
   posSmooth: 0.7,  // EMA LIGERO sobre la POSICIÓN de la muñeca (para no aplanar
                    // el momento en que las manos se juntan)
-  wristSmooth: 0.10, // EMA FUERTE sobre la orientación (codo/muñeca): es info de
-                     // cambio lento; con mala detección se torcía/saltaba
+  // EMA sobre la orientación de muñeca (giro de palma). Estaba en 0.10
+  // (fuerte) para arreglar GRACIAS, grabado con mala detección de manos — pero
+  // eso mismo APLANABA movimientos reales de muñeca (ej. NO de lado a lado)
+  // en grabaciones limpias: 0.10 dejaba un vaivén real (rango 0.57–0.73) casi
+  // plano (0.62–0.65). Con grabaciones limpias (protocolo actual) 0.5 alcanza
+  // para matar el ruido de un frame suelto sin aplastar el movimiento real.
+  wristSmooth: 0.5,
   handAttract: 0.7,  // cuando las dos manos están cerca, se juntan un poco más
                      // (0 = nada, 1 = se tocan del todo)
+
+  // ── Cabeza (Fase 3) ── nariz/orejas ya vienen en pose_world (33 puntos),
+  // no hace falta grabar nada extra. Ejes por calibrar con el panel 🔧 Cabeza.
+  headYawAxis:   'y',  // eje de girar la cabeza de lado a lado (NO)
+  headPitchAxis: 'x',  // eje de asentir arriba/abajo (SÍ)
+  headYawSign:   1,
+  headPitchSign: 1,
+  headGain:      1.3,  // el movimiento de cabeza real es sutil; se amplifica un poco
+  headSmooth:    0.5,
 
   // ── Dedos (Fase 2) ──
   fingerGain: 1.0,   // escala del doblez de dedos (1 = ángulo real)
@@ -165,6 +179,38 @@ export function activeArms(dataset) {
   let right = r >= need, left = l >= need;
   if (!right && !left) { right = true; left = true; }
   return { right, left };
+}
+
+// ── Cabeza (Fase 3): nariz + orejas de pose_world → yaw/pitch de la cabeza ────
+// MediaPipe Pose (33 pts) YA incluye nariz(0) y orejas(7,8) con profundidad
+// real dentro de pose_world — no hace falta grabar nada extra ni usar los 478
+// puntos de cara (esos no traen profundidad). "Adelante de la cabeza" se mide
+// como nariz - punto_medio_orejas; yaw/pitch se sacan de cuánto se desvía esa
+// dirección del eje del cuerpo (hombros/cadera), así que una cabeza quieta
+// mirando a cámara da ~0 y asentir/girar produce la señal real.
+export function frameHeadRotation(frame) {
+  if (!hasWorld(frame)) return null;
+  const pose = unmirrorWorld(frame.pose_world);
+  const axes = bodyAxesFromPose(pose);
+  if (!axes) return null;
+  const g = (i) => (present(pose[i]) ? worldize(pose[i]) : null);
+  const nose = g(0), earL = g(7), earR = g(8);
+  if (!nose || !earL || !earR) return null;
+  const earMid = mid(earL, earR);
+  const fwd = norm(sub(nose, earMid));
+  const [right, up, forward] = toAvatar(fwd, axes, 1.0);
+  const yaw = Math.atan2(right, forward) * CONFIG.headYawSign * CONFIG.headGain;
+  const pitch = Math.atan2(up, Math.hypot(right, forward)) * CONFIG.headPitchSign * CONFIG.headGain;
+  return { yaw, pitch };
+}
+
+export function smoothHeadSeq(rots, alpha = CONFIG.headSmooth) {
+  let acc = null;
+  return rots.map((r) => {
+    if (!r) { acc = null; return null; }
+    acc = acc ? { yaw: acc.yaw + alpha * (r.yaw - acc.yaw), pitch: acc.pitch + alpha * (r.pitch - acc.pitch) } : { ...r };
+    return { ...acc };
+  });
 }
 
 // ── Dedos (Fase 2): landmarks de mano → doblez de cada articulación ──────────

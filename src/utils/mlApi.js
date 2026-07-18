@@ -15,13 +15,22 @@ export function getMlApiCache() {
   return cached
 }
 
+// Render free duerme la instancia tras inactividad: el primer health-check
+// tras un cold start puede tardar bastante en responder. 20s es generoso para
+// no marcar "caído" a un servidor que solo está despertando, pero sigue
+// acotado (sin esto, un fetch roto podía quedarse colgado indefinidamente).
+const HEALTH_TIMEOUT_MS = 20000
+
 export function checkMlApiHealth({ force = false } = {}) {
   if (!force && cached && Date.now() - cached.at < CACHE_TTL_MS) {
     return Promise.resolve(cached)
   }
   if (!force && inflight) return inflight
 
-  inflight = fetch(`${ML_API_URL}/health`)
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), HEALTH_TIMEOUT_MS)
+
+  inflight = fetch(`${ML_API_URL}/health`, { signal: controller.signal })
     .then((r) => r.json())
     .then((data) => {
       cached = { ok: !!data.model_loaded, at: Date.now() }
@@ -33,6 +42,7 @@ export function checkMlApiHealth({ force = false } = {}) {
       inflight = null
       return cached
     })
+    .finally(() => clearTimeout(timer))
 
   return inflight
 }

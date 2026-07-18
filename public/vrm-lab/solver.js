@@ -18,9 +18,16 @@
 export const CONFIG = {
   zSign:   -1,     // signo de la profundidad de MediaPipe al pasar a mundo
   fwdSign:  1,     // si las señas salen atrás en vez de adelante, poner -1
-  fwdGain:  2.0,   // amplifica la profundidad (MediaPipe la comprime) → las
-                   // señas van HACIA ADELANTE en vez de hacia arriba
-  smooth:   0.18,  // EMA anti-tembleque (más bajo = más suave)
+  fwdGain:  1.8,   // inclina las señas HACIA ADELANTE (no hacia arriba). Aplica
+                   // también a datos 3D: los presenta más "de frente". Calibrable.
+  smooth:   0.18,  // EMA final sobre ángulos (fino)
+  dirSmooth: 0.20, // EMA general de direcciones
+  posSmooth: 0.7,  // EMA LIGERO sobre la POSICIÓN de la muñeca (para no aplanar
+                   // el momento en que las manos se juntan)
+  wristSmooth: 0.10, // EMA FUERTE sobre la orientación (codo/muñeca): es info de
+                     // cambio lento; con mala detección se torcía/saltaba
+  handAttract: 0.7,  // cuando las dos manos están cerca, se juntan un poco más
+                     // (0 = nada, 1 = se tocan del todo)
 
   // ── Dedos (Fase 2) ──
   fingerGain: 1.0,   // escala del doblez de dedos (1 = ángulo real)
@@ -28,6 +35,10 @@ export const CONFIG = {
   fingerAxis: 'z',   // eje de curl en ESTE VRM (derecha +, izquierda −)
   thumbGain:  1.0,   // escala del doblez del pulgar
   thumbSign:  -1,    // el pulgar dobla con signo opuesto (según sus poses)
+
+  // ── Muñeca (Fase 2b): giro de la palma desde pose_world 3D real ──
+  palmFlip:   1,     // si la palma queda al revés (mira atrás), poner -1
+  wristRoll:  0.785, // giro extra de la palma (rad) — calibrado a +45°
 };
 
 // ── Vector helpers ───────────────────────────────────────────────────────────
@@ -98,7 +109,7 @@ export function frameToArmDirs(frame, arms = { right: true, left: true }) {
   // Preferir 3D real (pose_world) si está; si no, caer a imagen 2D (legacy).
   const useWorld = hasWorld(frame);
   const pose = useWorld ? unmirrorWorld(frame.pose_world) : unmirrorPose(frame.pose || []);
-  const gain = useWorld ? 1.0 : CONFIG.fwdGain;   // con 3D real no hace falta amplificar
+  const gain = CONFIG.fwdGain;   // inclina hacia adelante (calibrable), también en 3D
   const g = (i) => (present(pose[i]) ? worldize(pose[i]) : null);
 
   const Rsh = g(12), Lsh = g(11);
@@ -114,19 +125,25 @@ export function frameToArmDirs(frame, arms = { right: true, left: true }) {
   const fwd = norm(cross(up, right));
   const axes = { right, up, fwd };
 
+  // Para IK: dirección a la muñeca + alcance (fracción del largo del brazo) +
+  // dirección del codo (pole). El baker convierte esto en posición objetivo y
+  // resuelve los ángulos para que la muñeca LLEGUE ahí (así las manos se juntan).
+  // IK con referencia COMÚN: la posición de la muñeca se mide respecto al CENTRO
+  // de los hombros (shC), no a cada hombro por separado. Así, al reproducirla en
+  // el avatar (escalada por el largo del brazo), las dos manos se juntan donde de
+  // verdad se juntaron. `wristOffset` va en metros (marco del avatar); el baker
+  // lo escala por (largo brazo avatar / recArmLen).
+  const armData = (Sh, El, Wr) => {
+    const vU = sub(El, Sh), vL = sub(Wr, El);
+    return {
+      pole:        toAvatar(norm(vU), axes, 1),      // dir del codo (desambigua IK)
+      wristOffset: toAvatar(sub(Wr, shC), axes, 1),  // muñeca respecto al centro de hombros
+      recArmLen:   (len(vU) + len(vL)) || 1e-6,
+    };
+  };
   const out = { _world: useWorld };
-  if (arms.right && Rsh && Rel && Rwr) {
-    out.right = {
-      upper: toAvatar(norm(sub(Rel, Rsh)), axes, gain),
-      lower: toAvatar(norm(sub(Rwr, Rel)), axes, gain),
-    };
-  }
-  if (arms.left && Lsh && Lel && Lwr) {
-    out.left = {
-      upper: toAvatar(norm(sub(Lel, Lsh)), axes, gain),
-      lower: toAvatar(norm(sub(Lwr, Lel)), axes, gain),
-    };
-  }
+  if (arms.right && Rsh && Rel && Rwr) out.right = armData(Rsh, Rel, Rwr);
+  if (arms.left && Lsh && Lel && Lwr) out.left = armData(Lsh, Lel, Lwr);
   return out;
 }
 
@@ -245,12 +262,135 @@ export function frameHandFwd(frame, arms = { right: true, left: true }) {
   return out;
 }
 
+// Muñeca (Fase 2b): plano de la palma desde pose_world 3D real.
+// pose_world trae muñeca + nudillos de índice/meñique con profundidad de verdad
+// (índices tras unmirror: der 16/20/18, izq 15/19/17). Con ellos se arma la
+// orientación completa de la mano: `fwd` = hacia los nudillos, `normal` =
+// perpendicular a la palma. Devuelve direcciones en marco del avatar.
+export function frameWristBasis(frame, arms = { right: true, left: true }) {
+  if (!hasWorld(frame)) return {};   // sin 3D real no hay giro fiable
+  const pose = unmirrorWorld(frame.pose_world);
+  const axes = bodyAxesFromPose(pose);
+  if (!axes) return {};
+  const g = (i) => (present(pose[i]) ? worldize(pose[i]) : null);
+  const basisFor = (wi, ii, pi) => {
+    const w = g(wi), ix = g(ii), pk = g(pi);
+    if (!w || !ix || !pk) return null;
+    // Si la mano está cerca del cuerpo/cara, estos 3 puntos de POSE (baja
+    // resolución, pensados para el esqueleto, no para la mano) quedan casi
+    // superpuestos — dan una dirección basura. Descartamos el frame en vez
+    // de devolver ruido; frameHandBasis (más preciso) cubre ese caso.
+    const span = Math.max(len(sub(ix, w)), len(sub(pk, w)));
+    if (span < 0.04) return null;
+    const fwd = norm(sub(mid(ix, pk), w));
+    let nrm = norm(cross(sub(ix, w), sub(pk, w)));
+    nrm = { x: nrm.x * CONFIG.palmFlip, y: nrm.y * CONFIG.palmFlip, z: nrm.z * CONFIG.palmFlip };
+    return { fwd: toAvatar(fwd, axes, 1.0), normal: toAvatar(nrm, axes, 1.0) };
+  };
+  const out = {};
+  if (arms.right) { const b = basisFor(16, 20, 18); if (b) out.right = b; }
+  if (arms.left)  { const b = basisFor(15, 19, 17); if (b) out.left = b; }
+  return out;
+}
+
+// Igual que frameWristBasis, pero usando los landmarks PROPIOS de la mano
+// (lh/rh, 21 puntos — el mismo set de alta resolución que ya usamos para los
+// dedos en frameFingers) en vez de los puntos aproximados de pose_world. Es
+// más preciso SIEMPRE, y crítico cuando la mano está cerca de la cara/cuerpo
+// (señas como HOLA): ahí pose_world casi no distingue muñeca/índice/meñique
+// (oclusión), pero el modelo de mano dedicado sigue viéndola bien porque
+// trabaja en un recorte de alta resolución centrado en la mano.
+// Usa el marco del cuerpo en 2D (imagen) — igual que frameHandFwd — porque
+// lh/rh vienen en coordenadas de imagen normalizada, no métricas 3D.
+export function frameHandBasis(frame, arms = { right: true, left: true }) {
+  const pose = unmirrorPose(frame.pose || []);
+  const axes = bodyAxesFromPose(pose);
+  if (!axes) return {};
+  const unmir = (p) => worldize([1 - (p[0] ?? 0), p[1] ?? 0, p[2] ?? 0]);
+  const basisFor = (h) => {
+    if (!handPresent(h)) return null;
+    const w = unmir(h[0]), ix = unmir(h[5]), pk = unmir(h[17]);   // muñeca, MCP índice, MCP meñique
+    const fwd = norm(sub(mid(ix, pk), w));
+    let nrm = norm(cross(sub(ix, w), sub(pk, w)));
+    nrm = { x: nrm.x * CONFIG.palmFlip, y: nrm.y * CONFIG.palmFlip, z: nrm.z * CONFIG.palmFlip };
+    return { fwd: toAvatar(fwd, axes, 1.0), normal: toAvatar(nrm, axes, 1.0) };
+  };
+  const out = {};
+  if (arms.right) { const b = basisFor(frame.lh); if (b) out.right = b; }   // espejo: lh = mano anatómica derecha
+  if (arms.left)  { const b = basisFor(frame.rh); if (b) out.left = b; }
+  return out;
+}
+
 // API: huesos de dedos de la seña, según brazos activos.
 export function frameFingers(frame, arms = { right: true, left: true }) {
   let out = {};
   if (arms.right && handPresent(frame.lh)) out = { ...out, ...handToFingerBones(frame.lh, 'right') };
   if (arms.left && handPresent(frame.rh)) out = { ...out, ...handToFingerBones(frame.rh, 'left') };
   return out;
+}
+
+// Recorta los frames de PREPARACIÓN al inicio: donde la mano todavía va
+// subiendo desde el reposo hacia la zona de la seña. Evita el "movimiento raro"
+// de entrada. Si la seña ya arranca con la mano arriba, no recorta nada.
+export function trimLeadIn(dataset) {
+  const F = dataset.frames || [];
+  if (F.length < 8) return dataset;
+  const useW = hasWorld(F[Math.floor(F.length / 2)]);
+  const P = (f) => (useW ? f.pose_world : f.pose);
+  const yy = (f, i) => { const p = P(f); return (p && p[i]) ? p[i][1] : null; };  // y hacia abajo
+  let start = 0;
+  for (let i = 0; i < F.length; i++) {
+    const f = F[i];
+    const w = Math.min(yy(f, 15) ?? 1e9, yy(f, 16) ?? 1e9);   // muñeca más alta (menor y)
+    const hip = ((yy(f, 23) ?? 0) + (yy(f, 24) ?? 0)) / 2;
+    const sh = ((yy(f, 11) ?? 0) + (yy(f, 12) ?? 0)) / 2;
+    if (w <= (hip + sh) / 2) { start = i; break; }   // muñeca ya en la zona alta
+  }
+  start = Math.min(Math.max(0, start - 2), Math.floor(F.length * 0.5));
+  return start > 0 ? { ...dataset, frames: F.slice(start) } : dataset;
+}
+
+// Simétrico a trimLeadIn pero al FINAL: recorta la bajada de los brazos de
+// vuelta al reposo si quedó grabada por error (ideal es soltar "S" justo
+// cuando termina el gesto, sin grabar la bajada — la transición de salida ya
+// la sintetiza sola, ver bakeSolver en index.html). Si la seña ya termina con
+// la mano arriba (nunca "baja" dentro de los frames grabados), no recorta nada.
+export function trimTrailOut(dataset) {
+  const F = dataset.frames || [];
+  if (F.length < 8) return dataset;
+  const useW = hasWorld(F[Math.floor(F.length / 2)]);
+  const P = (f) => (useW ? f.pose_world : f.pose);
+  const yy = (f, i) => { const p = P(f); return (p && p[i]) ? p[i][1] : null; };
+  let end = F.length;
+  for (let i = F.length - 1; i >= 0; i--) {
+    const f = F[i];
+    const w = Math.min(yy(f, 15) ?? 1e9, yy(f, 16) ?? 1e9);
+    const hip = ((yy(f, 23) ?? 0) + (yy(f, 24) ?? 0)) / 2;
+    const sh = ((yy(f, 11) ?? 0) + (yy(f, 12) ?? 0)) / 2;
+    if (w <= (hip + sh) / 2) { end = i + 1; break; }   // último frame con la muñeca aún arriba
+  }
+  end = Math.min(F.length, end + 2);                    // margen: no cortar justo en el borde
+  end = Math.max(end, Math.ceil(F.length * 0.5));       // nunca recorta más de la mitad
+  return end < F.length ? { ...dataset, frames: F.slice(0, end) } : dataset;
+}
+
+// Suaviza una secuencia de vectores [x,y,z] con EMA y los renormaliza. Se usa
+// sobre las DIRECCIONES (brazo, antebrazo, muñeca) antes de orientar los huesos:
+// suavizar la dirección evita los saltos/volteos de la muñeca (que suavizar el
+// ángulo después no puede arreglar). Los huecos (null) reinician el filtro.
+export function smoothVecSeq(vecs, alpha = CONFIG.dirSmooth) {
+  let acc = null;
+  return vecs.map((v) => {
+    if (!v) { acc = null; return null; }
+    if (!acc) acc = [v[0], v[1], v[2]];
+    else acc = [
+      acc[0] + alpha * (v[0] - acc[0]),
+      acc[1] + alpha * (v[1] - acc[1]),
+      acc[2] + alpha * (v[2] - acc[2]),
+    ];
+    const L = Math.hypot(acc[0], acc[1], acc[2]) || 1e-6;
+    return [acc[0] / L, acc[1] / L, acc[2] / L];
+  });
 }
 
 // ── Suavizado temporal (EMA) de los ángulos horneados ────────────────────────

@@ -174,6 +174,7 @@ async def predict(req: PredictRequest):
         _labels,
         probs,
         min_conf=UMBRAL_CONFIANZA,
+        min_margin=MARGEN_TOP2,
     )
 
     # "IDLE" es una clase real de entrenamiento (mano en reposo), no lo mismo

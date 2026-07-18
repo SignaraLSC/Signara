@@ -34,7 +34,18 @@ const SEQ_LEN        = 24
 const HAND_COUNT     = 21
 const UMBRAL         = 0.75
 const STABILITY_NEED = 3
+// Atajo de confirmación rápida (solo camino "live", no en el fin-de-seña que
+// ya confirma con 1 sola predicción): si la confianza es muy alta, no hace
+// falta esperar 3 predicciones idénticas en serie (3 RTTs al servidor) — con
+// una sola predicción muy segura alcanza, y se recorta la latencia percibida
+// en señas de movimiento continuo (sin pausa clara) a un tercio.
+const HIGH_CONF_INSTANT = 0.92
 const NO_HAND_RESET  = 12
+// Tiempo máximo de espera de /predict antes de abortar. Sin esto, si el
+// servidor ML está frío (Render) o la red falla a medias, el fetch podía
+// quedar colgado indefinidamente con apiInFlightRef en true, bloqueando
+// cualquier predicción nueva sin que el usuario supiera por qué "no responde".
+const PREDICT_TIMEOUT_MS = 12000
 // Tolerancia a pérdida MOMENTÁNEA de tracking (parpadeo típico de MediaPipe
 // en medio de un gesto rápido). Sin esto, un solo frame sin manos detectadas
 // vaciaba el buffer entero y obligaba a reiniciar la seña desde cero — por
@@ -502,12 +513,16 @@ export default function InterpretScreen({ onBack, onHome }) {
     const bufferCopy = padBuffer([...frames])
     apiInFlightRef.current = true
 
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), PREDICT_TIMEOUT_MS)
+
     ;(async () => {
       try {
         const resp = await fetch(`${ML_API_URL}/predict`, {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
           body:    JSON.stringify({ frames: bufferCopy }),
+          signal:  controller.signal,
         })
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
 
@@ -519,6 +534,18 @@ export default function InterpretScreen({ onBack, onHome }) {
         if (
           finalize &&
           confidence >= UMBRAL &&
+          prediction !== lastSignRef.current
+        ) {
+          confirmSign(prediction, confidence)
+          return
+        }
+
+        // Respaldo "live" (gesto continuo, sin pausa clara): con confianza
+        // muy alta no hace falta esperar STABILITY_NEED predicciones en serie
+        // (ver HIGH_CONF_INSTANT) — evita 2 RTTs extra en el caso ya claro.
+        if (
+          !finalize &&
+          confidence >= HIGH_CONF_INSTANT &&
           prediction !== lastSignRef.current
         ) {
           confirmSign(prediction, confidence)
@@ -539,9 +566,14 @@ export default function InterpretScreen({ onBack, onHome }) {
           confirmSign(prediction, confidence)
         }
       } catch {
+        // Incluye abort por timeout: se trata igual que cualquier otra falla
+        // de red. Marca el servidor como no disponible (igual que antes) y
+        // muestra el botón de "Reintentar conexión" — evita quedar con el
+        // HUD colgado en "Detectando…" sin ninguna explicación ni salida.
         mlAvailableRef.current = false
         setMlMode(false)
       } finally {
+        clearTimeout(timer)
         apiInFlightRef.current = false
       }
     })()

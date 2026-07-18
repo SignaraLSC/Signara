@@ -47,8 +47,18 @@
     <h1>Prueba avatar VRM</h1>
     <p><b>A) Hechas a mano</b> (su diccionario de poses VRM). Así se ve la calidad máxima:</p>
     <div class="row" id="signsHand"></div>
-    <p style="margin-top:14px"><b>C) Nuestro conversor</b> (grabaciones reales → huesos, geometría propia):</p>
+    <p style="margin-top:14px">
+      <b>C) Nuestro conversor</b> (grabaciones reales → huesos, geometría propia)
+      <button id="refreshAutoBtn" style="padding:3px 8px; font-size:11px; margin-left:4px;">🔄 recargar</button>
+      — lista en vivo desde <code>sign_ai/animations</code> (requiere <code>uvicorn api:app --port 8000</code> corriendo):
+    </p>
     <div class="row" id="signsAuto"></div>
+
+    <p style="margin-top:14px; color:#34d399"><b>✋ Giro de muñeca (BIEN)</b> — prueba hasta que los nudillos queden al frente:</p>
+    <div class="row" id="rollRow"></div>
+
+    <p style="margin-top:12px; color:#38bdf8"><b>➡️ Inclinar al frente (BIEN)</b> — más alto = más de frente (menos hacia arriba):</p>
+    <div class="row" id="fwdRow"></div>
 
     <p style="margin-top:14px; color:#fbbf24"><b>🔧 Calibrar ejes</b> — dime cuál DOBLA EL CODO (antebrazo se pliega) y cuál sube el brazo AL FRENTE:</p>
     <div class="row" id="probeRow"></div>
@@ -61,10 +71,11 @@
     import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
     import { VRMLoaderPlugin } from '@pixiv/three-vrm';
     import { setIdlePose, translateToLSC, playKeyframes } from './animations.js?v=lab3';
-    import { frameToArmDirs, frameFingers, frameHandFwd, activeArms, smoothPoseSeq } from './solver.js?v=lab11';
+    import { frameToArmDirs, frameFingers, frameWristBasis, frameHandBasis, activeArms, smoothPoseSeq, smoothVecSeq, trimLeadIn, trimTrailOut, CONFIG } from './solver.js?v=lab23';
 
     const statusEl = document.getElementById('status');
     const setStatus = (msg, kind = '') => { statusEl.textContent = msg; statusEl.className = kind; };
+    document.getElementById('refreshAutoBtn').addEventListener('click', () => loadAutoSigns());
 
     // ── Escena ────────────────────────────────────────────────────────────────
     const scene = new THREE.Scene();
@@ -118,8 +129,21 @@
             if (!b) return null;
             return { x: +b.rotation.x.toFixed(2), y: +b.rotation.y.toFixed(2), z: +b.rotation.z.toFixed(2) };
           },
+          // Normal de la palma y dirección de nudillos en MUNDO, tras posar.
+          // Avatar: +Z = hacia cámara/adelante. "Nudillos al frente" ⇒ el dorso
+          // mira +Z (normal de palma ≈ -Z) y los dedos apuntan según fwd.
+          palm(side = 'right') {
+            const gb = (n) => vrm.humanoid.getNormalizedBoneNode(side + n);
+            const wp = (b) => b.getWorldPosition(new THREE.Vector3());
+            const h = wp(gb('Hand')), mid = wp(gb('MiddleProximal'));
+            const ix = wp(gb('IndexProximal')), li = wp(gb('LittleProximal'));
+            const fwd = mid.clone().sub(h).normalize();
+            const nrm = new THREE.Vector3().crossVectors(ix.clone().sub(h), li.clone().sub(h)).normalize();
+            const r = (v) => ({ x: +v.x.toFixed(2), y: +v.y.toFixed(2), z: +v.z.toFixed(2) });
+            return { fwd: r(fwd), palmNormal: r(nrm) };
+          },
           async pose(sign, frac = 0.5) {
-            const res = await fetch(`anim/${sign}.json`);
+            const res = await fetch(`${API_URL}/sign/${sign}`);
             const kf = bakeSolver(await res.json());
             const i = Math.max(0, Math.min(kf.length - 1, Math.round(frac * (kf.length - 1))));
             setIdlePose(vrm);
@@ -146,6 +170,37 @@
               head: wp('head'), chest: wp('chest'), hips: wp('hips'),
             };
           },
+          // Diagnóstico cuantitativo: velocidad angular (grados/ms) de codo y
+          // brazo por keyframe horneado. Sirve para VER, no adivinar, si hay
+          // corte de velocidad (pausa) en el empalme entrada→seña, o un salto
+          // (pop) en el codo durante la salida.
+          // Hornea directo un dataset dado (para probar con datos sintéticos,
+          // ej. una seña de 1 mano armada a partir de otra grabación).
+          bake(dataset) { return bakeSolver(dataset); },
+          velocityProfile(sign) {
+            return fetch(`${API_URL}/sign/${sign}`).then((r) => r.json()).then((dataset) => {
+              const kfs = bakeSolver(dataset);
+              const bones = ['rightUpperArm', 'rightLowerArm', 'leftUpperArm', 'leftLowerArm'];
+              const carry = {};
+              bones.forEach((n) => { carry[n] = new THREE.Quaternion(); });
+              let t = 0;
+              const rows = [];
+              for (let i = 0; i < kfs.length; i++) {
+                const k = kfs[i];
+                const row = { i, t, dur: k.duration };
+                for (const n of bones) {
+                  const prev = carry[n].clone();
+                  if (k.pose[n]) carry[n] = eulerToQuat(k.pose[n]);
+                  const dAngDeg = prev.angleTo(carry[n]) * 180 / Math.PI;
+                  row[n + 'DegPerMs'] = +((dAngDeg / Math.max(1, k.duration)).toFixed(4));
+                  row[n + 'Deg'] = +dAngDeg.toFixed(2);
+                }
+                rows.push(row);
+                t += k.duration;
+              }
+              return rows;
+            });
+          },
         };
       } catch (e) {
         console.error(e);
@@ -153,10 +208,16 @@
       }
     }
 
-    // A) Señas hechas a mano (diccionario VRM). B) Nuestras grabaciones (Kalidokit).
+    // A) Señas hechas a mano (diccionario VRM). C) Nuestras grabaciones reales.
     const SIGNS_HAND = ['hola', 'hola2', 'gracias', 'bien', 'sí', 'no', 'por favor', 'amor', 'ayuda', 'nombre'];
     const HAND_LABELS = { hola: 'HOLA (orig)', hola2: 'HOLA ✨ mejorada' };
-    const SIGNS_AUTO = ['HOLA', 'GRACIAS', 'BIEN', 'MAL', 'NO', 'SI', 'POR_FAVOR'];
+    // Dónde vive sign_ai en local (cd sign_ai && uvicorn api:app --port 8000).
+    // Antes C) leía de una copia estática en anim/*.json que había que ir
+    // copiando a mano cada vez que grababas una seña nueva. Ahora lee la lista
+    // y cada animación EN VIVO desde la API — grabas con 00_capture.py,
+    // promueves con "A", pulsas 🔄 aquí, y ya aparece. Cero copiado manual.
+    const API_URL = 'http://localhost:8000';
+    let SIGNS_AUTO = [];   // se llena en loadAutoSigns()
 
     function buildButtons() {
       const hand = document.getElementById('signsHand');
@@ -168,6 +229,14 @@
         b.onclick = () => playHand(w);
         hand.appendChild(b);
       }
+      renderAutoButtons();
+      loadAutoSigns();
+      buildProbes();
+      buildRolls();
+      buildFwds();
+    }
+
+    function renderAutoButtons() {
       const auto = document.getElementById('signsAuto');
       auto.innerHTML = '';
       for (const s of SIGNS_AUTO) {
@@ -177,7 +246,53 @@
         b.onclick = () => playAuto(s);
         auto.appendChild(b);
       }
-      buildProbes();
+      if (!SIGNS_AUTO.length) {
+        auto.innerHTML = '<span style="font-size:12px;color:#93a2c6">(ninguna todavía)</span>';
+      }
+    }
+
+    // Trae la lista de tokens grabados desde la API (misma fuente que usa
+    // TranslationScreen en producción vía /animations). Si la API no está
+    // corriendo, no rompe nada — solo avisa y deja los botones que ya había.
+    async function loadAutoSigns() {
+      try {
+        const res = await fetch(`${API_URL}/animations`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        SIGNS_AUTO = (data.tokens || []).filter((t) => t !== 'IDLE').sort();
+        renderAutoButtons();
+      } catch (e) {
+        console.warn('No se pudo cargar /animations:', e);
+        setStatus('C) sin conexión con la API — corre: cd sign_ai && uvicorn api:app --port 8000', 'err');
+      }
+    }
+
+    // Botones de inclinación al frente: fijan CONFIG.fwdGain y reproducen BIEN.
+    function buildFwds() {
+      const row = document.getElementById('fwdRow');
+      row.innerHTML = '';
+      for (const g of [1.0, 1.5, 1.8, 2.2, 2.6, 3.0]) {
+        const b = document.createElement('button');
+        b.style.background = g === 1.8 ? '#0284c7' : '#0369a1';
+        b.style.fontSize = '12px';
+        b.textContent = `×${g}`;
+        b.onclick = () => { CONFIG.fwdGain = g; setStatus(`inclinar al frente ×${g}`); playAuto('BIEN'); };
+        row.appendChild(b);
+      }
+    }
+
+    // Botones de giro de muñeca: fijan CONFIG.wristRoll y reproducen BIEN.
+    function buildRolls() {
+      const row = document.getElementById('rollRow');
+      row.innerHTML = '';
+      for (const deg of [-90, -45, -20, 0, 20, 45, 90]) {
+        const b = document.createElement('button');
+        b.style.background = deg === 0 ? '#475569' : '#059669';
+        b.style.fontSize = '12px';
+        b.textContent = deg > 0 ? `+${deg}°` : `${deg}°`;
+        b.onclick = () => { CONFIG.wristRoll = deg * Math.PI / 180; setStatus(`giro muñeca ${deg}°`); playAuto('BIEN'); };
+        row.appendChild(b);
+      }
     }
 
     // ── Calibración de ejes ────────────────────────────────────────────────
@@ -233,6 +348,8 @@
     }
 
     // ── Baker: direcciones del solver → huesos (aiming con cuaterniones) ─────
+    const LEAD_IN_MS = 400;   // duración de la entrada suave reposo → seña
+    const SIGN_SLOWDOWN = 1.5; // el cuerpo de la seña se reproduce más lento (natural)
     const getBone = (n) => vrm.humanoid.getNormalizedBoneNode(n);
 
     // Apunta `bone` para que su "hacia el hijo" mire a targetWorld (Vector3).
@@ -246,43 +363,447 @@
     }
 
     function eulerOf(b) { return { x: b.rotation.x, y: b.rotation.y, z: b.rotation.z }; }
+    function eulerToQuat(e) {
+      e = e || { x: 0, y: 0, z: 0 };
+      return new THREE.Quaternion().setFromEuler(new THREE.Euler(e.x, e.y, e.z, 'XYZ'));
+    }
+    // Giro real (slerp de cuaterniones), no ángulos sueltos: interpolar Euler
+    // componente a componente puede tomar "el camino largo" cuando las dos
+    // orientaciones son muy distintas — la muñeca daba un giro brusco de golpe
+    // en la entrada/salida. Slerp siempre toma el camino corto y suave.
+    function slerpEuler(a, b, t) {
+      const q = new THREE.Quaternion().slerpQuaternions(eulerToQuat(a), eulerToQuat(b), t);
+      const e = new THREE.Euler().setFromQuaternion(q, 'XYZ');
+      return { x: e.x, y: e.y, z: e.z };
+    }
+    function lerpEuler(a, b, t) {   // para dedos: ángulos pequeños, lerp simple está bien
+      a = a || { x: 0, y: 0, z: 0 }; b = b || { x: 0, y: 0, z: 0 };
+      return { x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t, z: a.z + (b.z - a.z) * t };
+    }
 
-    function bakeSolver(dataset) {
+    // Orienta la mano con giro completo (dirección + normal de palma). Toma el
+    // "reposo" del rig (hacia el dedo medio, y palma vía índice×meñique) y lo
+    // rota para que calce con fwd/normal objetivo del 3D real.
+    function basisMat(fwd, nrm) {
+      const f = fwd.clone().normalize();
+      const n = nrm.clone().sub(f.clone().multiplyScalar(nrm.dot(f))).normalize();
+      const t = new THREE.Vector3().crossVectors(f, n);
+      return new THREE.Matrix4().makeBasis(f, n, t);
+    }
+    function aimHandFull(B, targetFwd, targetNormal, sideSign) {
+      if (!B.hd || !B.mid || !B.idx || !B.lit) return;
+      B.hd.quaternion.identity();
+      vrm.scene.updateMatrixWorld(true);
+      const hp = B.hd.getWorldPosition(new THREE.Vector3());
+      const restFwd = B.mid.getWorldPosition(new THREE.Vector3()).sub(hp);
+      const iP = B.idx.getWorldPosition(new THREE.Vector3()).sub(hp);
+      const lP = B.lit.getWorldPosition(new THREE.Vector3()).sub(hp);
+      const restNrm = new THREE.Vector3().crossVectors(iP, lP);
+      const Rrest = basisMat(restFwd, restNrm);
+      const Rtgt = basisMat(new THREE.Vector3(...targetFwd), new THREE.Vector3(...targetNormal));
+      const qDelta = new THREE.Quaternion().setFromRotationMatrix(
+        new THREE.Matrix4().multiplyMatrices(Rtgt, Rrest.clone().invert()));
+      const pq = new THREE.Quaternion();
+      B.hd.parent.getWorldQuaternion(pq);
+      B.hd.quaternion.copy(pq.clone().invert().multiply(qDelta).multiply(pq));
+      // Ajuste de giro de palma calibrable, alrededor del eje del antebrazo
+      // (hacia el nudillo medio). Signo espejado por lado.
+      if (CONFIG.wristRoll) {
+        const rollAxis = B.mid.position.clone().normalize();
+        B.hd.quaternion.multiply(new THREE.Quaternion().setFromAxisAngle(rollAxis, CONFIG.wristRoll * sideSign));
+      }
+    }
+
+    // EMA sobre una secuencia de escalares (p.ej. fracción de extensión del
+    // brazo). Null reinicia el filtro (brazo inactivo en ese frame).
+    function smoothScalarSeqLocal(vals, alpha) {
+      let acc = null;
+      return vals.map((v) => {
+        if (v == null) { acc = null; return null; }
+        acc = acc == null ? v : acc + alpha * (v - acc);
+        return acc;
+      });
+    }
+
+    // EMA sobre vectores SIN renormalizar (conserva la magnitud, p.ej. wristOffset
+    // en metros — a diferencia de smoothVecSeq que los deja unitarios).
+    function smoothVecRaw(vecs, alpha = CONFIG.dirSmooth) {
+      let acc = null;
+      return vecs.map((v) => {
+        if (!v) { acc = null; return null; }
+        acc = acc == null ? [v[0], v[1], v[2]]
+          : [acc[0] + alpha * (v[0] - acc[0]), acc[1] + alpha * (v[1] - acc[1]), acc[2] + alpha * (v[2] - acc[2])];
+        return [acc[0], acc[1], acc[2]];
+      });
+    }
+
+    function smoothstep01(t) { t = Math.max(0, Math.min(1, t)); return t * t * (3 - 2 * t); }
+
+    // Cinemática inversa de 2 huesos: dado el hombro S y el objetivo de muñeca
+    // T (y las longitudes L1=brazo, L2=antebrazo), devuelve la posición del codo
+    // E. `poleDir` desambigua hacia dónde apunta el codo. Así la muñeca LLEGA a T.
+    // hScale amortigua el componente de flexión (h) cerca de la extensión
+    // completa: ahí h ya es pequeño geométricamente, pero su DIRECCIÓN (dada
+    // por poleDir) sigue siendo sensible a errores de tracking — un pequeño
+    // ruido en el pole se traduce en un salto visible del codo aunque el
+    // objetivo T se mueva perfectamente suave. hScale=0 fuerza el codo sobre
+    // la línea recta hombro→muñeca (sin ambigüedad posible).
+    function solveIK(S, T, L1, L2, poleDir, hScale = 1) {
+      const n = T.clone().sub(S);
+      let d = n.length();
+      if (d < 1e-6) { n.set(0, -1, 0); d = 1e-6; }
+      n.normalize();
+      d = Math.max(Math.abs(L1 - L2) + 1e-4, Math.min(L1 + L2 - 1e-4, d));
+      const a = (d * d + L1 * L1 - L2 * L2) / (2 * d);
+      const h = Math.sqrt(Math.max(0, L1 * L1 - a * a)) * hScale;
+      let perp = poleDir.clone().addScaledVector(n, -poleDir.dot(n));
+      if (perp.lengthSq() < 1e-8) {
+        perp = new THREE.Vector3(0, 1, 0).addScaledVector(n, -n.y);
+        if (perp.lengthSq() < 1e-8) perp.set(1, 0, 0);
+      }
+      perp.normalize();
+      return S.clone().addScaledVector(n, a).addScaledVector(perp, h);
+    }
+    function bakeSolver(rawDataset) {
+      // Recorta preparación al inicio Y bajada de vuelta al reposo al final,
+      // si quedaron grabadas por error (ambas se sintetizan solas más abajo).
+      const dataset = trimTrailOut(trimLeadIn(rawDataset));
       const arms = activeArms(dataset);
       const R = { up: getBone('rightUpperArm'), lo: getBone('rightLowerArm'),
-                  hd: getBone('rightHand'), mid: getBone('rightMiddleProximal') };
+                  hd: getBone('rightHand'), mid: getBone('rightMiddleProximal'),
+                  idx: getBone('rightIndexProximal'), lit: getBone('rightLittleProximal') };
       const L = { up: getBone('leftUpperArm'),  lo: getBone('leftLowerArm'),
-                  hd: getBone('leftHand'), mid: getBone('leftMiddleProximal') };
+                  hd: getBone('leftHand'), mid: getBone('leftMiddleProximal'),
+                  idx: getBone('leftIndexProximal'), lit: getBone('leftLittleProximal') };
+      // Longitudes de hueso (brazo/antebrazo) y centro de hombros en reposo —
+      // constantes, para el IK. C_avatar es la referencia común de posición.
+      setIdlePose(vrm);
+      vrm.scene.updateMatrixWorld(true);
+      for (const B of [R, L]) {
+        const up = B.up.getWorldPosition(new THREE.Vector3());
+        const lo = B.lo.getWorldPosition(new THREE.Vector3());
+        const hd = B.hd.getWorldPosition(new THREE.Vector3());
+        B.L1 = lo.distanceTo(up);
+        B.L2 = hd.distanceTo(lo);
+      }
+      const C_avatar = new THREE.Vector3()
+        .addVectors(R.up.getWorldPosition(new THREE.Vector3()), L.up.getWorldPosition(new THREE.Vector3()))
+        .multiplyScalar(0.5);
+      const frames = dataset.frames || [];
+      // 1) Datos crudos por frame: IK (wristDir, reachFrac, pole) + muñeca + dedos.
+      const rawDirs = frames.map((f) => frameToArmDirs(f, arms));
+      // Base de la muñeca: pose_world (frameWristBasis) es la fuente de
+      // SIEMPRE — con ella está calibrado wristRoll y así quedaron bien
+      // señas como BIEN. Sólo usamos los landmarks de la MANO
+      // (frameHandBasis, más precisos pero con otro sesgo de giro — no
+      // recalibrado) para señas puntuales donde la mano queda pegada a la
+      // cara y pose_world da datos basura (oclusión). En vez de decidirlo
+      // cuadro a cuadro (arriesgoso: casi cualquier umbral automático puede
+      // colar frames "normales" y desviar señas que ya funcionan, como pasó
+      // con BIEN), lo decidimos por seña — lista explícita, cero riesgo para
+      // el resto. Agregar aquí cualquier otra seña con la mano junto a la
+      // cara/cabeza (mejilla, oreja, sien...) si se ve el mismo problema.
+      const NEAR_FACE_SIGNS = new Set(['HOLA']);
+      const useHandBasis = NEAR_FACE_SIGNS.has((dataset.token || '').toUpperCase());
+      const rawWri  = frames.map((f) => {
+        const pb = frameWristBasis(f, arms);
+        const hb = frameHandBasis(f, arms);
+        const primary = useHandBasis ? hb : pb;
+        const fallback = useHandBasis ? pb : hb;
+        const out = {};
+        if (primary.right || fallback.right) out.right = primary.right || fallback.right;
+        if (primary.left  || fallback.left)  out.left  = primary.left  || fallback.left;
+        return out;
+      });
+      const rawFing = frames.map((f) => frameFingers(f, arms));
+
+      // 2) Suavizar antes de orientar (mata tembleque/saltos).
+      const pick = (arr, side, key) => arr.map((r) => (r[side] ? r[side][key] : null));
+      const put  = (arr, side, key, seq) => arr.forEach((r, i) => { if (r[side]) r[side][key] = seq[i]; });
+      const median = (nums) => {
+        const s = nums.filter((v) => v != null).slice().sort((a, b) => a - b);
+        if (!s.length) return null;
+        const m = s.length >> 1;
+        return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+      };
+      // recArmLen (brazo+antebrazo medido en el video) es una constante
+      // ANATÓMICA de la persona — no cambia durante la toma. Suavizarlo
+      // cuadro-a-cuadro deja pasar caídas de profundidad (oclusión al cruzar
+      // las manos frente al pecho, típico en señas de 2 manos como GRACIAS):
+      // una caída de ~20% en recArmLen dispara la escala del objetivo de
+      // muñeca y el codo se abre hacia afuera y regresa — el "tirón". Usamos
+      // en cambio la MEDIANA de toda la toma como referencia fija por brazo
+      // (robusta a esos frames sueltos con profundidad mal estimada).
+      const armLenRef = {};
+      for (const side of ['right', 'left']) {
+        armLenRef[side] = median(pick(rawDirs, side, 'recArmLen'));
+        // poleSlow: versión MUY suavizada del pole (codo), usada solo cuando el
+        // brazo está cerca de la extensión completa (ver PASO C) — ahí el pole
+        // "normal" (wristSmooth) es ambiguo/ruidoso porque casi cualquier
+        // dirección de codo satisface la muñeca por igual, y un pequeño error
+        // de tracking se traduce en un salto grande del codo (bug original de
+        // singularidad IK, aquí DENTRO de la seña, no solo en la transición).
+        put(rawDirs, side, 'poleSlow',    smoothVecSeq(pick(rawDirs, side, 'pole'), CONFIG.wristSmooth * 0.35));
+        put(rawDirs, side, 'pole',        smoothVecSeq(pick(rawDirs, side, 'pole'), CONFIG.wristSmooth));
+        put(rawDirs, side, 'wristOffset', smoothVecRaw(pick(rawDirs, side, 'wristOffset'), CONFIG.posSmooth));
+        put(rawWri,  side, 'fwd',    smoothVecSeq(pick(rawWri, side, 'fwd'), CONFIG.wristSmooth));
+        put(rawWri,  side, 'normal', smoothVecSeq(pick(rawWri, side, 'normal'), CONFIG.wristSmooth));
+      }
+      const fingSmooth = smoothPoseSeq(rawFing, CONFIG.dirSmooth);
+
+      // 3a) Pre-pasada: calcular el objetivo de muñeca (con atracción) de TODOS
+      // los frames primero, y con eso la fracción de extensión del brazo. La
+      // extensión puede cambiar rápido de un frame a otro incluso con datos
+      // limpios (movimiento real y rápido); si el amortiguado de h/pole (ver
+      // solveIK) reacciona al valor INSTANTÁNEO, puede pasar de "sin
+      // amortiguar" a "amortiguado del todo" en un solo frame — eso es en sí
+      // mismo un salto. Por eso suavizamos la SECUENCIA de extensión en el
+      // tiempo antes de decidir cuánto amortiguar, y así la transición hacia
+      // el modo "brazo recto" es siempre gradual.
+      const allTg = [];
+      const extRaw = { right: [], left: [] };
+      for (let i = 0; i < frames.length; i++) {
+        const dirs = rawDirs[i];
+        const tg = {};
+        for (const [B, d, name] of [[R, dirs.right, 'right'], [L, dirs.left, 'left']]) {
+          if (!d) continue;
+          const S = B.up.getWorldPosition(new THREE.Vector3());   // hombro (fijo, no depende de la pose)
+          const scale = (B.L1 + B.L2) / (armLenRef[name] || d.recArmLen);
+          const T = C_avatar.clone().addScaledVector(new THREE.Vector3(...d.wristOffset), scale);
+          tg[name] = { B, d, S, T };
+        }
+        if (tg.right && tg.left) {
+          const gap = tg.right.T.distanceTo(tg.left.T);
+          const near = 1.0 * (R.L1 + R.L2);
+          if (gap < near) {
+            const mid = tg.right.T.clone().add(tg.left.T).multiplyScalar(0.5);
+            const pull = CONFIG.handAttract * (1 - gap / near);
+            tg.right.T.lerp(mid, pull);
+            tg.left.T.lerp(mid, pull);
+          }
+        }
+        for (const name of ['right', 'left']) {
+          extRaw[name].push(tg[name] ? tg[name].S.distanceTo(tg[name].T) / (tg[name].B.L1 + tg[name].B.L2) : null);
+        }
+        allTg.push(tg);
+      }
+      const extSmooth = {
+        right: smoothScalarSeqLocal(extRaw.right, 0.25),
+        left:  smoothScalarSeqLocal(extRaw.left, 0.25),
+      };
+
+      // 3b) Hornear con IK: la muñeca llega a su posición real → las manos se juntan.
       const poses = [];
-      for (const f of (dataset.frames || [])) {
-        const dirs = frameToArmDirs(f, arms);
-        const hands = frameHandFwd(f, arms);
+      for (let i = 0; i < frames.length; i++) {
+        const dirs = rawDirs[i], wrists = rawWri[i];
         setIdlePose(vrm);                    // brazos inactivos quedan en reposo
         vrm.scene.updateMatrixWorld(true);
         const pose = {};
-        const doSide = (B, d, handFwd, name) => {
-          if (!d) return;
-          aimBone(B.up, B.lo, new THREE.Vector3(...d.upper));
+        const tg = allTg[i];
+        // PASO C: IK + orientar huesos hacia el objetivo (ya con atracción).
+        for (const name of ['right', 'left']) {
+          const t = tg[name]; if (!t) continue;
+          const { B, d, S, T } = t;
+          // Cerca de la extensión completa (brazo casi recto) el pole normal
+          // es inestable — mezclamos hacia la versión muy suavizada (poleSlow)
+          // Y además amortiguamos h (ver solveIK) para eliminar por completo
+          // la sensibilidad al pole justo donde es más ambigua. Usa la
+          // extensión SUAVIZADA en el tiempo (extSmooth), no la instantánea.
+          const extFrac = extSmooth[name][i];
+          const poleBlend = smoothstep01((extFrac - 0.85) / (0.99 - 0.85));
+          const poleUse = poleBlend > 0
+            ? new THREE.Vector3(...d.pole).normalize().lerp(new THREE.Vector3(...d.poleSlow).normalize(), poleBlend).normalize()
+            : new THREE.Vector3(...d.pole).normalize();
+          const hScale = 1 - smoothstep01((extFrac - 0.92) / (0.985 - 0.92));
+          const E = solveIK(S, T, B.L1, B.L2, poleUse, hScale);
+          aimBone(B.up, B.lo, E.clone().sub(S).normalize());
           vrm.scene.updateMatrixWorld(true);            // el antebrazo usa el brazo ya girado
-          aimBone(B.lo, B.hd, new THREE.Vector3(...d.lower));
+          aimBone(B.lo, B.hd, T.clone().sub(E).normalize());
           pose[name + 'UpperArm'] = eulerOf(B.up);
           pose[name + 'LowerArm'] = eulerOf(B.lo);
-          // Muñeca: orienta la mano hacia donde apuntan los dedos (aprox.).
-          if (handFwd) {
+          const wrist = name === 'right' ? wrists.right : wrists.left;
+          if (wrist) {
             vrm.scene.updateMatrixWorld(true);
-            aimBone(B.hd, B.mid, new THREE.Vector3(...handFwd));
+            aimHandFull(B, wrist.fwd, wrist.normal, name === 'right' ? 1 : -1);
             pose[name + 'Hand'] = eulerOf(B.hd);
           }
-        };
-        doSide(R, dirs.right, hands.right, 'right');
-        doSide(L, dirs.left,  hands.left,  'left');
-        // Dedos (Fase 2): se calculan directo como rotación .z, sin aiming.
-        Object.assign(pose, frameFingers(f, arms));
+        }
+        Object.assign(pose, fingSmooth[i]);   // dedos ya suavizados
         poses.push(pose);
       }
-      const fps = dataset.fps || 30;
-      const dur = Math.round(1000 / fps);
-      return smoothPoseSeq(poses).map((p) => ({ duration: dur, pose: p }));
+      // Blindaje de bordes: si un brazo activo en la seña no se detectó en el
+      // primer o el último frame (oclusión momentánea justo al empezar/acabar
+      // de grabar — típico si la mano entra/sale del encuadre), se sostiene el
+      // valor del frame válido más cercano. Sin esto, poses[0]/poses[N-1] no
+      // tendrían esa clave: la transición de entrada/salida (que lee first/last
+      // más abajo) se saltaría ese brazo entero, o el brazo aparecería de
+      // golpe a mitad de la seña sin transición — el mismo tipo de "pop" que
+      // ya resolvimos para el codo, pero por datos faltantes en el borde en
+      // vez de por singularidad IK. General: protege cualquier grabación
+      // futura, no solo GRACIAS/BIEN.
+      for (const side of ['right', 'left']) {
+        const key = side + 'UpperArm';
+        const firstIdx = poses.findIndex((p) => p[key] !== undefined);
+        if (firstIdx === -1) continue;   // este brazo nunca aparece: nada que rellenar
+        let lastIdx = poses.length - 1;
+        while (lastIdx > firstIdx && poses[lastIdx][key] === undefined) lastIdx--;
+        for (let i = 0; i < firstIdx; i++) {
+          poses[i][key] = poses[firstIdx][key];
+          poses[i][side + 'LowerArm'] = poses[firstIdx][side + 'LowerArm'];
+          poses[i][side + 'Hand'] = poses[firstIdx][side + 'Hand'];
+        }
+        for (let i = lastIdx + 1; i < poses.length; i++) {
+          poses[i][key] = poses[lastIdx][key];
+          poses[i][side + 'LowerArm'] = poses[lastIdx][side + 'LowerArm'];
+          poses[i][side + 'Hand'] = poses[lastIdx][side + 'Hand'];
+        }
+      }
+
+      const fps = (dataset.fps > 0 && dataset.fps < 240) ? dataset.fps : 30;   // valor sano
+      const dur = Math.round(1000 / fps * SIGN_SLOWDOWN);   // más lento = natural
+      const signKfs = poses.map((p) => ({ duration: dur, pose: p }));
+      if (!poses.length) return signKfs;
+
+      // ── Reposo natural: muñeca neutra + dedos ligeramente relajados ──────────
+      const NEUTRAL = { x: 0, y: 0, z: 0 };
+      const fingersOf = (p) => { const o = {}; for (const k in p) if (/(Proximal|Intermediate|Distal|Thumb)/.test(k)) o[k] = p[k]; return o; };
+      // Brazo activo = aparece en la animación horneada (más fiable que solo
+      // activeArms, que puede marcar ruido de la mano opuesta).
+      const signUsesArm = (side) => poses.some((p) => p[side + 'UpperArm'] !== undefined);
+
+      setIdlePose(vrm);
+      vrm.scene.updateMatrixWorld(true);
+      const sideRest = {};
+      for (const side of ['right', 'left']) {
+        const B = side === 'right' ? R : L;
+        sideRest[side] = {
+          upper: eulerOf(B.up),
+          lower: eulerOf(B.lo),
+          hand: NEUTRAL,
+        };
+      }
+      const frozenFingerRest = (side) => {
+        const o = {
+          [side + 'UpperArm']: sideRest[side].upper,
+          [side + 'LowerArm']: sideRest[side].lower,
+          [side + 'Hand']: NEUTRAL,
+        };
+        for (const f of ['Index', 'Middle', 'Ring', 'Little']) {
+          for (const seg of ['Proximal', 'Intermediate', 'Distal']) o[`${side}${f}${seg}`] = NEUTRAL;
+        }
+        o[side + 'ThumbProximal'] = NEUTRAL;
+        o[side + 'ThumbDistal'] = NEUTRAL;
+        return o;
+      };
+
+      const REST_CURL = 0.35;
+      const restFingers = {};
+      for (const side of ['right', 'left']) {
+        if (!signUsesArm(side)) continue;
+        const g = side === 'right' ? 1 : -1;
+        for (const f of ['Index', 'Middle', 'Ring', 'Little']) {
+          restFingers[`${side}${f}Proximal`]     = { x: 0, y: 0, z: g * REST_CURL };
+          restFingers[`${side}${f}Intermediate`] = { x: 0, y: 0, z: g * REST_CURL };
+          restFingers[`${side}${f}Distal`]       = { x: 0, y: 0, z: g * REST_CURL * 0.6 };
+        }
+      }
+
+      // ── Transición SIN IK (entrada y salida) ───────────────────────────────
+      // Por qué NO usar IK aquí: el reposo (brazo colgando) está casi tan
+      // extendido como la seña misma (fracción de extensión ≈0.98, medida con
+      // el IK real — ver diagnóstico). Es decir, la transición completa ocurre
+      // DENTRO de la zona de singularidad del codo, no solo cerca del final ni
+      // solo al bajar — también al SUBIR desde reposo al empezar la seña. Ya
+      // conocemos las dos poses exactas en los extremos (reposo, y el primer/
+      // último frame de la seña, ambos ya resueltos por IK durante el
+      // horneado). No hace falta re-resolver IK para interpolar ENTRE dos
+      // rotaciones de hueso conocidas: un SLERP directo de cuaterniones
+      // (hombro + codo, cada uno por separado) es geométricamente imposible de
+      // "voltear" — no hay solver, no hay singularidad. El único riesgo de
+      // este método (que el camino cartesiano de la muñeca no sea "recto") es
+      // aceptable e imperceptible en una transición de reposo↔seña.
+      //
+      // Los pasos usan t = s/(N+1) (nunca llega a 1); el keyframe final es una
+      // copia EXACTA del empalme (frame 0 de la seña o reposo). Así smoothstep
+      // frena/acelera en reposo sin anular la velocidad justo en el empalme.
+      const TRANS_STEPS = 8;
+      const smoothstep = (t) => t * t * (3 - 2 * t);
+      const transition = (sideData, fingerA, fingerB, steps, stepMs) => {
+        const activeSides = Object.keys(sideData);
+        const out = [];
+        for (let s = 1; s <= steps; s++) {
+          const a = smoothstep(s / (steps + 1));
+          const pose = {};
+          for (const side of ['right', 'left']) {
+            if (activeSides.includes(side)) continue;
+            Object.assign(pose, frozenFingerRest(side));
+          }
+          for (const side of activeSides) {
+            const P = sideData[side];
+            pose[side + 'UpperArm'] = slerpEuler(P.upperA, P.upperB, a);
+            pose[side + 'LowerArm'] = slerpEuler(P.lowerA, P.lowerB, a);
+            pose[side + 'Hand'] = slerpEuler(P.handA, P.handB, a);
+          }
+          const bones = new Set([...Object.keys(fingerA), ...Object.keys(fingerB)]);
+          bones.forEach((k) => { pose[k] = lerpEuler(fingerA[k], fingerB[k], a); });
+          out.push({ duration: stepMs, pose });
+        }
+        return out;
+      };
+
+      const buildExactRestPose = (activeSides) => {
+        const pose = { ...restFingers };
+        for (const side of ['right', 'left']) {
+          if (activeSides.includes(side)) {
+            pose[side + 'UpperArm'] = sideRest[side].upper;
+            pose[side + 'LowerArm'] = sideRest[side].lower;
+            pose[side + 'Hand'] = NEUTRAL;
+          } else {
+            Object.assign(pose, frozenFingerRest(side));
+          }
+        }
+        return pose;
+      };
+
+      const first = poses[0], last = poses[poses.length - 1];
+      const entrySides = {}, exitSides = {};
+      for (const side of ['right', 'left']) {
+        if (!signUsesArm(side) || !first[side + 'UpperArm'] || !last[side + 'UpperArm']) continue;
+        const rest = sideRest[side];
+        entrySides[side] = {
+          upperA: rest.upper, upperB: first[side + 'UpperArm'],
+          lowerA: rest.lower, lowerB: first[side + 'LowerArm'],
+          handA: NEUTRAL, handB: first[side + 'Hand'] || NEUTRAL,
+        };
+        exitSides[side] = {
+          upperA: last[side + 'UpperArm'], upperB: rest.upper,
+          lowerA: last[side + 'LowerArm'], lowerB: rest.lower,
+          handA: last[side + 'Hand'] || NEUTRAL, handB: NEUTRAL,
+        };
+      }
+      const activeSides = Object.keys(entrySides);
+      const transSteps = TRANS_STEPS - 1;
+      const entryStepMs = LEAD_IN_MS / TRANS_STEPS;
+      const exitStepMs = 480 / TRANS_STEPS;
+      const entryKfs = transition(entrySides, restFingers, fingersOf(first), transSteps, entryStepMs);
+      // Empalme exacto con frame 0: mismo pose y duración del primer frame de la
+      // seña, sin duplicar keyframe (evita micro-pausa por tramo de delta cero).
+      entryKfs.push({ duration: dur, pose: { ...first } });
+      const signKfsBody = poses.length > 1
+        ? poses.slice(1).map((p) => ({ duration: dur, pose: p }))
+        : [];
+      const exitKfs = transition(exitSides, fingersOf(last), restFingers, transSteps, exitStepMs);
+      exitKfs.push({ duration: exitStepMs, pose: buildExactRestPose(activeSides) });
+      const all = [...entryKfs, ...signKfsBody, ...exitKfs];
+
+      // Blindaje: brazos que NO participan en la seña quedan congelados en reposo
+      // en todos los keyframes (incluye transiciones).
+      for (const side of ['right', 'left']) {
+        if (signUsesArm(side)) continue;
+        const rest = frozenFingerRest(side);
+        all.forEach((k) => Object.assign(k.pose, rest));
+      }
+      return all;
     }
 
     function playHand(word) {
@@ -295,16 +816,72 @@
       });
     }
 
+    // ── Reproductor propio con cuaterniones (slerp) ─────────────────────────
+    // Interpola con slerp (camino más corto) en vez de ángulos euler por
+    // separado → sin el "camino torcido" que sacaba el brazo al lado. General:
+    // sirve igual para cualquier seña, sin ajustar ninguna.
+    let __animCancel = null;
+    function quatOfEuler(e) {
+      return new THREE.Quaternion().setFromEuler(new THREE.Euler(e.x || 0, e.y || 0, e.z || 0, 'XYZ'));
+    }
+    function playSolverAnim(kfs, onDone) {
+      const names = [...new Set(kfs.flatMap((k) => Object.keys(k.pose)))];
+      const nodes = {}; names.forEach((n) => { nodes[n] = getBone(n); });
+      // Pista de cuaterniones por hueso: frame 0 = pose actual (reposo), luego
+      // cada keyframe (arrastrando el último valor para huesos ausentes).
+      const times = [0];
+      const carry = {}; const tracks = {};
+      names.forEach((n) => {
+        carry[n] = nodes[n] ? nodes[n].quaternion.clone() : new THREE.Quaternion();
+        tracks[n] = [carry[n].clone()];
+      });
+      let acc = 0;
+      for (const k of kfs) {
+        acc += k.duration; times.push(acc);
+        for (const n of names) {
+          if (k.pose[n]) carry[n] = quatOfEuler(k.pose[n]);
+          tracks[n].push(carry[n].clone());
+        }
+      }
+      const total = acc || 1;
+      const start = performance.now();
+      let raf = null, cancelled = false;
+      function step(now) {
+        if (cancelled) return;
+        const el = now - start;
+        if (el >= total) {
+          for (const n of names) if (nodes[n]) nodes[n].quaternion.copy(tracks[n][tracks[n].length - 1]);
+          onDone && onDone();
+          return;
+        }
+        let i = 0; while (i < times.length - 1 && times[i + 1] <= el) i++;
+        const seg = Math.max(1, times[i + 1] - times[i]);
+        // SIEMPRE lineal aquí: la entrada/salida ya traen la aceleración/
+        // desaceleración horneada en cómo se repartieron los pasos del IK
+        // (transition() más abajo). Frenar/acelerar OTRA VEZ aquí (por-tramo)
+        // causaba pausas y saltos de velocidad en cada frontera entre los
+        // varios micro-tramos del IK.
+        const tt = Math.min(1, Math.max(0, (el - times[i]) / seg));
+        for (const n of names) if (nodes[n]) nodes[n].quaternion.slerpQuaternions(tracks[n][i], tracks[n][i + 1], tt);
+        raf = requestAnimationFrame(step);
+      }
+      raf = requestAnimationFrame(step);
+      return () => { cancelled = true; if (raf) cancelAnimationFrame(raf); };
+    }
+
     async function playAuto(sign) {
       if (!vrm || busy) return;
       busy = true;
       setStatus('C) ' + sign.replace(/_/g, ' ') + ' (conversor propio)…');
       try {
-        const res = await fetch(`anim/${sign}.json`);
+        const res = await fetch(`${API_URL}/sign/${sign}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status} — ¿está corriendo la API? (cd sign_ai && uvicorn api:app --port 8000)`);
         const dataset = await res.json();
         const keyframes = bakeSolver(dataset);
         setIdlePose(vrm);
-        playKeyframes(vrm, keyframes, () => {
+        vrm.scene.updateMatrixWorld(true);
+        if (__animCancel) __animCancel();
+        __animCancel = playSolverAnim(keyframes, () => {
           busy = false;
           setStatus('Listo — pulsa una seña', 'ok');
         });

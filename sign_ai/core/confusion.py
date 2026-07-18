@@ -47,10 +47,16 @@ def pair_is_confusable(label_a: str, label_b: str) -> bool:
     return frozenset({label_a.upper(), label_b.upper()}) in CONFUSION_PAIRS
 
 
-def required_margin(top_label: str, second_label: str) -> float:
+def required_margin(
+    top_label: str, second_label: str, base_margin: float = DEFAULT_MIN_MARGIN
+) -> float:
+    """`base_margin` es el margen normal (configurable vía SIGNARA_MARGEN_TOP2
+    en api.py). Para pares confundibles se exige ese mismo margen MÁS el extra
+    fijo que separaba antes a DEFAULT_MIN_MARGIN de STRICT_MIN_MARGIN, así que
+    subir/bajar el margen base también mueve el umbral estricto en proporción."""
     if pair_is_confusable(top_label, second_label):
-        return STRICT_MIN_MARGIN
-    return DEFAULT_MIN_MARGIN
+        return base_margin + (STRICT_MIN_MARGIN - DEFAULT_MIN_MARGIN)
+    return base_margin
 
 
 def evaluate_prediction(
@@ -58,6 +64,7 @@ def evaluate_prediction(
     probs,
     *,
     min_conf: float = DEFAULT_MIN_CONF,
+    min_margin: float = DEFAULT_MIN_MARGIN,
 ) -> tuple[str | None, float, float]:
     """
     Devuelve (predicción aceptada o None, confianza top1, margen top1-top2).
@@ -65,6 +72,11 @@ def evaluate_prediction(
     `labels` puede incluir sub-etiquetas de variante (HOLA_V1, HOLA_V2, ...);
     aquí se fusionan por palabra canónica antes de decidir, así el resultado
     y el margen de confusión operan siempre sobre palabras, no variantes.
+
+    `min_margin` es el margen BASE (no confundible); antes este parámetro no
+    existía y la función siempre usaba el default aunque api.py exponía
+    SIGNARA_MARGEN_TOP2 como si fuera configurable — quedaba muerto. Ahora sí
+    se respeta.
     """
     import numpy as np
 
@@ -90,7 +102,7 @@ def evaluate_prediction(
 
     second = int(order[1])
     margin = float(canon_probs[top] - canon_probs[second])
-    need = required_margin(canon_labels[top], canon_labels[second])
+    need = required_margin(canon_labels[top], canon_labels[second], min_margin)
 
     if margin < need:
         return None, conf, margin

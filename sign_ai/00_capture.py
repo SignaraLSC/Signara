@@ -13,8 +13,12 @@ proyecto necesita:
                                poder re-entrenar con torso/cara SIN re-grabar)
 
 Idea clave (respuesta a "¿un mismo dataset sirve para reconocer y para animar?"):
-  - Reconocer  → necesita MUCHAS muestras variadas  → todas van al *_raw.csv
-  - Animar     → necesita UNA toma limpia y canónica → se "promueve" con la tecla A
+  - Reconocer  → necesita MUCHAS muestras variadas  → todas van al *_raw.csv,
+                 remuestreadas a SEQ_LEN frames (lo que espera el GNN)
+  - Animar     → necesita UNA toma limpia y canónica → se "promueve" con la
+                 tecla A, y se guarda COMPLETA (sin remuestrear) con su fps
+                 real medido, para no perder detalle temporal en señas largas
+                 o de 2 manos (el IK del avatar es más estable con más frames)
 
 Uso:
     cd sign_ai
@@ -37,6 +41,7 @@ import csv
 import json
 import os
 import re
+import time
 import unicodedata
 
 import cv2
@@ -100,6 +105,45 @@ def extract_full(results):
         "pose": lm_to_list(results.pose_landmarks, 33),
         "pose_world": lm_to_list(results.pose_world_landmarks, 33),
     }
+
+
+# ─── Calidad de la toma (avisos, no bloquean el guardado) ─────────────────────
+# Mismos umbrales que solver.js (handActive/hasWorld) del lab del avatar, para
+# que el aviso en captura prediga exactamente lo que le va a pasar al bakeSolver.
+
+def _hand_ok(frame):
+    """¿Al menos una mano tiene landmarks reales en este frame?"""
+    def active(h):
+        return isinstance(h, list) and any(
+            (abs(p[0]) + abs(p[1]) + abs(p[2] if len(p) > 2 else 0.0)) > 1e-3 for p in h
+        )
+    return active(frame.get("lh")) or active(frame.get("rh"))
+
+
+def _world_ok(frame):
+    """¿Trae landmarks 3D métricos (pose_world) usables? Sin esto, el IK del
+    avatar cae a 2D (menos preciso, sobre todo la profundidad al cruzar manos)."""
+    w = frame.get("pose_world")
+    return isinstance(w, list) and any(
+        (abs(p[0]) + abs(p[1]) + abs(p[2] if len(p) > 2 else 0.0)) > 1e-4 for p in w
+    )
+
+
+def report_quality(frames):
+    """Imprime un aviso si la toma tiene demasiados frames con mala detección.
+    No descarta nada — solo avisa para que decidas si conviene regrabar."""
+    n = len(frames)
+    if n == 0:
+        return
+    no_hands = sum(1 for f in frames if not _hand_ok(f))
+    no_world = sum(1 for f in frames if not _world_ok(f))
+    if no_hands / n > 0.3:
+        print(f"   ⚠  {no_hands}/{n} frames sin manos detectadas — revisa luz/encuadre; "
+              f"considera regrabar esta toma.")
+    if no_world / n > 0.3:
+        print(f"   ⚠  {no_world}/{n} frames sin profundidad 3D (pose_world) — acércate "
+              f"a la cámara o gírate un poco (evita quedar de frente puro); afecta "
+              f"sobre todo señas donde las manos se cruzan/juntan.")
 
 
 # ─── Cara recortada (mismos 124 puntos de contorno que dibuja AvatarSigner3D) ──
@@ -215,13 +259,21 @@ def resample_frames(frames, n):
     return out
 
 
-def save_animation(label, full_frames):
+def save_animation(label, full_frames, fps=FPS_TARGET):
     """Animación del avatar. Se guarda SIEMPRE bajo el nombre canónico (sin
     sufijo de variante _V<N>), porque el avatar solo necesita una toma por
     palabra — sin importar cuál variante grabaste, promuévela con 'A' y
     quedará disponible como esa palabra para el frontend.
     Guarda la cara RECORTADA (124 puntos de contorno) que dibuja
-    AvatarSigner3D; la cara completa queda en raw_full."""
+    AvatarSigner3D; la cara completa queda en raw_full.
+
+    IMPORTANTE: `full_frames` debe ser la toma COMPLETA tal cual se grabó (sin
+    remuestrear a SEQ_LEN) — el bakeSolver del avatar (public/vrm-lab) necesita
+    la máxima resolución temporal posible para que el IK no tenga que "saltar"
+    entre poses muy distintas de un frame al siguiente, sobre todo en señas de
+    2 manos donde se cruzan/juntan. `fps` debe ser la tasa REAL medida durante
+    la grabación (no un valor fijo), para que la duración reproducida en el
+    avatar coincida con el ritmo real de la seña."""
     token = canonical_label(label)
     frames = [
         {"lh": f["lh"], "rh": f["rh"], "pose": f["pose"],
@@ -231,9 +283,9 @@ def save_animation(label, full_frames):
     ]
     path = os.path.join(ANIM_DIR, f"{token}.json")
     with open(path, "w", encoding="utf-8") as f:
-        json.dump({"token": token, "fps": FPS_TARGET, "frames": frames},
+        json.dump({"token": token, "fps": round(fps, 2), "frames": frames},
                   f, separators=(",", ":"))
-    print(f"⭐ Animación canónica guardada: {path}  ({len(frames)} frames)")
+    print(f"⭐ Animación canónica guardada: {path}  ({len(frames)} frames @ {fps:.1f} fps)")
 
 
 def draw_overlay(frame, results):
@@ -263,7 +315,8 @@ def main():
     print(f"\n🎥 Captura única — persona: {persona} | seña: {label}")
     print(f"   Muestras se guardan en: {csv_path} (empezando en #{muestra})")
     print("   S   → EMPEZAR a grabar / S otra vez → TERMINAR (duración natural)")
-    print(f"        la seña se remuestrea a {SEQ_LEN} frames (corta o larga, sin quietud ni cortes)")
+    print(f"        para entrenar se remuestrea a {SEQ_LEN} frames; para el avatar se")
+    print("        guarda la toma COMPLETA (más frames = codo/muñeca más estables)")
     print("   A   → marcar la ÚLTIMA muestra como animación del avatar")
     print("   ESC → salir\n")
 
@@ -271,7 +324,9 @@ def main():
 
     grabando = False
     buffer_frames: list[dict] = []   # muestra en curso (cuerpo completo)
-    last_sample: list[dict] | None = None  # última muestra completada (para promover a avatar)
+    rec_start_t = 0.0                # reloj de pared al pulsar S (para fps real)
+    last_sample: list[dict] | None = None    # última muestra COMPLETA (para promover a avatar)
+    last_sample_fps = FPS_TARGET             # fps real medido de esa muestra
     total_guardadas = 0
 
     while cam.isOpened():
@@ -288,6 +343,12 @@ def main():
             buffer_frames.append(extract_full(results))
             cv2.putText(frame, f"GRABANDO {len(buffer_frames)}f  (S=terminar)", (20, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+            # Aviso EN VIVO (no solo al terminar): si en este instante no se
+            # detecta ninguna mano, es la señal más temprana posible de que
+            # conviene repetir la toma (mala luz, mano fuera de encuadre...).
+            if not results.left_hand_landmarks and not results.right_hand_landmarks:
+                cv2.putText(frame, "SIN MANOS DETECTADAS", (20, 85),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 165, 255), 2)
         else:
             msg = (f"LISTO [{total_guardadas} muestra(s)] | S=grabar A=avatar"
                    if total_guardadas else "LISTO | S=grabar")
@@ -306,28 +367,50 @@ def main():
             if not grabando:
                 grabando = True
                 buffer_frames = []
+                rec_start_t = time.time()
                 print("🔴 Grabando… (S de nuevo para terminar)")
             else:
-                # TERMINAR: remuestrea la seña real a SEQ_LEN y guarda.
+                # TERMINAR.
                 grabando = False
                 real = len(buffer_frames)
                 if real < MIN_CAPTURE_FRAMES:
                     print(f"⚠  Muy corta ({real} frames < {MIN_CAPTURE_FRAMES}); descartada.")
                     buffer_frames = []
                     continue
+
+                # fps REAL de esta toma (para reproducir el avatar al ritmo real,
+                # no a un valor fijo). Se acota a un rango sano por si el reloj
+                # o la cámara dan un valor absurdo (frame_rate 0, cuelgue, etc.).
+                elapsed = max(time.time() - rec_start_t, 1e-6)
+                real_fps = real / elapsed
+                if not (8.0 <= real_fps <= 60.0):
+                    real_fps = FPS_TARGET
+
+                report_quality(buffer_frames)
+
+                # El CSV de entrenamiento (y su respaldo raw_full) SIEMPRE va
+                # remuestreado a SEQ_LEN — así lo espera 06_gnn_train.py e
+                # import_raw_samples.py (que rechaza tamaños distintos).
                 sample = resample_frames(buffer_frames, SEQ_LEN)
                 append_raw_csv(csv_path, label, persona, muestra, sample)
                 save_raw_full(persona, label, muestra, sample)
-                last_sample = sample
+
+                # El AVATAR, en cambio, usa la toma COMPLETA sin comprimir a
+                # SEQ_LEN (24 frames aplanaría el detalle temporal de señas
+                # largas/de 2 manos, que es justo donde más ayuda tener más
+                # muestras para que el IK no salte entre poses muy distintas).
+                last_sample = list(buffer_frames)
+                last_sample_fps = real_fps
+
                 total_guardadas += 1
-                print(f"✅ Muestra #{muestra} guardada — {real} frames reales → {SEQ_LEN} "
-                      f"(remuestreada) — total sesión: {total_guardadas}")
+                print(f"✅ Muestra #{muestra} guardada — {real} frames reales (~{real_fps:.1f} fps) "
+                      f"→ {SEQ_LEN} (para entrenar) — total sesión: {total_guardadas}")
                 muestra += 1
                 buffer_frames = []
 
         elif key == ord("a"):
             if last_sample:
-                save_animation(label, last_sample)
+                save_animation(label, last_sample, fps=last_sample_fps)
             else:
                 print("⚠  Aún no hay ninguna muestra grabada para promover a avatar.")
 

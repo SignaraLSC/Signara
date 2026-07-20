@@ -24,26 +24,58 @@ const TextInputPanel = forwardRef(function TextInputPanel(
 
   const liveEmittedRef = useRef([])
 
+  // Reconocimiento de voz: el texto interim/final puede llegar acumulado o como
+  // delta. Solo emitimos palabras NUEVAS respecto a lo ya enviado. Si el
+  // interim se acorta (el motor corrige), NO reiniciamos ni re-emitimos: eso
+  // duplicaba señas. Solo reiniciamos si el prefijo deja de coincidir.
+  function normW(w) {
+    return String(w || '').normalize('NFD').replace(/\p{M}/gu, '').toLowerCase()
+  }
   function emitNewWords(allWords) {
     const prev = liveEmittedRef.current
+    let common = 0
+    while (
+      common < prev.length &&
+      common < allWords.length &&
+      normW(prev[common]) === normW(allWords[common])
+    ) common++
+
+    // TEMPORAL: mismo flag que useVoiceInput.js — window.__SIGNARA_VOICE_DEBUG = true
+    if (typeof window !== 'undefined' && window.__SIGNARA_VOICE_DEBUG) {
+      console.log('[voz][emitNewWords]', { prev: prev.slice(), allWords: allWords.slice(), common })
+    }
+
+    // Prefijo roto (nueva frase / reinicio del reconocedor): empezar de cero.
+    if (common < prev.length && common < allWords.length) {
+      for (let i = 0; i < allWords.length; i++) {
+        const w = allWords[i]
+        if (w && onLiveWordRef.current) onLiveWordRef.current(w)
+      }
+      liveEmittedRef.current = allWords.slice()
+      return
+    }
+
+    // Acortó pero sigue siendo prefijo: no re-emitir.
+    if (allWords.length < prev.length) {
+      liveEmittedRef.current = allWords.slice()
+      return
+    }
+
     for (let i = prev.length; i < allWords.length; i++) {
       const w = allWords[i]
       if (!w) continue
       if (onLiveWordRef.current) onLiveWordRef.current(w)
     }
-    liveEmittedRef.current = allWords
+    liveEmittedRef.current = allWords.slice()
   }
 
   function handleLive(text, isFinal) {
     const cleaned = String(text || '').trim()
     setValue(cleaned)
     const words = cleaned.split(/\s+/).filter(Boolean)
-    if (isFinal) {
-      emitNewWords(words)
-      liveEmittedRef.current = []
-    } else {
-      emitNewWords(words.slice(0, -1))
-    }
+    // Interim: la última palabra puede seguir cambiando, no se emite todavía.
+    // Final: ya está confirmada completa, se emite también la última.
+    emitNewWords(isFinal ? words : words.slice(0, -1))
   }
 
   const { listening, error, supported, start, stop } = useVoiceInput({
@@ -140,10 +172,8 @@ const TextInputPanel = forwardRef(function TextInputPanel(
         className={
           'overflow-hidden rounded-[1.25rem] border-[3px] bg-white shadow-[0_12px_28px_-16px_rgba(45,42,38,0.35)] transition ' +
           (listening
-            ? 'border-pastel-grape ring-4 ring-pastel-purple/30'
-            : inputMode === 'voice'
-              ? 'border-pastel-purple-line'
-              : 'border-pastel-green-line')
+            ? 'border-palette-azure ring-4 ring-pastel-blue/40'
+            : 'border-pastel-blue-line')
         }
       >
         <div className="flex items-center gap-2 px-2.5 py-2 sm:gap-3 sm:px-3 sm:py-2.5">
@@ -153,15 +183,15 @@ const TextInputPanel = forwardRef(function TextInputPanel(
             disabled={!supported}
             title={supported ? (listening ? 'Detener micrófono' : 'Activar micrófono') : 'Voz no disponible'}
             className={
-              'relative inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-xl transition-all duration-300 focus:outline-none focus:ring-4 focus:ring-pastel-purple/30 sm:h-12 sm:w-12 ' +
+              'relative inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-xl transition-all duration-300 focus:outline-none focus:ring-4 focus:ring-pastel-blue/40 sm:h-12 sm:w-12 ' +
               (listening
-                ? 'bg-pastel-grape text-white shadow-[0_8px_24px_-6px_rgba(126,100,201,0.7)]'
-                : 'border-2 border-pastel-ink/15 bg-pastel-purple/40 text-pastel-grape hover:border-pastel-grape hover:bg-pastel-purple') +
+                ? 'bg-palette-azure text-white shadow-[0_8px_24px_-6px_rgba(46,124,248,0.55)]'
+                : 'border-2 border-pastel-ink/15 bg-pastel-blue/60 text-palette-azure hover:border-pastel-blue-line hover:bg-pastel-blue') +
               (!supported ? ' opacity-40 cursor-not-allowed' : '')
             }
             aria-pressed={listening}
           >
-            {listening && <span className="absolute inset-0 rounded-xl bg-pastel-grape/30 animate-pulse-ring" />}
+            {listening && <span className="absolute inset-0 rounded-xl bg-palette-azure/30 animate-pulse-ring" />}
             <MicIcon size={22} />
           </button>
 
@@ -184,7 +214,7 @@ const TextInputPanel = forwardRef(function TextInputPanel(
             <button
               type="submit"
               disabled={busy || !value.trim()}
-              className="inline-flex h-11 shrink-0 items-center justify-center gap-1.5 rounded-xl bg-pastel-grape px-3 text-sm font-bold text-white shadow-[0_6px_16px_-6px_rgba(126,100,201,0.6)] transition hover:brightness-105 focus:outline-none focus:ring-4 focus:ring-pastel-purple disabled:cursor-not-allowed disabled:opacity-50 sm:h-12 sm:gap-2 sm:px-4"
+              className="inline-flex h-11 shrink-0 items-center justify-center gap-1.5 rounded-xl bg-palette-azure px-3 text-sm font-bold text-white shadow-[0_6px_16px_-6px_rgba(46,124,248,0.5)] transition hover:brightness-105 focus:outline-none focus:ring-4 focus:ring-pastel-blue disabled:cursor-not-allowed disabled:opacity-50 sm:h-12 sm:gap-2 sm:px-4"
             >
               {busy ? <Spinner /> : (
                 <>
@@ -196,7 +226,7 @@ const TextInputPanel = forwardRef(function TextInputPanel(
           )}
 
           {listening && (
-            <span className="inline-flex h-11 shrink-0 items-center gap-1.5 rounded-xl bg-pastel-grape px-3 text-xs font-extrabold text-white sm:h-12 sm:px-3.5">
+            <span className="inline-flex h-11 shrink-0 items-center gap-1.5 rounded-xl bg-palette-azure px-3 text-xs font-extrabold text-white sm:h-12 sm:px-3.5">
               <span className="h-1.5 w-1.5 rounded-full bg-white animate-pulse" />
               EN VIVO
             </span>
@@ -207,7 +237,7 @@ const TextInputPanel = forwardRef(function TextInputPanel(
       {/* Ejemplos rápidos */}
       {!listening && (
         <div className="mt-4" data-tutorial="translate-examples">
-          <p className="mb-2 text-xs font-extrabold uppercase tracking-wider text-pastel-grape">
+          <p className="mb-2 text-xs font-extrabold uppercase tracking-wider text-palette-azure">
             Prueba con un clic
           </p>
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
@@ -217,9 +247,9 @@ const TextInputPanel = forwardRef(function TextInputPanel(
                 type="button"
                 disabled={busy}
                 onClick={() => runExample(text)}
-                className="group flex flex-col items-center gap-1 rounded-2xl border-2 border-pastel-ink/10 bg-white px-2 py-3 text-center transition hover:-translate-y-0.5 hover:border-pastel-green-line hover:bg-pastel-green/50 hover:shadow-[0_10px_24px_-14px_rgba(45,42,38,0.35)] disabled:opacity-50"
+                className="group flex flex-col items-center gap-1 rounded-2xl border-2 border-pastel-ink/10 bg-white px-2 py-3 text-center transition hover:-translate-y-0.5 hover:border-pastel-blue-line hover:bg-pastel-blue/50 hover:shadow-[0_10px_24px_-14px_rgba(45,42,38,0.35)] disabled:opacity-50"
               >
-                <Icon name={icon} className="h-6 w-6 text-pastel-grape transition group-hover:scale-110" strokeWidth={1.75} />
+                <Icon name={icon} className="h-6 w-6 text-palette-azure transition group-hover:scale-110" strokeWidth={1.75} />
                 <span className="text-[11px] font-bold leading-tight text-pastel-ink sm:text-xs">{text}</span>
               </button>
             ))}
@@ -229,12 +259,12 @@ const TextInputPanel = forwardRef(function TextInputPanel(
 
       {listening && (
         <div className="mt-3 flex flex-wrap items-center gap-2 text-xs font-semibold text-pastel-sub">
-          <span className="inline-flex items-center gap-1.5 rounded-full border-2 border-pastel-grape/30 bg-pastel-purple/40 px-3 py-1 text-pastel-grape">
-            <span className="h-1.5 w-1.5 rounded-full bg-pastel-grape animate-pulse" />
+          <span className="inline-flex items-center gap-1.5 rounded-full border-2 border-pastel-blue-line/60 bg-pastel-blue/60 px-3 py-1 text-palette-azure">
+            <span className="h-1.5 w-1.5 rounded-full bg-palette-azure animate-pulse" />
             Escuchando… cada palabra se convierte en seña
           </span>
           {pendingWord && (
-            <span className="inline-flex items-center gap-1 rounded-full border-2 border-pastel-purple-line bg-pastel-purple px-2.5 py-1 text-pastel-grape animate-pulse">
+            <span className="inline-flex items-center gap-1 rounded-full border-2 border-pastel-blue-line bg-pastel-blue px-2.5 py-1 text-palette-azure animate-pulse">
               &quot;{pendingWord}&quot;…
             </span>
           )}
@@ -267,12 +297,12 @@ function ModeTab({ active, icon, label, hint, onClick, disabled }) {
       className={
         'flex items-center gap-2.5 rounded-2xl border-[3px] px-3 py-3 text-left transition sm:px-4 ' +
         (active
-          ? 'border-pastel-grape bg-pastel-purple shadow-[0_10px_24px_-12px_rgba(126,100,201,0.5)] scale-[1.02]'
-          : 'border-pastel-ink/10 bg-white hover:border-pastel-green-line hover:bg-pastel-green/30') +
+          ? 'border-pastel-blue-line bg-pastel-blue shadow-[0_10px_24px_-12px_rgba(46,124,248,0.35)] scale-[1.02]'
+          : 'border-pastel-ink/10 bg-white hover:border-pastel-blue-line hover:bg-pastel-blue/30') +
         (disabled ? ' opacity-40 cursor-not-allowed' : '')
       }
     >
-      <span className={'flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border-2 ' + (active ? 'border-pastel-grape bg-white text-pastel-grape' : 'border-pastel-ink/10 bg-pastel-cream text-pastel-ink')}>
+      <span className={'flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border-2 ' + (active ? 'border-pastel-blue-line bg-white text-palette-azure' : 'border-pastel-ink/10 bg-pastel-cream text-pastel-ink')}>
         {icon}
       </span>
       <span>

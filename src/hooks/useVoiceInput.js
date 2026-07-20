@@ -27,6 +27,7 @@ export default function useVoiceInput({
   const wantListenRef = useRef(false)
   const onResultRef = useRef(onResult)
   const onLiveRef = useRef(onLiveTranscript)
+  const lastFinalRef = useRef('')
   onResultRef.current = onResult
   onLiveRef.current = onLiveTranscript
 
@@ -46,26 +47,55 @@ export default function useVoiceInput({
     recognition.maxAlternatives = 1
 
     recognition.onresult = (event) => {
-      let finalText = ''
-      let interimText = ''
-      for (let i = event.resultIndex; i < event.results.length; i++) {
+      // OJO #1: event.resultIndex es poco fiable entre navegadores — en
+      // algunos se queda en 0 (cada evento trae el texto COMPLETO
+      // acumulado), en otros avanza (cada evento trae solo lo NUEVO).
+      // Solución: reconstruir SIEMPRE el texto completo iterando TODOS los
+      // resultados desde el índice 0.
+      // OJO #2 (el bug real): cuando hay VARIOS resultados — típico si hablas
+      // con una pequeña pausa entre palabras, cada palabra queda como su
+      // propio result — concatenarlos con += los pegaba SIN ESPACIO
+      // ("hola"+"gracias"+"bien" → "holagraciasbien"), porque
+      // result.transcript no trae espacio propio de forma consistente. Al
+      // separar por espacios después, esa palabra pegada contaba como UNA
+      // sola — la del medio "desaparecía" (fusionada), leyéndose como
+      // salto/duplicado según cómo cayera el conteo. Se une con join(' ')
+      // explícito, nunca con concatenación directa.
+      const finalParts = []
+      const interimParts = []
+      for (let i = 0; i < event.results.length; i++) {
         const r = event.results[i]
-        if (r.isFinal) finalText += r[0].transcript
-        else interimText += r[0].transcript
+        const t = (r[0].transcript || '').trim()
+        if (!t) continue
+        if (r.isFinal) finalParts.push(t)
+        else interimParts.push(t)
+      }
+      const finalText = finalParts.join(' ')
+      const interimText = interimParts.join(' ')
+      const combined = [finalText, interimText].filter(Boolean).join(' ')
+      const isFullyFinal = interimText === '' // ninguna palabra queda "en progreso"
+
+      // TEMPORAL: activa con window.__SIGNARA_VOICE_DEBUG = true en la consola
+      // antes de hablar, para ver exactamente qué manda el navegador si el
+      // duplicado/salto de palabras sigue pasando después de este arreglo.
+      if (typeof window !== 'undefined' && window.__SIGNARA_VOICE_DEBUG) {
+        console.log('[voz]', {
+          results: Array.from(event.results).map((r) => ({ isFinal: r.isFinal, t: r[0].transcript })),
+          finalText, interimText, combined, isFullyFinal,
+        })
       }
 
-      // Stream interim text continuously - drives the live queue.
-      if (interimText) {
+      if (combined) {
         setInterim(interimText)
-        if (onLiveRef.current) onLiveRef.current(interimText, false)
+        if (onLiveRef.current) onLiveRef.current(combined, isFullyFinal)
       }
 
-      // Final phrase finalised - drives translateText() for polishing.
-      if (finalText) {
+      // Respaldo (traducción de frase completa): solo cuando ya no hay nada
+      // pendiente Y el texto final creció de verdad respecto al último aviso.
+      if (isFullyFinal && finalText && finalText !== lastFinalRef.current) {
+        lastFinalRef.current = finalText
         const cleaned = finalText.trim()
-        setTranscript((prev) => (prev ? `${prev} ${cleaned}` : cleaned).trim())
-        setInterim('')
-        if (onLiveRef.current) onLiveRef.current(cleaned, true)
+        setTranscript(cleaned)
         if (onResultRef.current) onResultRef.current(cleaned)
       }
     }
@@ -102,6 +132,7 @@ export default function useVoiceInput({
   const start = useCallback(() => {
     setError(null)
     setInterim('')
+    lastFinalRef.current = ''
     if (!recognitionRef.current) return
     wantListenRef.current = true
     try {

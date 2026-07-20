@@ -6,15 +6,15 @@ import Icon from './Icon.jsx'
 const ACCENTS = {
   translate: {
     label: 'Traducir',
-    chip: 'bg-pastel-green border-pastel-green-line text-pastel-ink',
-    btn: 'bg-pastel-grape',
-    bar: 'bg-pastel-green',
-  },
-  interpret: {
-    label: 'Interpretar',
     chip: 'bg-pastel-blue border-pastel-blue-line text-pastel-ink',
     btn: 'bg-pastel-grape',
     bar: 'bg-pastel-blue',
+  },
+  interpret: {
+    label: 'Interpretar',
+    chip: 'bg-pastel-purple border-pastel-purple-line text-pastel-ink',
+    btn: 'bg-pastel-grape',
+    bar: 'bg-pastel-purple',
   },
 }
 

@@ -65,6 +65,7 @@ const VRM_IDLE = {
     leftUpperArm:  { x: 0,    y: 0, z: -1.4 },
     leftLowerArm:  { x: 0,    y: 0, z:  0   },
     leftHand:      { x: 0,    y: 0, z:  0   },
+    head:          { x: 0,    y: 0, z:  0   },
 };
 
 // ─── Volver a pose relajada ───────────────────────────────────────────────────
@@ -300,23 +301,30 @@ export const ANIM_GRACIAS = [
     { duration:480, pose:{ ...R_ARM_EXT,  rightHand:{x: 0.2, y:0, z:0}, ...R_OPEN }},
 ];
 
-// SÍ — puño asiente arriba-abajo
+// SÍ — puño al pecho; la cabeza asiente 3 veces en X (fluido vía easeInOut).
+const SI_HOLD = { ...R_ARM_CHEST, rightHand:{x: 0, y: 0, z: 0}, ...R_FIST };
+const HEAD_NOD = 0.38;
 export const ANIM_SI = [
-    { duration:320, pose:{ ...R_ARM_CHEST, rightHand:{x: 0.35, y:0, z:0}, ...R_FIST }},
-    { duration:180, pose:{ ...R_ARM_CHEST, rightHand:{x:-0.35, y:0, z:0}, ...R_FIST }},
-    { duration:180, pose:{ ...R_ARM_CHEST, rightHand:{x: 0.35, y:0, z:0}, ...R_FIST }},
-    { duration:180, pose:{ ...R_ARM_CHEST, rightHand:{x:-0.35, y:0, z:0}, ...R_FIST }},
-    { duration:180, pose:{ ...R_ARM_CHEST, rightHand:{x: 0.35, y:0, z:0}, ...R_FIST }},
+    { duration:260, pose:{ ...SI_HOLD, head:{ x:  HEAD_NOD, y: 0, z: 0 } } },
+    { duration:260, pose:{ ...SI_HOLD, head:{ x: -HEAD_NOD, y: 0, z: 0 } } },
+    { duration:260, pose:{ ...SI_HOLD, head:{ x:  HEAD_NOD, y: 0, z: 0 } } },
+    { duration:260, pose:{ ...SI_HOLD, head:{ x: -HEAD_NOD, y: 0, z: 0 } } },
+    { duration:260, pose:{ ...SI_HOLD, head:{ x:  HEAD_NOD, y: 0, z: 0 } } },
+    { duration:260, pose:{ ...SI_HOLD, head:{ x: -HEAD_NOD, y: 0, z: 0 } } },
+    { duration:220, pose:{ ...SI_HOLD, head:{ x:  0,        y: 0, z: 0 } } },
 ];
 
-// NO — índice, oscila izquierda-derecha
+// NO — índice quieto; la cabeza niega 3 veces en Y (lado a lado).
+const NO_HOLD = { ...R_ARM_MID, rightHand:{x: 0, y: 0, z: 0}, ...R_POINT };
+const HEAD_SHAKE = 0.42;
 export const ANIM_NO = [
-    { duration:300, pose:{ ...R_ARM_MID, rightHand:{x:0, y: 0,    z:0}, ...R_POINT }},
-    { duration:200, pose:{ ...R_ARM_MID, rightHand:{x:0, y: 0.45, z:0}, ...R_POINT }},
-    { duration:200, pose:{ ...R_ARM_MID, rightHand:{x:0, y:-0.45, z:0}, ...R_POINT }},
-    { duration:200, pose:{ ...R_ARM_MID, rightHand:{x:0, y: 0.45, z:0}, ...R_POINT }},
-    { duration:200, pose:{ ...R_ARM_MID, rightHand:{x:0, y:-0.45, z:0}, ...R_POINT }},
-    { duration:200, pose:{ ...R_ARM_MID, rightHand:{x:0, y: 0,    z:0}, ...R_POINT }},
+    { duration:260, pose:{ ...NO_HOLD, head:{ x: 0, y:  HEAD_SHAKE, z: 0 } } },
+    { duration:260, pose:{ ...NO_HOLD, head:{ x: 0, y: -HEAD_SHAKE, z: 0 } } },
+    { duration:260, pose:{ ...NO_HOLD, head:{ x: 0, y:  HEAD_SHAKE, z: 0 } } },
+    { duration:260, pose:{ ...NO_HOLD, head:{ x: 0, y: -HEAD_SHAKE, z: 0 } } },
+    { duration:260, pose:{ ...NO_HOLD, head:{ x: 0, y:  HEAD_SHAKE, z: 0 } } },
+    { duration:260, pose:{ ...NO_HOLD, head:{ x: 0, y: -HEAD_SHAKE, z: 0 } } },
+    { duration:220, pose:{ ...NO_HOLD, head:{ x: 0, y:  0,          z: 0 } } },
 ];
 
 // BIEN — pulgar arriba

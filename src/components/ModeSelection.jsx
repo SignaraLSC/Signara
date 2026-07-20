@@ -46,7 +46,7 @@ export default function ModeSelection({ onSelect, onBack }) {
             <AppPageStagger className="mt-12 grid grid-cols-1 gap-6 md:grid-cols-2 md:gap-8">
               <ModeCard
                 number="01"
-                color="green"
+                color="blue"
                 tag="Español → Señas"
                 title="Traducir"
                 headline="Habla o escribe, el avatar señará por ti"
@@ -58,7 +58,7 @@ export default function ModeSelection({ onSelect, onBack }) {
               />
               <ModeCard
                 number="02"
-                color="blue"
+                color="purple"
                 tag="Señas → Texto"
                 title="Interpretar"
                 headline="Muestra tus manos, Signara entiende"
@@ -72,12 +72,12 @@ export default function ModeSelection({ onSelect, onBack }) {
 
             <AppPageStagger className="mt-10 grid grid-cols-1 gap-3 sm:grid-cols-2 md:mt-12">
               <HintBlock
-                color="green"
+                color="blue"
                 title="¿Quieres explicarte a alguien sordo?"
                 text="Usa Traducir: tú hablas, el avatar hace las señas."
               />
               <HintBlock
-                color="blue"
+                color="purple"
                 title="¿Quieres entender señas?"
                 text="Usa Interpretar: señas con la cámara, texto en pantalla."
               />
@@ -93,19 +93,24 @@ export default function ModeSelection({ onSelect, onBack }) {
 }
 
 const CARD_STYLES = {
-  green: {
-    card: 'border-pastel-green-line bg-pastel-green hover:border-pastel-green-line hover:shadow-[0_28px_50px_-24px_rgba(148,208,142,0.75)]',
-    icon: 'border-pastel-green-line bg-white text-pastel-ink',
-    tag: 'border-pastel-green-line bg-white text-pastel-ink',
-    number: 'border-pastel-green-line text-pastel-ink',
-    cta: 'bg-pastel-ink text-white shadow-[0_12px_28px_-10px_rgba(45,42,38,0.55)] hover:bg-pastel-ink/90',
-  },
   blue: {
     card: 'border-pastel-blue-line bg-pastel-blue hover:border-pastel-blue-line hover:shadow-[0_28px_50px_-24px_rgba(147,190,240,0.85)]',
     icon: 'border-pastel-blue-line bg-white text-pastel-ink',
     tag: 'border-pastel-blue-line bg-white text-pastel-ink',
     number: 'border-pastel-blue-line text-pastel-ink',
-    cta: 'bg-pastel-grape text-white shadow-[0_12px_28px_-10px_rgba(126,100,201,0.7)] hover:brightness-110',
+    // Botón: fondo blanco + texto negro; borde = color de la card; hover oscurece.
+    cta: 'border-[3px] border-pastel-blue-line bg-white text-pastel-ink shadow-[0_10px_24px_-12px_rgba(147,190,240,0.45)] hover:bg-pastel-blue-line hover:text-white',
+    check: 'bg-pastel-blue-line',
+    bigNumber: 'text-pastel-blue-line',
+  },
+  purple: {
+    card: 'border-pastel-purple-line bg-pastel-purple hover:border-pastel-purple-line hover:shadow-[0_28px_50px_-24px_rgba(188,164,230,0.85)]',
+    icon: 'border-pastel-purple-line bg-white text-pastel-ink',
+    tag: 'border-pastel-purple-line bg-white text-pastel-ink',
+    number: 'border-pastel-purple-line text-pastel-ink',
+    cta: 'border-[3px] border-pastel-purple-line bg-white text-pastel-ink shadow-[0_10px_24px_-12px_rgba(188,164,230,0.45)] hover:bg-pastel-purple-line hover:text-white',
+    check: 'bg-pastel-purple-line',
+    bigNumber: 'text-pastel-purple-line',
   },
 }
 
@@ -133,7 +138,7 @@ function ModeCard({
       <span
         className={
           'absolute -right-3 -top-4 select-none text-[7rem] font-extrabold leading-none opacity-[0.07] ' +
-          (color === 'green' ? 'text-pastel-green-line' : 'text-pastel-blue-line')
+          s.bigNumber
         }
         aria-hidden="true"
       >
@@ -171,7 +176,7 @@ function ModeCard({
         <ul className="mt-5 space-y-2">
           {features.map((f) => (
             <li key={f} className="flex items-center gap-2.5 text-sm font-bold text-pastel-ink/85">
-              <CheckDot color={color} />
+              <CheckDot className={s.check} />
               {f}
             </li>
           ))}
@@ -191,8 +196,12 @@ function ModeCard({
   )
 }
 
+const HINT_BORDER = {
+  blue: 'border-pastel-blue-line bg-pastel-blue/60',
+  purple: 'border-pastel-purple-line bg-pastel-purple/60',
+}
 function HintBlock({ color, title, text }) {
-  const border = color === 'green' ? 'border-pastel-green-line bg-pastel-green/60' : 'border-pastel-blue-line bg-pastel-blue/60'
+  const border = HINT_BORDER[color] || HINT_BORDER.blue
   return (
     <div className={'motion-surface rounded-2xl border-2 px-5 py-4 ' + border}>
       <p className="text-sm font-extrabold text-pastel-ink">{title}</p>
@@ -201,10 +210,9 @@ function HintBlock({ color, title, text }) {
   )
 }
 
-function CheckDot({ color }) {
-  const bg = color === 'green' ? 'bg-pastel-green-line' : 'bg-pastel-blue-line'
+function CheckDot({ className = 'bg-pastel-blue-line' }) {
   return (
-    <span className={'flex h-5 w-5 shrink-0 items-center justify-center rounded-full ' + bg}>
+    <span className={'flex h-5 w-5 shrink-0 items-center justify-center rounded-full ' + className}>
       <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="#FAF6EC" strokeWidth="3.5" strokeLinecap="round" strokeLinejoin="round">
         <path d="M20 6L9 17l-5-5" />
       </svg>

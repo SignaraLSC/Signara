@@ -18,7 +18,7 @@ export default function SignChips({ signs = [], activeIndex = -1 }) {
           className={
             'chip transition-all duration-300 ' +
             (i === activeIndex
-              ? 'chip-active scale-110 ring-4 ring-pastel-grape/30 shadow-[0_8px_24px_-6px_rgba(126,100,201,0.55)]'
+              ? 'chip-active scale-110 ring-4 ring-palette-azure/30 shadow-[0_8px_24px_-6px_rgba(46,124,248,0.45)]'
               : i < activeIndex
                 ? 'opacity-60'
                 : '')

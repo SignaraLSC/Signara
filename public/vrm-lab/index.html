@@ -57,6 +57,13 @@
     <p style="margin-top:14px; color:#34d399"><b>✋ Giro de muñeca (BIEN)</b> — prueba hasta que los nudillos queden al frente:</p>
     <div class="row" id="rollRow"></div>
 
+    <p style="margin-top:14px; color:#c084fc"><b>🧪 Prueba #1: fuente de muñeca</b> — 'hand' = 21 landmarks de la mano en TODAS las señas (en vez de solo pose_world). Cambia y prueba SI/NO/MAL/BIEN:</p>
+    <div class="row" id="wristSourceRow"></div>
+    <p style="margin-top:8px; color:#c084fc">Giro de muñeca para fuente 'hand' (independiente del de arriba):</p>
+    <div class="row" id="rollHandRow"></div>
+    <p style="margin-top:8px; color:#c084fc">Señas (misma lista de C, aquí para no scrollear al probar):</p>
+    <div class="row" id="signsAutoWristTest"></div>
+
     <p style="margin-top:12px; color:#38bdf8"><b>➡️ Inclinar al frente (BIEN)</b> — más alto = más de frente (menos hacia arriba):</p>
     <div class="row" id="fwdRow"></div>
 
@@ -73,8 +80,8 @@
     import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
     import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
     import { VRMLoaderPlugin } from '@pixiv/three-vrm';
-    import { setIdlePose, translateToLSC, playKeyframes } from './animations.js?v=lab3';
-    import { frameToArmDirs, frameFingers, frameWristBasis, frameHandBasis, frameHeadRotation, smoothHeadSeq, activeArms, smoothPoseSeq, smoothVecSeq, trimLeadIn, trimTrailOut, CONFIG } from './solver.js?v=lab24';
+    import { setIdlePose, translateToLSC, playKeyframes } from './animations.js?v=lab4';
+    import { frameToArmDirs, frameFingers, frameWristBasis, frameHandBasis, despikeWristSeq, frameHeadRotation, smoothHeadSeq, activeArms, smoothPoseSeq, smoothVecSeq, trimLeadIn, trimTrailOut, CONFIG } from './solver.js?v=lab28';
 
     const statusEl = document.getElementById('status');
     const setStatus = (msg, kind = '') => { statusEl.textContent = msg; statusEl.className = kind; };
@@ -180,6 +187,20 @@
           // Hornea directo un dataset dado (para probar con datos sintéticos,
           // ej. una seña de 1 mano armada a partir de otra grabación).
           bake(dataset) { return bakeSolver(dataset); },
+          // TEMP: probar ejes del pulgar a mano. setBone(name,'x'|'y'|'z',val).
+          setBone(name, axis, val) {
+            const b = vrm.humanoid.getNormalizedBoneNode(name);
+            if (!b) return null;
+            b.rotation[axis] = val;
+            vrm.update(0);
+            return { name, axis, val };
+          },
+          getPos(name) {
+            const b = vrm.humanoid.getNormalizedBoneNode(name);
+            if (!b) return null;
+            const v = new THREE.Vector3(); b.getWorldPosition(v);
+            return { x: +v.x.toFixed(4), y: +v.y.toFixed(4), z: +v.z.toFixed(4) };
+          },
           velocityProfile(sign) {
             return fetch(`${API_URL}/sign/${sign}`).then((r) => r.json()).then((dataset) => {
               const kfs = bakeSolver(dataset);
@@ -238,20 +259,27 @@
       buildHeadProbes();
       buildRolls();
       buildFwds();
+      buildWristSourceToggle();
+      buildRollsHand();
     }
 
+    // Misma lista de señas en dos filas (fila C original + duplicado junto a
+    // la Prueba #1 de muñeca), para no tener que scrollear al comparar fuentes.
     function renderAutoButtons() {
-      const auto = document.getElementById('signsAuto');
-      auto.innerHTML = '';
-      for (const s of SIGNS_AUTO) {
-        const b = document.createElement('button');
-        b.style.background = '#3b82f6';
-        b.textContent = s.replace(/_/g, ' ');
-        b.onclick = () => playAuto(s);
-        auto.appendChild(b);
-      }
-      if (!SIGNS_AUTO.length) {
-        auto.innerHTML = '<span style="font-size:12px;color:#93a2c6">(ninguna todavía)</span>';
+      for (const id of ['signsAuto', 'signsAutoWristTest']) {
+        const row = document.getElementById(id);
+        if (!row) continue;
+        row.innerHTML = '';
+        for (const s of SIGNS_AUTO) {
+          const b = document.createElement('button');
+          b.style.background = '#3b82f6';
+          b.textContent = s.replace(/_/g, ' ');
+          b.onclick = () => playAuto(s);
+          row.appendChild(b);
+        }
+        if (!SIGNS_AUTO.length) {
+          row.innerHTML = '<span style="font-size:12px;color:#93a2c6">(ninguna todavía)</span>';
+        }
       }
     }
 
@@ -295,6 +323,46 @@
         b.style.fontSize = '12px';
         b.textContent = deg > 0 ? `+${deg}°` : `${deg}°`;
         b.onclick = () => { CONFIG.wristRoll = deg * Math.PI / 180; setStatus(`giro muñeca ${deg}°`); playAuto('BIEN'); };
+        row.appendChild(b);
+      }
+    }
+
+    // Prueba #1 (aislada): alternar la fuente de orientación de muñeca entre
+    // 'pose' (actual) y 'hand' (21 landmarks). No toca IK/C_avatar/torso.
+    // Replay la última seña reproducida para poder comparar A/B rápido.
+    function buildWristSourceToggle() {
+      const row = document.getElementById('wristSourceRow');
+      row.innerHTML = '';
+      const srcs = [['pose', 'pose_world (actual)'], ['hand', 'mano 21 landmarks']];
+      const buttons = srcs.map(([src, label]) => {
+        const b = document.createElement('button');
+        b.style.fontSize = '12px';
+        b.textContent = label;
+        b.onclick = () => {
+          CONFIG.wristSource = src;
+          setStatus(`muñeca: fuente = ${src}`);
+          buttons.forEach(([bt, s]) => { bt.style.background = CONFIG.wristSource === s ? '#7c3aed' : '#4c1d95'; });
+          playAuto(lastPlayedSign);
+        };
+        row.appendChild(b);
+        return [b, src];
+      });
+      buttons.forEach(([bt, s]) => { bt.style.background = CONFIG.wristSource === s ? '#7c3aed' : '#4c1d95'; });
+    }
+
+    function buildRollsHand() {
+      const row = document.getElementById('rollHandRow');
+      row.innerHTML = '';
+      for (const deg of [-135, -90, -45, -20, 0, 20, 45, 90, 135]) {
+        const b = document.createElement('button');
+        b.style.background = deg === 0 ? '#475569' : '#a855f7';
+        b.style.fontSize = '12px';
+        b.textContent = deg > 0 ? `+${deg}°` : `${deg}°`;
+        b.onclick = () => {
+          CONFIG.wristRollHand = deg * Math.PI / 180;
+          setStatus(`giro muñeca (hand) ${deg}°`);
+          playAuto(lastPlayedSign);
+        };
         row.appendChild(b);
       }
     }
@@ -426,7 +494,7 @@
       const t = new THREE.Vector3().crossVectors(f, n);
       return new THREE.Matrix4().makeBasis(f, n, t);
     }
-    function aimHandFull(B, targetFwd, targetNormal, sideSign) {
+    function aimHandFull(B, targetFwd, targetNormal, sideSign, rollRad = CONFIG.wristRoll) {
       if (!B.hd || !B.mid || !B.idx || !B.lit) return;
       B.hd.quaternion.identity();
       vrm.scene.updateMatrixWorld(true);
@@ -444,9 +512,9 @@
       B.hd.quaternion.copy(pq.clone().invert().multiply(qDelta).multiply(pq));
       // Ajuste de giro de palma calibrable, alrededor del eje del antebrazo
       // (hacia el nudillo medio). Signo espejado por lado.
-      if (CONFIG.wristRoll) {
+      if (rollRad) {
         const rollAxis = B.mid.position.clone().normalize();
-        B.hd.quaternion.multiply(new THREE.Quaternion().setFromAxisAngle(rollAxis, CONFIG.wristRoll * sideSign));
+        B.hd.quaternion.multiply(new THREE.Quaternion().setFromAxisAngle(rollAxis, rollRad * sideSign));
       }
     }
 
@@ -505,6 +573,15 @@
       // si quedaron grabadas por error (ambas se sintetizan solas más abajo).
       const dataset = trimTrailOut(trimLeadIn(rawDataset));
       const arms = activeArms(dataset);
+      // Overrides mínimos de giro de palma (solo donde el +45° global no basta).
+      // MAL: pulgar abajo → hace falta ~−100° (menos de −90°).
+      const token = (dataset.token || '').toUpperCase();
+      const WRIST_OVERRIDES = { MAL: -100 * Math.PI / 180 };
+      // Overrides calibrados contra la fuente 'pose' — no aplican si se está
+      // probando 'hand' (esa fuente tiene su propio giro base, wristRollHand).
+      const bakeWristRoll = CONFIG.wristSource === 'hand'
+        ? CONFIG.wristRollHand
+        : ((token in WRIST_OVERRIDES) ? WRIST_OVERRIDES[token] : CONFIG.wristRoll);
       const R = { up: getBone('rightUpperArm'), lo: getBone('rightLowerArm'),
                   hd: getBone('rightHand'), mid: getBone('rightMiddleProximal'),
                   idx: getBone('rightIndexProximal'), lit: getBone('rightLittleProximal') };
@@ -550,6 +627,39 @@
         }
         return T;
       }
+      // Igual que avoidTorso pero solo pregunta (no corrige) — se usa en la
+      // transición de ENTRADA/SALIDA para decidir si el camino recto
+      // reposo↔seña pasaría por dentro del torso y hace falta un punto
+      // intermedio que lo rodee (ver waypointFor más abajo).
+      function insideTorso(T) {
+        const off = T.clone().sub(C_avatar);
+        return Math.abs(off.x) < TORSO_HALF_WIDTH && off.y < TORSO_UP && off.y > -TORSO_DOWN && off.z < TORSO_MIN_FWD;
+      }
+      // Cuando las dos manos se juntan (p.ej. GRACIAS): la de ABAJO (derecha)
+      // no debe meterse en el pecho ni ocupar el mismo volumen que la de
+      // ARRIBA (izquierda en barbilla). Se apilan: misma X aprox., Y separada,
+      // y la baja un poco más al frente (+Z).
+      function stackHands(tg) {
+        if (!tg.right || !tg.left) return;
+        const lo = tg.right.T.y <= tg.left.T.y ? 'right' : 'left';
+        const hi = lo === 'right' ? 'left' : 'right';
+        const hiT = tg[hi].T, loT = tg[lo].T;
+        if (hiT.distanceTo(loT) > shoulderHalfW * 1.35) return;
+        const sepY = shoulderHalfW * 0.16;
+        const minFwdLo = shoulderHalfW * 0.58; // clearance pecho para la mano baja
+        const stackZ = shoulderHalfW * 0.08;   // baja un poco más hacia cámara
+        // Alinear bajo la mano alta y mantener separación vertical.
+        loT.x += (hiT.x - loT.x) * 0.55;
+        if (hiT.y - loT.y < sepY) loT.y = hiT.y - sepY;
+        // Mano baja delante del tronco (aunque esté bajo el pecho / fuera de TORSO_UP).
+        const off = loT.clone().sub(C_avatar);
+        if (Math.abs(off.x) < shoulderHalfW * 0.95 && off.y > -TORSO_DOWN && off.z < minFwdLo) {
+          off.z = minFwdLo;
+          loT.copy(C_avatar.clone().add(off));
+        }
+        // Que no quede detrás de la mano alta (atraviesa hacia el pecho).
+        if (loT.z < hiT.z + stackZ) loT.z = hiT.z + stackZ;
+      }
       const frames = dataset.frames || [];
       // 1) Datos crudos por frame: IK (wristDir, reachFrac, pole) + muñeca + dedos.
       const rawDirs = frames.map((f) => frameToArmDirs(f, arms));
@@ -565,7 +675,10 @@
       // el resto. Agregar aquí cualquier otra seña con la mano junto a la
       // cara/cabeza (mejilla, oreja, sien...) si se ve el mismo problema.
       const NEAR_FACE_SIGNS = new Set(['HOLA']);
-      const useHandBasis = NEAR_FACE_SIGNS.has((dataset.token || '').toUpperCase());
+      // Prueba aislada (#1): CONFIG.wristSource='hand' fuerza frameHandBasis
+      // (21 landmarks de mano) en TODAS las señas, no solo las de NEAR_FACE_SIGNS.
+      // Se prueba con su propio giro (wristRollHand) sin tocar wristRoll ni el IK.
+      const useHandBasis = CONFIG.wristSource === 'hand' || NEAR_FACE_SIGNS.has((dataset.token || '').toUpperCase());
       const rawWri  = frames.map((f) => {
         const pb = frameWristBasis(f, arms);
         const hb = frameHandBasis(f, arms);
@@ -576,6 +689,12 @@
         if (primary.left  || fallback.left)  out.left  = primary.left  || fallback.left;
         return out;
       });
+      // Repara pérdidas momentáneas de tracking de mano (1-2 frames sueltos
+      // donde el giro se "invierte" de golpe y vuelve) — ver despikeWristSeq.
+      for (const side of ['right', 'left']) {
+        const seq = rawWri.map((r) => r[side] || null);
+        despikeWristSeq(seq).forEach((v, i) => { if (v) rawWri[i][side] = v; });
+      }
       const rawFing = frames.map((f) => frameFingers(f, arms));
       // Cabeza (Fase 3): nariz/orejas de pose_world → yaw/pitch. Huecos (mano
       // tapando la cara, detección floja) heredan el último valor válido, igual
@@ -661,6 +780,9 @@
             tg.right.T.copy(avoidTorso(tg.right.T));
             tg.left.T.copy(avoidTorso(tg.left.T));
           }
+          // Apilar si están cerca: mano baja delante del pecho y debajo de la
+          // alta, sin atravesar tronco ni la otra mano (GRACIAS).
+          stackHands(tg);
         }
         for (const name of ['right', 'left']) {
           extRaw[name].push(tg[name] ? tg[name].S.distanceTo(tg[name].T) / (tg[name].B.L1 + tg[name].B.L2) : null);
@@ -704,7 +826,7 @@
           const wrist = name === 'right' ? wrists.right : wrists.left;
           if (wrist) {
             vrm.scene.updateMatrixWorld(true);
-            aimHandFull(B, wrist.fwd, wrist.normal, name === 'right' ? 1 : -1);
+            aimHandFull(B, wrist.fwd, wrist.normal, name === 'right' ? 1 : -1, bakeWristRoll);
             pose[name + 'Hand'] = eulerOf(B.hd);
           }
         }
@@ -829,8 +951,24 @@
           }
           for (const side of activeSides) {
             const P = sideData[side];
-            pose[side + 'UpperArm'] = slerpEuler(P.upperA, P.upperB, a);
-            pose[side + 'LowerArm'] = slerpEuler(P.lowerA, P.lowerB, a);
+            // Si hay punto intermedio (waypoint, ver más abajo — la mano
+            // ENTRA/SALE del reposo rodeando el torso en vez de en línea
+            // recta), el mismo tramo de tiempo compartido `a` se reparte en
+            // dos: reposo→waypoint (primera mitad) y waypoint→seña (segunda).
+            if (P.wpUpper) {
+              if (a <= 0.5) {
+                const t2 = a / 0.5;
+                pose[side + 'UpperArm'] = slerpEuler(P.upperA, P.wpUpper, t2);
+                pose[side + 'LowerArm'] = slerpEuler(P.lowerA, P.wpLower, t2);
+              } else {
+                const t2 = (a - 0.5) / 0.5;
+                pose[side + 'UpperArm'] = slerpEuler(P.wpUpper, P.upperB, t2);
+                pose[side + 'LowerArm'] = slerpEuler(P.wpLower, P.lowerB, t2);
+              }
+            } else {
+              pose[side + 'UpperArm'] = slerpEuler(P.upperA, P.upperB, a);
+              pose[side + 'LowerArm'] = slerpEuler(P.lowerA, P.lowerB, a);
+            }
             pose[side + 'Hand'] = slerpEuler(P.handA, P.handB, a);
           }
           const bones = new Set([...Object.keys(fingerA), ...Object.keys(fingerB)]);
@@ -856,21 +994,84 @@
         return pose;
       };
 
+      // SI / NO: cabeza sintetizada (3 ciclos fluidos). No depende del tracking
+      // de cara — SI = pitch (X), NO = yaw (Y); ejes vía CONFIG por si el VRM cambia.
+      if (token === 'SI' || token === 'SÍ' || token === 'NO') {
+        const n = poses.length;
+        const cycles = 3;
+        const amp = token === 'NO' ? 0.42 : 0.38;
+        const axis = token === 'NO' ? CONFIG.headYawAxis : CONFIG.headPitchAxis;
+        const sign = token === 'NO' ? CONFIG.headYawSign : CONFIG.headPitchSign;
+        for (let i = 0; i < n; i++) {
+          const t = n <= 1 ? 0 : i / (n - 1);
+          const a = amp * sign * Math.sin(cycles * Math.PI * 2 * t);
+          poses[i].head = { x: 0, y: 0, z: 0, [axis]: a };
+        }
+      }
+
+      // ── (#2) Rodear el torso en la ENTRADA/SALIDA ────────────────────────
+      // El slerp reposo↔seña de arriba interpola hombro/codo directo, sin
+      // saber que hay un cuerpo — en señas donde la mano de reposo (colgando
+      // al lado) y la mano de la seña (cerca del pecho, ej. GRACIAS) quedan
+      // en lados opuestos del torso, el camino directo lo atraviesa. Si el
+      // PUNTO MEDIO de ese camino cae dentro de la caja del torso (mismo
+      // chequeo que avoidTorso), se inserta un punto intermedio empujado
+      // hacia AFUERA (lado anatómico correcto) y por delante del pecho, y la
+      // transición pasa a ser reposo→waypoint→seña. Si el camino directo ya
+      // iba por fuera del torso, no se toca nada (waypoint = null). General:
+      // se decide por geometría en cada toma, no por lista de señas.
+      function tgWristAt(side, fromEnd) {
+        const arr = fromEnd ? [...allTg].reverse() : allTg;
+        for (const tg of arr) if (tg[side]) return tg[side].T;
+        return null;
+      }
+      function waypointFor(side, targetT) {
+        const B = side === 'right' ? R : L;
+        setIdlePose(vrm); vrm.scene.updateMatrixWorld(true);
+        const restWrist = B.hd.getWorldPosition(new THREE.Vector3());
+        const midPt = restWrist.clone().add(targetT).multiplyScalar(0.5);
+        if (!insideTorso(midPt)) return null;   // camino directo ya libre
+        const off = midPt.clone().sub(C_avatar);
+        const outSign = side === 'right' ? -1 : 1;   // lado derecho avatar = -X
+        off.x = outSign * Math.max(Math.abs(off.x), TORSO_HALF_WIDTH * 1.3);
+        return avoidTorso(C_avatar.clone().add(off));
+      }
+      function solveArmEuler(side, T) {
+        const B = side === 'right' ? R : L;
+        setIdlePose(vrm); vrm.scene.updateMatrixWorld(true);
+        const S = B.up.getWorldPosition(new THREE.Vector3());
+        const poleDir = new THREE.Vector3(0, -1, 0.3).normalize();   // codo relajado hacia abajo/frente
+        const E = solveIK(S, T, B.L1, B.L2, poleDir, 1);
+        aimBone(B.up, B.lo, E.clone().sub(S).normalize());
+        vrm.scene.updateMatrixWorld(true);
+        aimBone(B.lo, B.hd, T.clone().sub(E).normalize());
+        return { upper: eulerOf(B.up), lower: eulerOf(B.lo) };
+      }
+
       const first = poses[0], last = poses[poses.length - 1];
       const entrySides = {}, exitSides = {};
       for (const side of ['right', 'left']) {
         if (!signUsesArm(side) || !first[side + 'UpperArm'] || !last[side + 'UpperArm']) continue;
         const rest = sideRest[side];
-        entrySides[side] = {
+        const entrySide = {
           upperA: rest.upper, upperB: first[side + 'UpperArm'],
           lowerA: rest.lower, lowerB: first[side + 'LowerArm'],
           handA: NEUTRAL, handB: first[side + 'Hand'] || NEUTRAL,
         };
-        exitSides[side] = {
+        const firstTarget = tgWristAt(side, false);
+        const entryWp = firstTarget ? waypointFor(side, firstTarget) : null;
+        if (entryWp) { const e = solveArmEuler(side, entryWp); entrySide.wpUpper = e.upper; entrySide.wpLower = e.lower; }
+        entrySides[side] = entrySide;
+
+        const exitSide = {
           upperA: last[side + 'UpperArm'], upperB: rest.upper,
           lowerA: last[side + 'LowerArm'], lowerB: rest.lower,
           handA: last[side + 'Hand'] || NEUTRAL, handB: NEUTRAL,
         };
+        const lastTarget = tgWristAt(side, true);
+        const exitWp = lastTarget ? waypointFor(side, lastTarget) : null;
+        if (exitWp) { const e = solveArmEuler(side, exitWp); exitSide.wpUpper = e.upper; exitSide.wpLower = e.lower; }
+        exitSides[side] = exitSide;
       }
       const activeSides = Object.keys(entrySides);
       const transSteps = TRANS_STEPS - 1;
@@ -960,8 +1161,10 @@
       return () => { cancelled = true; if (raf) cancelAnimationFrame(raf); };
     }
 
+    let lastPlayedSign = 'BIEN';
     async function playAuto(sign) {
       if (!vrm || busy) return;
+      lastPlayedSign = sign;
       busy = true;
       setStatus('C) ' + sign.replace(/_/g, ' ') + ' (conversor propio)…');
       try {

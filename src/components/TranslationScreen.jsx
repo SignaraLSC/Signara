@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ResetButton, SectionLabel } from './AppShell.jsx'
 import PoseViewer from './PoseViewer.jsx'
-import AvatarSigner3D from './AvatarSigner3D.jsx'
+import AvatarSignerVRM from './AvatarSignerVRM.jsx'
 import Icon from './Icon.jsx'
 import { ML_API_URL } from '../utils/mlApi.js'
 import TextInputPanel from './TextInputPanel.jsx'
@@ -19,7 +19,7 @@ import {
 import { TRANSLATE_TUTORIAL_STEPS } from '../data/modeTutorialSteps.js'
 import { useModeTutorial } from '../hooks/useModeTutorial.js'
 import { translateText } from '../utils/translateText.js'
-import { tokenize } from '../utils/textNormalizer.js'
+import { tokenize, normalizeForSearch } from '../utils/textNormalizer.js'
 import { SIGNED_LANG_LABEL } from '../utils/signLanguage.js'
 
 /**
@@ -40,6 +40,23 @@ function matchSignTokens(words, available) {
     if (hit) { result.push(hit); i += len } else { i += 1 }
   }
   return result
+}
+
+/**
+ * Igual estrategia que matchSignTokens (combos de hasta 3 palabras, el más
+ * largo primero) pero mirando hacia ATRÁS desde el final de `words` — para el
+ * reconocimiento EN VIVO, donde las palabras llegan una por una y hay que
+ * decidir con lo que ya se tiene, sin saber la frase completa todavía.
+ * Devuelve { token, consumed } o null si ninguna combinación que termine en
+ * la última palabra coincide.
+ */
+function tryMatchSuffix(words, available) {
+  for (let n = Math.min(3, words.length); n >= 1; n--) {
+    const slice = words.slice(words.length - n)
+    const cand = slice.join('_')
+    if (available.includes(cand)) return { token: cand, consumed: n }
+  }
+  return null
 }
 
 export default function TranslationScreen({
@@ -68,13 +85,42 @@ export default function TranslationScreen({
   const missedTimerRef = useRef(null)
   const signerRef = useRef(null)
   const availableTokensRef = useRef([])   // tokens con animación grabada disponible
+  // En vivo: si alguna palabra ya se encoló mientras se hablaba, el resultado
+  // final de la voz no debe volver a arrancar todo desde cero (ver
+  // handleVoiceFinal). liveQueueBufferRef guarda tokens que llegaron ANTES de
+  // que el avatar terminara de montarse (useSigner pasa a true de forma
+  // asíncrona), para no perder la primera palabra de la frase.
+  const liveMatchedRef = useRef(false)
+  const liveQueueBufferRef = useRef([])
+  // Espejo síncrono de `useSigner`: en React.StrictMode (dev), las funciones
+  // actualizadoras pasadas a setState se ejecutan DOS VECES a propósito para
+  // detectar efectos secundarios impuros. handleLiveWord llamaba a
+  // signerRef.current.queue(token) DENTRO de un setUseSigner(prev => ...) —
+  // StrictMode la disparaba dos veces, encolando cada palabra dos veces (la
+  // seña se reproducía duplicada). Un ref normal no sufre esa doble
+  // invocación, así que el efecto secundario se decide leyendo el ref, nunca
+  // dentro del updater de setState.
+  const useSignerRef = useRef(false)
+  // Últimas 1-2 palabras EN VIVO que no combinaron con nada todavía — se
+  // guardan por si la SIGUIENTE palabra forma una seña de 2-3 palabras
+  // (POR_FAVOR, COMO_ESTAS...). Sin esto, la coincidencia en vivo solo miraba
+  // una palabra a la vez y esas señas nunca se activaban por voz.
+  const pendingWordsRef = useRef([])
+
+  // Precarga el VRM en cuanto hay animaciones: si esperamos a la 1ª palabra,
+  // el usuario nota varios segundos de "Cargando avatar…".
+  const [signerMounted, setSignerMounted] = useState(false)
 
   // Al montar, consulta qué señas tienen animación 3D propia grabada.
   useEffect(() => {
     let cancelled = false
     fetch(`${ML_API_URL}/animations`)
       .then((r) => r.json())
-      .then((d) => { if (!cancelled) availableTokensRef.current = d?.tokens || [] })
+      .then((d) => {
+        if (cancelled) return
+        availableTokensRef.current = d?.tokens || []
+        if ((d?.tokens || []).length) setSignerMounted(true)
+      })
       .catch(() => {})
     return () => { cancelled = true }
   }, [])
@@ -85,6 +131,16 @@ export default function TranslationScreen({
       signerRef.current?.replace(signerTokens)
     }
   }, [useSigner, signerTokens])
+
+  // El avatar se monta recién cuando useSigner pasa a true — si una palabra
+  // en vivo llegó justo antes de eso, quedó en el buffer; se encola apenas
+  // el ref esté listo.
+  useEffect(() => {
+    if (useSigner && liveQueueBufferRef.current.length) {
+      liveQueueBufferRef.current.forEach((t) => signerRef.current?.queue(t))
+      liveQueueBufferRef.current = []
+    }
+  }, [useSigner])
 
   const revokePoseBlob = useCallback(() => {
     if (poseBlobRef.current?.startsWith('blob:')) {
@@ -105,9 +161,13 @@ export default function TranslationScreen({
     setPendingWord('')
     setMissedWord('')
     setUseSigner(false)
+    useSignerRef.current = false
     setSignerTokens([])
     signerRef.current?.clear()
     pendingWordRef.current = ''
+    liveMatchedRef.current = false
+    liveQueueBufferRef.current = []
+    pendingWordsRef.current = []
     if (missedTimerRef.current) clearTimeout(missedTimerRef.current)
   }, [revokePoseBlob])
 
@@ -126,8 +186,8 @@ export default function TranslationScreen({
     setPoseFinished(false)
     revokePoseBlob()
     setPoseSrc(null)
-    setUseSigner(false)
-    setSignerTokens([])
+    // No poner useSigner=false aquí si vamos a seguir con el avatar: desmontar
+    // recarga el VRM entero y se siente lentísimo (y pisa la cola en vivo).
 
     // ── Primario: avatar 3D de landmarks con animaciones grabadas ──────────────
     // Si alguna palabra tiene animación propia (grabada con 00_capture.py),
@@ -138,13 +198,18 @@ export default function TranslationScreen({
 
     if (matched.length > 0) {
       setTranslateSource('signer3d')
+      signerRef.current?.clear()
       setSignerTokens(matched)
       setUseSigner(true)
+      useSignerRef.current = true
       setBusy(false)
       return
     }
 
     // ── Respaldo: pose-viewer de sign.mt ───────────────────────────────────────
+    setUseSigner(false)
+    useSignerRef.current = false
+    setSignerTokens([])
     try {
       const result = await translateText(text)
       setTranslateSource(result.source)
@@ -173,6 +238,24 @@ export default function TranslationScreen({
     revokePoseBlob()
   }, [revokePoseBlob])
 
+  // En vivo: cada palabra reconocida se encola de inmediato en el avatar si
+  // tiene animación grabada — no espera a que termines de hablar. Antes esto
+  // solo actualizaba el texto en pantalla; el avatar recién arrancaba al
+  // final (handleVoiceFinal → handleSubmit), por eso se sentía "todo junto
+  // al final" en vez de en tiempo real.
+  const queueLiveToken = useCallback((token) => {
+    setMissedWord('')
+    liveMatchedRef.current = true
+    setTranslateSource('signer3d')
+    if (useSignerRef.current) {
+      signerRef.current?.queue(token)
+    } else {
+      liveQueueBufferRef.current.push(token)
+      useSignerRef.current = true
+      setUseSigner(true)
+    }
+  }, [])
+
   const handleLiveWord = useCallback((rawWord) => {
     const cleaned = String(rawWord || '').trim()
     if (!cleaned) return
@@ -180,17 +263,61 @@ export default function TranslationScreen({
     setOriginalText((prev) => (prev ? prev + ' ' : '') + cleaned)
     pendingWordRef.current = ''
     setPendingWord('')
-  }, [])
+
+    // normalizeForSearch quita acentos ("cómo"→"como") y puntuación que el
+    // reconocedor de voz suele pegar a la ÚLTIMA palabra de la frase
+    // ("favor." con punto) — sin esto esa palabra nunca calzaba con el token
+    // grabado (comparación exacta y sensible a esto). Es la MISMA
+    // normalización que ya usa tokenize() para el modo de texto — antes el
+    // modo de voz no la usaba, por eso fallaba más seguido.
+    const normalized = normalizeForSearch(cleaned)
+    if (!normalized) return
+    // Combos de hasta 3 palabras (POR_FAVOR, COMO_ESTAS...), mirando la
+    // palabra actual junto con las 1-2 anteriores que aún no combinaron.
+    const candidate = [...pendingWordsRef.current, normalized.toUpperCase()]
+    const hit = tryMatchSuffix(candidate, availableTokensRef.current)
+    if (hit) {
+      queueLiveToken(hit.token)
+      pendingWordsRef.current = candidate.slice(0, candidate.length - hit.consumed)
+      return
+    }
+
+    // Ninguna combinación que termine en la palabra actual coincide. Se
+    // guarda para la próxima (podría ser el INICIO de una seña de 2-3
+    // palabras) — pero si el buffer ya tiene más de 2 pendientes, la más
+    // vieja ya se probó en todas las combinaciones posibles y nunca combinó
+    // con nada: se descarta como "sin seña" en vez de quedar esperando para
+    // siempre.
+    pendingWordsRef.current = candidate
+    if (pendingWordsRef.current.length > 2) {
+      const dropped = pendingWordsRef.current.shift()
+      setMissedWord(dropped)
+    }
+  }, [queueLiveToken])
 
   const handleVoiceFinal = useCallback((text) => {
     pendingWordRef.current = ''
     setPendingWord('')
     setLiveMode(false)
+    // Nadie más viene detrás — cualquier palabra que quedó esperando pareja
+    // (ej. dijiste "por" y ahí terminó, sin "favor") no va a combinar con
+    // nada; se limpia el buffer para la próxima frase.
+    pendingWordsRef.current = []
+    // Si ya se fueron encolando señas en vivo palabra por palabra, no hay que
+    // reprocesar toda la frase de nuevo — signerRef.current.replace(...) (vía
+    // handleSubmit) reiniciaría la cola (duplicados / se salta la del medio) y
+    // además desmontaba el VRM. liveMatchedRef es síncrono (liveMode es async).
+    if (liveMatchedRef.current) {
+      setBusy(false)
+      return
+    }
     if (text?.trim()) handleSubmit(text.trim())
   }, [handleSubmit])
 
   const handlePanelSubmit = useCallback((text) => {
-    if (liveMode) handleVoiceFinal(text)
+    // Ojo: onResult de la voz corre en el MISMO tick que el último onLiveWord.
+    // liveMode (state) aún puede ser false → hay que mirar liveMatchedRef.
+    if (liveMatchedRef.current || liveMode) handleVoiceFinal(text)
     else handleSubmit(text)
   }, [liveMode, handleVoiceFinal, handleSubmit])
 
@@ -227,10 +354,10 @@ export default function TranslationScreen({
         <AppPagePanel>
             <AppPageHeading>
               <div>
-                <SectionLabel color="green">Traducir</SectionLabel>
+                <SectionLabel color="blue">Traducir</SectionLabel>
                 <h1 className="mt-3 text-3xl font-extrabold leading-tight tracking-tight sm:text-4xl">
                   De palabras a{' '}
-                  <span className="inline-block rounded-xl border-2 border-pastel-green-line bg-pastel-green px-2.5 py-0.5 shadow-[0_8px_18px_-8px_rgba(45,42,38,0.35)]">
+                  <span className="inline-block rounded-xl border-2 border-pastel-blue-line bg-pastel-blue px-2.5 py-0.5 shadow-[0_8px_18px_-8px_rgba(45,42,38,0.35)]">
                     {SIGNED_LANG_LABEL}
                   </span>
                 </h1>
@@ -253,7 +380,7 @@ export default function TranslationScreen({
               </AppPageStagger>
             </AppPageHeading>
 
-            <div className="mt-7 grid grid-cols-1 gap-6 lg:grid-cols-12 lg:gap-8">
+            <div className="mt-7 grid grid-cols-1 gap-6 lg:grid-cols-12 lg:items-start lg:gap-8">
               <AppPageStagger className="flex flex-col gap-5 lg:col-span-5">
                 <TextInputPanel
                   ref={inputRef}
@@ -280,20 +407,25 @@ export default function TranslationScreen({
 
                 {wordChips.length > 0 && (
                   <OutputCard
-                    color="green"
+                    color="blue"
                     icon={<SignIcon />}
                     title="Palabras"
                     emptyIcon="sign"
                     empty=""
                     hasContent
                   >
-                    <SignChips signs={wordChips} activeIndex={-1} />
+                    {/* Alto fijo con scroll interno: si esto crece libremente, la
+                        fila del grid crece con él y estira el <canvas> del avatar
+                        (sin relación de aspecto fija) — se veía deformado. */}
+                    <div className="max-h-32 overflow-y-auto pr-1">
+                      <SignChips signs={wordChips} activeIndex={-1} />
+                    </div>
                   </OutputCard>
                 )}
               </AppPageStagger>
 
               <div className="animate-motion-scale-in lg:col-span-7">
-                <div className="relative flex h-full flex-col overflow-hidden rounded-[2rem] border-[3px] border-pastel-green-line bg-pastel-green p-5 shadow-[0_24px_50px_-28px_rgba(148,208,142,0.7)] sm:p-7">
+                <div className="relative flex h-full flex-col overflow-hidden rounded-[2rem] border-[3px] border-pastel-blue-line bg-pastel-blue p-5 shadow-[0_24px_50px_-28px_rgba(147,190,240,0.7)] sm:p-7">
                   <div className="relative mb-4">
                     <p className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-[0.22em] text-pastel-ink/70">
                       <Icon name="eye" className="h-3.5 w-3.5" strokeWidth={2.25} /> Mira aquí
@@ -301,12 +433,12 @@ export default function TranslationScreen({
                     <p className="mt-1 text-xl font-extrabold text-pastel-ink sm:text-2xl">
                       {busy
                         ? 'Generando seña…'
-                        : useSigner
-                          ? `Seña ${SIGNED_LANG_LABEL} (avatar 3D)`
-                          : hasPose3d
-                            ? poseFinished
-                              ? `Seña ${SIGNED_LANG_LABEL} (final)`
-                              : `Seña ${SIGNED_LANG_LABEL} (3D)`
+                        : hasPose3d && !useSigner
+                          ? poseFinished
+                            ? `Seña ${SIGNED_LANG_LABEL} (final)`
+                            : `Seña ${SIGNED_LANG_LABEL} (3D)`
+                          : signerMounted
+                            ? `Seña ${SIGNED_LANG_LABEL} (avatar 3D)`
                             : 'Escribe para ver la animación'}
                     </p>
                   </div>
@@ -317,33 +449,34 @@ export default function TranslationScreen({
                     </p>
                   )}
 
-                  <div className="relative flex flex-1 items-center justify-center rounded-[1.5rem] border-2 border-white/60 bg-[#FAF6EC]/90 p-4 shadow-inner sm:p-6 min-h-[320px]">
-                    <div className="w-full max-w-lg">
-                      {useSigner ? (
-                        <div className="h-[320px] w-full">
-                          <AvatarSigner3D
-                            ref={signerRef}
-                            apiUrl={ML_API_URL}
-                            onFinish={() => setPoseFinished(true)}
-                          />
-                        </div>
-                      ) : hasPose3d ? (
+                  <div className="relative flex min-h-[360px] flex-1 items-center justify-center overflow-hidden rounded-[1.5rem] bg-[#FAF6EC]/90 sm:min-h-[420px]">
+                    {/* Avatar siempre visible (idle) en cuanto hay animaciones / VRM. */}
+                    {signerMounted && !hasPose3d && (
+                      <div className="absolute inset-0 h-full w-full">
+                        <AvatarSignerVRM
+                          ref={signerRef}
+                          apiUrl={ML_API_URL}
+                          onFinish={() => setPoseFinished(true)}
+                        />
+                      </div>
+                    )}
+                    {hasPose3d && !useSigner ? (
+                      <div className="absolute inset-0">
                         <PoseViewer
                           src={poseSrc}
                           onError={handlePoseError}
                           onEnded={() => setPoseFinished(true)}
                         />
-                      ) : (
-                        <div className="flex min-h-[280px] flex-col items-center justify-center rounded-2xl border-2 border-dashed border-pastel-ink/15 bg-white/60 px-6 text-center">
-                          <Icon name="user" className="h-12 w-12 text-pastel-ink/30" strokeWidth={1.5} />
-                          <p className="mt-3 text-sm font-semibold text-pastel-sub">
-                            {busy
-                              ? 'Cargando animación 3D…'
-                              : 'La figura firmando aparecerá aquí'}
-                          </p>
-                        </div>
-                      )}
-                    </div>
+                      </div>
+                    ) : null}
+                    {!signerMounted && !hasPose3d && (
+                      <div className="flex flex-col items-center justify-center px-6 text-center">
+                        <Icon name="user" className="h-12 w-12 text-pastel-ink/30" strokeWidth={1.5} />
+                        <p className="mt-3 text-sm font-semibold text-pastel-sub">
+                          {busy ? 'Cargando animación 3D…' : 'Cargando avatar…'}
+                        </p>
+                      </div>
+                    )}
                   </div>
 
                   {!originalText && !busy && (
@@ -377,7 +510,7 @@ function StatusPill({ variant, children }) {
   const styles = {
     live: 'border-pastel-grape bg-pastel-grape text-white shadow-[0_6px_16px_-6px_rgba(126,100,201,0.6)]',
     busy: 'border-pastel-purple-line bg-pastel-purple text-pastel-grape',
-    count: 'border-pastel-green-line bg-pastel-green text-pastel-ink',
+    count: 'border-pastel-blue-line bg-pastel-blue text-pastel-ink',
   }
   return (
     <span className={'inline-flex items-center gap-1.5 rounded-full border-2 px-3 py-1.5 text-xs font-bold ' + styles[variant]}>
@@ -387,10 +520,10 @@ function StatusPill({ variant, children }) {
 }
 
 function OutputCard({ color, icon, title, empty, emptyIcon, hasContent, children }) {
-  const border = color === 'green'
-    ? 'border-pastel-green-line'
+  const border = color === 'blue'
+    ? 'border-pastel-blue-line'
     : 'border-pastel-ink/10'
-  const bg = color === 'green' ? 'bg-pastel-green/40' : 'bg-white'
+  const bg = color === 'blue' ? 'bg-pastel-blue/40' : 'bg-white'
 
   return (
     <div className={`rounded-[1.5rem] border-2 ${border} ${bg} p-5 shadow-sm`}>
@@ -421,5 +554,5 @@ function TextIcon() {
 }
 
 function SignIcon() {
-  return <Icon name="sign" className="h-5 w-5 text-pastel-grape" strokeWidth={1.75} />
+  return <Icon name="sign" className="h-5 w-5 text-palette-azure" strokeWidth={1.75} />
 }

@@ -851,10 +851,10 @@ export default function InterpretScreen({ onBack, onHome }) {
         <AppPagePanel>
             <AppPageHeading>
               <div>
-                <SectionLabel color="blue">Interpretar</SectionLabel>
+                <SectionLabel color="purple">Interpretar</SectionLabel>
                 <h1 className="mt-3 text-3xl font-extrabold leading-tight tracking-tight sm:text-4xl">
                   De señas a{' '}
-                  <span className="inline-block rounded-xl border-2 border-pastel-blue-line bg-pastel-blue px-2.5 py-0.5 shadow-[0_8px_18px_-8px_rgba(45,42,38,0.35)]">
+                  <span className="inline-block rounded-xl border-2 border-pastel-purple-line bg-pastel-purple px-2.5 py-0.5 shadow-[0_8px_18px_-8px_rgba(45,42,38,0.35)]">
                     texto
                   </span>
                 </h1>
@@ -888,8 +888,8 @@ export default function InterpretScreen({ onBack, onHome }) {
                   className={
                     'relative overflow-hidden rounded-[2rem] border-[3px] shadow-[0_24px_50px_-28px_rgba(147,190,240,0.75)] ' +
                     (running && handVisible
-                      ? 'border-pastel-grape bg-gradient-to-br from-pastel-blue via-pastel-blue to-pastel-purple/40'
-                      : 'border-pastel-blue-line bg-pastel-blue')
+                      ? 'border-pastel-grape bg-gradient-to-br from-pastel-purple via-pastel-purple to-pastel-purple/40'
+                      : 'border-pastel-purple-line bg-pastel-purple')
                   }
                 >
                   {running && displaySign && (
@@ -915,7 +915,7 @@ export default function InterpretScreen({ onBack, onHome }) {
                       >
                         <p className="text-[10px] font-bold uppercase tracking-wider text-pastel-sub">Captura</p>
                         <div className="mt-1 flex items-center gap-2">
-                          <div className="h-2 w-20 overflow-hidden rounded-full bg-pastel-blue/50">
+                          <div className="h-2 w-20 overflow-hidden rounded-full bg-pastel-purple/50">
                             <div
                               ref={bufferBarRef}
                               className="h-full rounded-full"
@@ -959,7 +959,7 @@ export default function InterpretScreen({ onBack, onHome }) {
 
                     {running && !mlMode && !mlConnecting && (
                       <div className="absolute inset-0 flex items-center justify-center bg-pastel-ink/75 p-6 backdrop-blur-sm">
-                        <div className="max-w-sm rounded-2xl border-2 border-pastel-blue-line bg-[#FAF6EC] p-5 text-center shadow-xl">
+                        <div className="max-w-sm rounded-2xl border-2 border-pastel-purple-line bg-[#FAF6EC] p-5 text-center shadow-xl">
                           <Icon name="alert" className="mx-auto h-9 w-9 text-pastel-grape" strokeWidth={1.75} />
                           <p className="mt-2 text-lg font-extrabold text-pastel-ink">Servidor IA no conectado</p>
                           <p className="mt-1 text-xs font-semibold text-pastel-sub">Ejecuta en una terminal:</p>
@@ -1054,13 +1054,10 @@ export default function InterpretScreen({ onBack, onHome }) {
                 )}
 
                 {!running && !history.length && (
-                  <div className="rounded-2xl border-2 border-dashed border-pastel-blue-line bg-pastel-blue/40 px-4 py-4 text-center">
+                  <div className="rounded-2xl border-2 border-dashed border-pastel-purple-line bg-pastel-purple/40 px-4 py-4 text-center">
                     <p className="text-sm font-bold text-pastel-ink">
                       Pulsa <strong className="text-pastel-grape">Empezar a interpretar</strong>.
                       Haz cada seña con movimiento claro. Cuando termines, <strong>quita las manos</strong> del encuadre para confirmar la seña.
-                    </p>
-                    <p className="mt-2 text-xs font-semibold text-pastel-sub">
-                      Señas: HOLA · GRACIAS · BIEN · MAL · COMO ESTAS · SED · NECESITO AYUDA · POR FAVOR · SI · NO · ADIOS · FAMILIA · PERDON
                     </p>
                   </div>
                 )}
@@ -1069,7 +1066,7 @@ export default function InterpretScreen({ onBack, onHome }) {
               <AppPageStagger className="flex flex-col gap-5 lg:col-span-5">
                 <div
                   data-tutorial="interpret-results"
-                  className="motion-surface animate-motion-scale-in rounded-[1.5rem] border-[3px] border-pastel-blue-line bg-white p-5 shadow-[0_16px_36px_-22px_rgba(45,42,38,0.35)] sm:p-6"
+                  className="motion-surface animate-motion-scale-in rounded-[1.5rem] border-[3px] border-pastel-purple-line bg-white p-5 shadow-[0_16px_36px_-22px_rgba(45,42,38,0.35)] sm:p-6"
                 >
                   <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-pastel-grape">Última seña</p>
                   {latest ? (
@@ -1084,7 +1081,7 @@ export default function InterpretScreen({ onBack, onHome }) {
                         </div>
                         <div className="h-2.5 overflow-hidden rounded-full border border-pastel-ink/10 bg-pastel-cream">
                           <div
-                            className="h-full rounded-full bg-gradient-to-r from-pastel-blue-line to-pastel-grape transition-all duration-500"
+                            className="h-full rounded-full bg-gradient-to-r from-pastel-purple-line to-pastel-grape transition-all duration-500"
                             style={{ width: `${confPct}%` }}
                           />
                         </div>
@@ -1112,7 +1109,7 @@ export default function InterpretScreen({ onBack, onHome }) {
                     {history.map((h, i) => (
                       <li
                         key={i}
-                        className="flex items-center gap-3 rounded-xl border-2 border-pastel-blue-line/50 bg-pastel-blue/20 px-3 py-2"
+                        className="flex items-center gap-3 rounded-xl border-2 border-pastel-purple-line/50 bg-pastel-purple/20 px-3 py-2"
                       >
                         <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-white text-xs font-extrabold text-pastel-grape">
                           {i + 1}
@@ -1146,7 +1143,7 @@ export default function InterpretScreen({ onBack, onHome }) {
 function StatusPill({ variant, children }) {
   const styles = {
     live: 'border-pastel-grape bg-pastel-grape text-white shadow-[0_6px_16px_-6px_rgba(126,100,201,0.6)]',
-    count: 'border-pastel-blue-line bg-pastel-blue text-pastel-ink',
+    count: 'border-pastel-purple-line bg-pastel-purple text-pastel-ink',
   }
   return (
     <span className={'inline-flex items-center gap-1.5 rounded-full border-2 px-3 py-1.5 text-xs font-bold ' + styles[variant]}>
@@ -1201,7 +1198,7 @@ function OutputCard({ title, empty, emptyIcon, hasContent, children }) {
 function CameraPermissionPrompt({ onAccept, onDecline }) {
   return (
     <div className="absolute inset-0 z-30 flex animate-permission-overlay-in items-center justify-center overflow-y-auto bg-pastel-ink/78 p-3 sm:p-5">
-      <div className="my-auto w-full max-w-sm animate-permission-card-in rounded-2xl border-2 border-pastel-blue-line bg-[#FAF6EC] p-4 text-center shadow-xl sm:p-5">
+      <div className="my-auto w-full max-w-sm animate-permission-card-in rounded-2xl border-2 border-pastel-purple-line bg-[#FAF6EC] p-4 text-center shadow-xl sm:p-5">
         <Icon
           name="camera"
           className="animate-float mx-auto h-8 w-8 text-pastel-grape sm:h-9 sm:w-9"
@@ -1245,7 +1242,7 @@ function CameraPermissionPrompt({ onAccept, onDecline }) {
 function CameraOverlay({ icon, title, subtitle, actionLabel, onAction }) {
   return (
     <div className="absolute inset-0 z-30 flex items-center justify-center overflow-y-auto bg-pastel-ink/78 p-3 text-center backdrop-blur-sm sm:p-5">
-      <div className="my-auto w-full max-w-sm rounded-2xl border-2 border-pastel-blue-line bg-[#FAF6EC] p-4 shadow-xl sm:p-5">
+      <div className="my-auto w-full max-w-sm rounded-2xl border-2 border-pastel-purple-line bg-[#FAF6EC] p-4 shadow-xl sm:p-5">
         <Icon name={icon} className="mx-auto h-9 w-9 text-pastel-grape" strokeWidth={1.75} />
         <p className="mt-3 text-base font-extrabold text-pastel-ink sm:text-lg">{title}</p>
         {subtitle && (

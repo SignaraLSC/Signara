@@ -140,7 +140,13 @@ export default function App() {
         enterClass={motionClass}
         render={(currentScreen) => {
           if (currentScreen === 'landing') {
-            return <LandingScreen onStart={() => navigate('mode')} />
+            return (
+              <LandingScreen
+                onStart={() => navigate('mode')}
+                onStartTranslate={() => navigate('translate')}
+                onStartInterpret={() => navigate('interpret')}
+              />
+            )
           }
           if (currentScreen === 'mode') {
             return (

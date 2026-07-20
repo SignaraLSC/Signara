@@ -6,7 +6,7 @@ const NAV = [
   { id: 'como-funciona', label: 'Cómo funciona', href: '#como-funciona' },
 ]
 
-export default function LandingScreen({ onStart }) {
+export default function LandingScreen({ onStart, onStartTranslate, onStartInterpret }) {
   const [activeNav, setActiveNav] = useState('inicio')
 
   return (
@@ -143,28 +143,28 @@ export default function LandingScreen({ onStart }) {
 
           <div className="motion-stagger mt-12 grid grid-cols-1 gap-6 md:grid-cols-3">
             <FeatureCard
-              color="green"
+              color="blue"
               tag="Voz y texto"
               title="Traducir"
               description="Escribe o habla en español y míralo convertido en señas con un avatar."
               icon={<TranslateIcon />}
-              onStart={onStart}
+              onStart={onStartTranslate || onStart}
             />
             <FeatureCard
-              color="blue"
+              color="purple"
               tag="Cámara + IA"
               title="Interpretar"
               description="Apunta la cámara a las señas y conviértelas en texto o voz al instante."
               icon={<CameraIcon />}
-              onStart={onStart}
+              onStart={onStartInterpret || onStart}
             />
             <FeatureCard
-              color="purple"
+              color="green"
               tag="Animado"
               title="Avatar 3D"
               description="Un avatar realiza las señas con movimientos naturales y fáciles de seguir."
               icon={<AvatarIcon />}
-              onStart={onStart}
+              onStart={onStartTranslate || onStart}
             />
           </div>
         </div>

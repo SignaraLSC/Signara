@@ -355,12 +355,12 @@ body {
 
   .chip {
     @apply inline-flex items-center gap-1.5 rounded-full border-2
-           border-pastel-purple-line bg-pastel-purple/50 px-4 py-1.5
+           border-pastel-blue-line bg-pastel-blue/70 px-4 py-1.5
            text-sm font-bold text-pastel-ink shadow-sm;
   }
 
   .chip-active {
-    @apply border-pastel-grape bg-pastel-grape text-white shadow-[0_8px_20px_-6px_rgba(126,100,201,0.5)];
+    @apply border-palette-azure bg-palette-azure text-white shadow-[0_8px_20px_-6px_rgba(46,124,248,0.5)];
   }
   .gradient-halo {
     @apply bg-clip-text text-transparent;

@@ -1,0 +1,201 @@
+/**
+ * AvatarSignerVRM
+ * Reproduce animaciones de señas grabadas con 00_capture.py, servidas por la
+ * API ML en /sign/{token}, sobre un avatar VRM humanoide (en vez del
+ * esqueleto de puntos que usaba el AvatarSigner3D anterior). Toda la lógica
+ * de conversión landmarks → huesos (solver geométrico, IK de brazo, evitar
+ * torso, orientación de muñeca desde 21 landmarks, dedos, cabeza) viene del
+ * laboratorio `public/vrm-lab/`, portada a src/utils/vrmSolver.js +
+ * vrmBaker.js + vrmPlayer.js.
+ *
+ * API imperativa (via ref): queue(token) · replace([tokens]) · clear()
+ * — igual contrato que el componente anterior, para no tocar TranslationScreen.
+ */
+
+import {
+  forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState,
+} from 'react'
+import * as THREE from 'three'
+import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js'
+import { VRMLoaderPlugin } from '@pixiv/three-vrm'
+import { setIdlePose } from '../utils/vrmIdlePose.js'
+import { createBaker } from '../utils/vrmBaker.js'
+import { playSolverAnim } from '../utils/vrmPlayer.js'
+
+const AVATAR_URL = '/avatar/signara-avatar.vrm'
+
+const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, onFinish }, ref) {
+  const canvasRef = useRef(null)
+  const sceneRef = useRef(null)
+  const vrmRef = useRef(null)
+  const bakerRef = useRef(null)
+  const cacheRef = useRef({}) // token -> dataset crudo de la API
+  const bakeCacheRef = useRef({}) // token -> keyframes ya horneados (evita re-bake lento)
+  const queueRef = useRef([])
+  const playingRef = useRef(false)
+  const cancelPlayRef = useRef(null)
+  const [avatarReady, setAvatarReady] = useState(false)
+  const [avatarError, setAvatarError] = useState(false)
+  const [status, setStatus] = useState('idle') // 'idle' | 'loading' | 'playing' (de una seña)
+  const [everPlayed, setEverPlayed] = useState(false)
+
+  const fetchDataset = useCallback(async (token) => {
+    if (cacheRef.current[token]) return cacheRef.current[token]
+    const res = await fetch(`${apiUrl}/sign/${token}`)
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const data = await res.json()
+    cacheRef.current[token] = data
+    return data
+  }, [apiUrl])
+
+  // ─── Init escena + carga del VRM ────────────────────────────────────────
+  useEffect(() => {
+    const canvas = canvasRef.current
+    if (!canvas) return
+    let cancelled = false
+
+    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true })
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
+    const w = canvas.clientWidth, h = canvas.clientHeight
+    renderer.setSize(w, h, false)
+
+    const scene = new THREE.Scene()
+    const camera = new THREE.PerspectiveCamera(32, w / h, 0.1, 20)
+
+    // Cámara fija — encuadre cerrado a medio cuerpo (pecho/cara), no de
+    // cuerpo entero, para que la seña se vea grande y clara.
+    const target = new THREE.Vector3(0, 1.3, 0)
+    const R = 1.85
+    camera.position.set(target.x, target.y + 0.05, target.z + R)
+    camera.lookAt(target)
+
+    scene.add(new THREE.AmbientLight(0xffffff, 0.8))
+    const key = new THREE.DirectionalLight(0xfff5e8, 1.0)
+    key.position.set(1.5, 3, 4)
+    scene.add(key)
+    const fill = new THREE.DirectionalLight(0x88aaff, 0.35)
+    fill.position.set(-3, 1, -2)
+    scene.add(fill)
+
+    sceneRef.current = { scene, camera, renderer }
+
+    let lastMs = performance.now()
+    let animId
+    const render = () => {
+      animId = requestAnimationFrame(render)
+      const nowMs = performance.now()
+      if (vrmRef.current) vrmRef.current.update((nowMs - lastMs) / 1000)
+      lastMs = nowMs
+      renderer.render(scene, camera)
+    }
+    render()
+
+    const loader = new GLTFLoader()
+    loader.register((parser) => new VRMLoaderPlugin(parser))
+    loader.loadAsync(AVATAR_URL).then((gltf) => {
+      if (cancelled) return
+      const vrm = gltf.userData.vrm
+      scene.add(vrm.scene)
+      setIdlePose(vrm)
+      vrmRef.current = vrm
+      bakerRef.current = createBaker(vrm)
+      setAvatarReady(true)
+    }).catch((e) => {
+      console.error(e)
+      if (!cancelled) setAvatarError(true)
+    })
+
+    const onResize = () => {
+      const w2 = canvas.clientWidth, h2 = canvas.clientHeight
+      if (!w2 || !h2) return
+      renderer.setSize(w2, h2, false)
+      camera.aspect = w2 / h2
+      camera.updateProjectionMatrix()
+    }
+    window.addEventListener('resize', onResize)
+    return () => {
+      cancelled = true
+      cancelAnimationFrame(animId)
+      window.removeEventListener('resize', onResize)
+      renderer.dispose()
+      sceneRef.current = null
+      vrmRef.current = null
+      bakerRef.current = null
+    }
+  }, [])
+
+  const processQueue = useCallback(async () => {
+    if (playingRef.current) return
+    if (queueRef.current.length === 0) { setStatus('idle'); onFinish?.(); return }
+    if (!vrmRef.current || !bakerRef.current) return // el avatar aún está cargando; reintenta cuando termine
+    playingRef.current = true
+    const token = queueRef.current.shift()
+    onSign?.(token)
+    try {
+      setStatus('loading')
+      let keyframes = bakeCacheRef.current[token]
+      if (!keyframes) {
+        const dataset = await fetchDataset(token)
+        keyframes = bakerRef.current.bakeSolver(dataset)
+        bakeCacheRef.current[token] = keyframes
+      }
+      setIdlePose(vrmRef.current)
+      setStatus('playing')
+      setEverPlayed(true)
+      cancelPlayRef.current = playSolverAnim(vrmRef.current, keyframes, () => {
+        playingRef.current = false
+        processQueue()
+      })
+    } catch (e) {
+      console.error(e)
+      playingRef.current = false
+      processQueue()
+    }
+  }, [fetchDataset, onSign, onFinish])
+
+  // Si la cola llegó antes de que el VRM terminara de cargar, reintenta apenas
+  // esté listo (evita perder la primera palabra si el usuario escribe rápido).
+  useEffect(() => {
+    if (avatarReady && queueRef.current.length && !playingRef.current) processQueue()
+  }, [avatarReady, processQueue])
+
+  useImperativeHandle(ref, () => ({
+    queue(token) { if (!token) return; queueRef.current.push(token); processQueue() },
+    replace(tokens) {
+      if (cancelPlayRef.current) cancelPlayRef.current()
+      playingRef.current = false
+      queueRef.current = [...(tokens || [])]
+      processQueue()
+    },
+    clear() {
+      if (cancelPlayRef.current) cancelPlayRef.current()
+      playingRef.current = false
+      queueRef.current = []
+      if (vrmRef.current) setIdlePose(vrmRef.current)
+      setStatus('idle')
+    },
+  }), [processQueue])
+
+  return (
+    <div className="relative h-full w-full overflow-hidden bg-transparent">
+      <canvas ref={canvasRef} className="h-full w-full" style={{ display: 'block' }} />
+      {!avatarReady && !avatarError && (
+        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+          <span className="text-xs text-pastel-sub">Cargando avatar…</span>
+        </div>
+      )}
+      {avatarReady && status === 'loading' && !everPlayed && (
+        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+          <span className="text-xs text-pastel-sub">Cargando animación…</span>
+        </div>
+      )}
+      {avatarError && (
+        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
+          <span className="text-xs text-pastel-pink">No se pudo cargar el avatar 3D</span>
+        </div>
+      )}
+    </div>
+  )
+})
+
+export default AvatarSignerVRM

@@ -14,16 +14,11 @@ import {
 import { INTERPRET_TUTORIAL_STEPS } from '../data/modeTutorialSteps.js'
 import { useModeTutorial } from '../hooks/useModeTutorial.js'
 import { ML_API_URL, checkMlApiHealth, getMlApiCache } from '../utils/mlApi.js'
+import { getSharedHandLandmarker } from '../utils/handLandmarker.js'
 
-const MEDIAPIPE_HOLISTIC_VER = '0.5.1675471629'
-const MEDIAPIPE_CAM_VER      = '0.3.1675466862'
-const MEDIAPIPE_DRAW_VER     = '0.3.1675466124'
-
-const MP_SCRIPTS = [
-  `https://cdn.jsdelivr.net/npm/@mediapipe/holistic@${MEDIAPIPE_HOLISTIC_VER}/holistic.js`,
-  `https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils@${MEDIAPIPE_CAM_VER}/camera_utils.js`,
-  `https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils@${MEDIAPIPE_DRAW_VER}/drawing_utils.js`,
-]
+// Migrado de @mediapipe/holistic (legacy) a @mediapipe/tasks-vision:
+// HandLandmarker con GPU, solo manos. FaceLandmarker se pospuso: no se usa
+// aún en /predict y correrlo cada frame retrasaba los puntos de la mano.
 
 // ── Parámetros (alineados con sign_ai/07_gnn_predict.py) ─────────────────────
 // SEQ_LEN debe coincidir exactamente con sign_ai/core/gnn_model.SEQ_LEN y
@@ -33,13 +28,12 @@ const MP_SCRIPTS = [
 const SEQ_LEN        = 24
 const HAND_COUNT     = 21
 const UMBRAL         = 0.75
-const STABILITY_NEED = 3
+const STABILITY_NEED = 2
 // Atajo de confirmación rápida (solo camino "live", no en el fin-de-seña que
 // ya confirma con 1 sola predicción): si la confianza es muy alta, no hace
-// falta esperar 3 predicciones idénticas en serie (3 RTTs al servidor) — con
-// una sola predicción muy segura alcanza, y se recorta la latencia percibida
-// en señas de movimiento continuo (sin pausa clara) a un tercio.
-const HIGH_CONF_INSTANT = 0.92
+// falta esperar 2 predicciones idénticas en serie — con una sola predicción
+// muy segura alcanza.
+const HIGH_CONF_INSTANT = 0.90
 const NO_HAND_RESET  = 12
 // Tiempo máximo de espera de /predict antes de abortar. Sin esto, si el
 // servidor ML está frío (Render) o la red falla a medias, el fetch podía
@@ -52,7 +46,9 @@ const PREDICT_TIMEOUT_MS = 12000
 // eso la primera seña (hecha con más cuidado/lentitud) se reconocía rápido
 // y las siguientes parecían "esperar hasta 24": en realidad se reiniciaban
 // varias veces hasta que por casualidad el tracking aguantaba sin cortes.
-const NO_HAND_GRACE  = 4
+// Buffer: tolera parpadeos de tracking sin vaciar la seña.
+// El overlay se limpia al instante (ver handleResults) — no “mano pegada”.
+const NO_HAND_GRACE  = 8
 // Pausa CORTA tras confirmar una seña. Antes eran 30 frames (~1 s), lo que
 // hacía imposible encadenar señas para formar frases en tiempo real: tras cada
 // palabra había un segundo muerto. Ahora es apenas un anti-rebote para no
@@ -60,121 +56,93 @@ const NO_HAND_GRACE  = 4
 // una seña sin querer es el reinicio del pico (hay que volver a mover la mano
 // —superar MOVED_MIN— antes de que se pueda confirmar otra).
 const POST_CONFIRM_WAIT = 6
-const MIN_FRAMES     = 8
+// Mínimo de frames reales para mandar a /predict. El modelo espera SEQ_LEN
+// por shape, pero padBuffer remuestrea señas cortas (como en 00_capture.py) —
+// NO hay que esperar a “llenar 24” en pantalla.
+const MIN_FRAMES     = 6
 
-// ── Detección de FIN DE SEÑA (predecir al terminar, no en un conteo fijo) ────
-// El problema con un umbral fijo de "quietud": los landmarks de MediaPipe
-// tiemblan, así que una mano quieta registra micro-movimiento que reinicia el
-// contador y nunca se detecta el final. Solución: umbral ADAPTATIVO relativo
-// al pico de movimiento de ESTA seña. Se considera "detenido" cuando el
-// movimiento cae por debajo de STOP_FRAC del pico (o por debajo de un piso
-// absoluto), durante STOP_FRAMES frames seguidos, y solo si antes hubo un
-// gesto real (el pico superó MOVED_MIN). Así funciona con señas rápidas o
-// lentas y no se engaña con el tembleque.
-const STOP_FRAMES = 3      // frames consecutivos "detenido" para confirmar el fin
-const STOP_FRAC   = 0.4    // detenido si el movimiento < 40% del pico de la seña
-const STOP_ABS    = 0.006  // …o por debajo de este piso absoluto (mano casi quieta)
-const MOVED_MIN   = 0.012  // el pico debe superar esto para contar como "hubo seña"
+// ── Fin de seña (camino principal, tiempo real) ─────────────────────────────
+// Igual que al grabar: haces el gesto con su duración natural y al pausar se
+// confirma. Umbral ADAPTATIVO al pico de movimiento de ESTA seña.
+const STOP_FRAMES = 2      // frames “detenido” para cortar (más ágil en web)
+const STOP_FRAC   = 0.4
+const STOP_ABS    = 0.006
+const MOVED_MIN   = 0.012
 
-// Predicción en vivo (respaldo): si el gesto sigue en movimiento continuo sin
-// detenerse, se evalúa la ventana completa igual (con el control de estabilidad
-// de 3 predicciones seguidas, que evita confirmar de más).
-const LIVE_MIN_FRAMES = SEQ_LEN
+// Respaldo si el gesto no hace pausa: reevaluar en vivo cada LIVE_STRIDE
+// frames nuevos, desde MIN_FRAMES (nunca esperar SEQ_LEN=24).
+const LIVE_STRIDE = 3
 
-// Conexiones MediaPipe para dibujar el esqueleto de la mano (no viene en drawing_utils).
-const HAND_CONNECTIONS = [
-  [0, 1], [1, 2], [2, 3], [3, 4],
-  [0, 5], [5, 6], [6, 7], [7, 8],
-  [5, 9], [9, 10], [10, 11], [11, 12],
-  [9, 13], [13, 14], [14, 15], [15, 16],
-  [13, 17], [0, 17], [17, 18], [18, 19], [19, 20],
-].map(([start, end]) => ({ start, end }))
+// Inferencia: equilibrio velocidad / tracking (izq. sufría a 160×120).
+const DETECT_W = 192
+const DETECT_H = 144
 
-// ── Filtro One-Euro (anti-tembleque) ─────────────────────────────────────────
-// Los landmarks de MediaPipe tiemblan cuando la mano está casi quieta y saltan
-// cuando las dos manos se juntan (el tracker duda). El filtro One-Euro es el
-// estándar para esto: suaviza fuerte a baja velocidad (mata el tembleque) pero
-// deja pasar el movimiento rápido (no arrastra ni retrasa señas veloces), así
-// que no distorsiona la forma del gesto que ve el modelo. Se aplica por mano y
-// se REINICIA cuando la mano desaparece, para que al reaparecer salte al valor
-// nuevo en vez de interpolar desde cero.
-function makeOneEuro({ minCutoff = 1.2, beta = 0.6, dCutoff = 1.0, freq = 30 } = {}) {
-  let xPrev = null, dxPrev = null, tPrev = null
-  const alpha = (cutoff, dt) => {
-    const tau = 1 / (2 * Math.PI * cutoff)
-    return 1 / (1 + tau / dt)
-  }
-  return {
-    reset() { xPrev = null; dxPrev = null; tPrev = null },
-    filter(x, t) {
-      if (xPrev === null) {
-        xPrev = x.slice()
-        dxPrev = x.map(() => 0)
-        tPrev = t
-        return x.slice()
-      }
-      const dt = (t > tPrev) ? (t - tPrev) / 1000 : 1 / freq
-      tPrev = t
-      const aD = alpha(dCutoff, dt)
-      const out = new Array(x.length)
-      for (let i = 0; i < x.length; i++) {
-        const dx = (x[i] - xPrev[i]) / dt
-        const dxHat = dxPrev[i] + aD * (dx - dxPrev[i])
-        const cutoff = minCutoff + beta * Math.abs(dxHat)
-        const a = alpha(cutoff, dt)
-        const xHat = xPrev[i] + a * (x[i] - xPrev[i])
-        out[i] = xHat
-        xPrev[i] = xHat
-        dxPrev[i] = dxHat
-      }
-      return out
-    },
-  }
-}
-
-// 21 landmarks {x,y,z} ⇄ vector plano [63] (para pasar por el filtro).
-function landmarksToVec(lms) {
-  const v = new Array(HAND_COUNT * 3).fill(0)
-  if (lms) {
-    const n = Math.min(lms.length, HAND_COUNT)
-    for (let i = 0; i < n; i++) {
-      v[i * 3]     = lms[i]?.x ?? 0
-      v[i * 3 + 1] = lms[i]?.y ?? 0
-      v[i * 3 + 2] = lms[i]?.z ?? 0
-    }
-  }
-  return v
-}
-function vecToLandmarks(v) {
-  const out = new Array(HAND_COUNT)
-  for (let i = 0; i < HAND_COUNT; i++) {
-    out[i] = { x: v[i * 3], y: v[i * 3 + 1], z: v[i * 3 + 2] }
+// ── Dibujo de la mano: solo puntos (sin líneas del esqueleto). ───────────────
+function copyHandLandmarks(lms) {
+  if (!lms) return null
+  const n = Math.min(lms.length, HAND_COUNT)
+  const out = new Array(n)
+  for (let i = 0; i < n; i++) {
+    const p = lms[i]
+    out[i] = { x: p.x, y: p.y, z: p.z || 0 }
   }
   return out
 }
 
-// ── Script loader ─────────────────────────────────────────────────────────────
-
-function loadScript(url) {
-  return new Promise((resolve, reject) => {
-    let s = document.querySelector(`script[data-signara="${url}"]`)
-    if (s) {
-      if (s.getAttribute('data-loaded') === 'true') return resolve()
-      s.addEventListener('load', resolve)
-      s.addEventListener('error', () => reject(new Error('Failed: ' + url)))
-      return
-    }
-    s = document.createElement('script')
-    s.src = url; s.async = true; s.crossOrigin = 'anonymous'
-    s.dataset.signara = url
-    s.addEventListener('load', () => { s.setAttribute('data-loaded', 'true'); resolve() })
-    s.addEventListener('error', () => reject(new Error('Failed: ' + url)))
-    document.head.appendChild(s)
-  })
+function drawHandDots(ctx, landmarks, { color, radius }) {
+  const w = ctx.canvas.width, h = ctx.canvas.height
+  const r = radius ?? 2.5
+  ctx.fillStyle = color
+  for (const p of landmarks) {
+    if (!p) continue
+    ctx.beginPath()
+    ctx.arc(p.x * w, p.y * h, r, 0, Math.PI * 2)
+    ctx.fill()
+  }
 }
 
-async function loadMediaPipe() {
-  for (const url of MP_SCRIPTS) await loadScript(url)
+// HandLandmarker devuelve `landmarks`/`handedness` como listas paralelas (una
+// mano detectada = un índice en cada una), no separadas en left/right como
+// Holistic. Se reconstruye la misma forma {leftHandLandmarks,
+// rightHandLandmarks} que ya usa TODO el resto del archivo (handleResults,
+// extractLandmarks) — así el resto del pipeline no necesita tocarse.
+// `categoryName` ('Left'/'Right') es la misma clasificación de "mano
+// anatómica" que ya devolvía Holistic (mismo modelo de manos por debajo),
+// así que la corrección de espejo existente sigue aplicando igual.
+function adaptHandResult(res) {
+  let leftHandLandmarks = null, rightHandLandmarks = null
+  const lm = res?.landmarks || []
+  const hd = res?.handedness || []
+  const scored = []
+  for (let i = 0; i < lm.length; i++) {
+    const cat = hd[i]?.[0]
+    scored.push({
+      landmarks: lm[i],
+      label: cat?.categoryName,
+      score: cat?.score ?? 0,
+      x: lm[i]?.[0]?.x ?? 0.5,
+    })
+  }
+  // Primero etiquetas confiables de MediaPipe.
+  for (const h of scored) {
+    if (h.score < 0.35) continue
+    if (h.label === 'Left' && !leftHandLandmarks) leftHandLandmarks = h.landmarks
+    else if (h.label === 'Right' && !rightHandLandmarks) rightHandLandmarks = h.landmarks
+  }
+  // Respaldo: por posición en imagen (x menor = izquierda del frame).
+  // Evita perder la mano izq. cuando handedness falla o score baja.
+  if (scored.length === 1) {
+    const h = scored[0]
+    if (!leftHandLandmarks && !rightHandLandmarks) {
+      if (h.x < 0.5) leftHandLandmarks = h.landmarks
+      else rightHandLandmarks = h.landmarks
+    }
+  } else if (scored.length >= 2 && (!leftHandLandmarks || !rightHandLandmarks)) {
+    const sorted = [...scored].sort((a, b) => a.x - b.x)
+    if (!leftHandLandmarks) leftHandLandmarks = sorted[0].landmarks
+    if (!rightHandLandmarks) rightHandLandmarks = sorted[sorted.length - 1].landmarks
+  }
+  return { leftHandLandmarks, rightHandLandmarks }
 }
 
 // ── Extracción de landmarks ───────────────────────────────────────────────────
@@ -253,13 +221,14 @@ function frameMovement(prev, curr) {
 export default function InterpretScreen({ onBack, onHome }) {
   const videoRef     = useRef(null)
   const canvasRef    = useRef(null)
-  const holisticRef  = useRef(null)
-  const cameraRef    = useRef(null)
+  const handLandmarkerRef = useRef(null)
+  const mediaStreamRef    = useRef(null)
+  const detectRafRef      = useRef(null)
   const runningRef   = useRef(false)
   const audioRef     = useRef(true)
 
   // Pipeline refs (sin re-render)
-  const landmarkBufferRef = useRef([])   // frames con movimiento, maxlen=SEQ_LEN
+  const landmarkBufferRef = useRef([])   // frames del gesto en curso (máx SEQ_LEN)
   const predHistRef       = useRef([])   // historial de predicciones para estabilidad
   const prevFrameRef      = useRef(null) // frame anterior para calcular movimiento
   const noHandCountRef    = useRef(0)    // frames consecutivos sin manos
@@ -267,10 +236,7 @@ export default function InterpretScreen({ onBack, onHome }) {
   const peakMovementRef   = useRef(0)    // pico de movimiento de la seña en curso (umbral adaptativo)
   const cooldownRef       = useRef(0)    // cooldown frame-based
   const lastSignRef       = useRef('')   // última seña confirmada (evita repetir)
-  const lhFilterRef       = useRef(null) // One-Euro mano izq (navegador: right)
-  const rhFilterRef       = useRef(null) // One-Euro mano der (navegador: left)
-  if (!lhFilterRef.current) lhFilterRef.current = makeOneEuro()
-  if (!rhFilterRef.current) rhFilterRef.current = makeOneEuro()
+  const lastLiveAtRef     = useRef(0)    // len del buffer en la última predicción live
   const apiInFlightRef    = useRef(false)
   const mlAvailableRef    = useRef(false)
   const sentenceClearRef  = useRef(null)
@@ -279,9 +245,16 @@ export default function InterpretScreen({ onBack, onHome }) {
   const handVisibleRef      = useRef(false)
   const inCooldownRef       = useRef(false)
   const bufferHudRef        = useRef(null)
-  const bufferBarRef        = useRef(null)
-  const bufferTextRef       = useRef(null)
   const statusTextRef       = useRef(null)
+  const handBadgeRef        = useRef(null)
+  // Última detección (snap inmediato — sin morph que atrase).
+  const drawLeftRef  = useRef(null)
+  const drawRightRef = useRef(null)
+  const detectCanvasRef = useRef(null)
+  const speakQueueRef = useRef([])
+  const speakBusyRef = useRef(false)
+  const speakTimerRef = useRef(null)
+  const spanishVoiceRef = useRef(null)
 
   // UI state
   const [scriptsLoaded, setScriptsLoaded] = useState(false)
@@ -304,7 +277,21 @@ export default function InterpretScreen({ onBack, onHome }) {
   const [sentence,      setSentence]      = useState([])
 
   useEffect(() => { runningRef.current = running }, [running])
-  useEffect(() => { audioRef.current   = audioOn  }, [audioOn])
+  useEffect(() => {
+    audioRef.current = audioOn
+    if (!audioOn) stopSpeech()
+  }, [audioOn])
+
+  // Chrome carga voces de forma async; calentar lista para acertar es-ES.
+  useEffect(() => {
+    const warm = () => { pickSpanishVoice() }
+    warm()
+    window.speechSynthesis?.addEventListener?.('voiceschanged', warm)
+    return () => {
+      window.speechSynthesis?.removeEventListener?.('voiceschanged', warm)
+      stopSpeech()
+    }
+  }, [])
 
   // ── Verificar API ML ───────────────────────────────────────────────────────
   useEffect(() => {
@@ -329,76 +316,70 @@ export default function InterpretScreen({ onBack, onHome }) {
     return () => { cancelled = true }
   }, [])
 
-  // ── Cargar MediaPipe ───────────────────────────────────────────────────────
+  // ── HandLandmarker (singleton: no re-descargar al remount) ─────────────────
   useEffect(() => {
     let cancelled = false
-    loadMediaPipe()
-      .then(() => { if (!cancelled) setScriptsLoaded(true) })
-      .catch(e  => { if (!cancelled) setScriptsError(String(e.message || e)) })
-    return () => { cancelled = true }
+    getSharedHandLandmarker()
+      .then((hand) => {
+        if (cancelled) return
+        handLandmarkerRef.current = hand
+        setScriptsLoaded(true)
+      })
+      .catch((e) => {
+        if (!cancelled) setScriptsError(String(e?.message || e))
+      })
+    return () => {
+      cancelled = true
+      handLandmarkerRef.current = null
+      // No .close(): el singleton se reutiliza en la siguiente visita.
+    }
   }, [])
 
-  // ── Inicializar Holistic + cámara (solo tras consentimiento del usuario) ───
+  // ── Cámara (solo tras consentimiento del usuario) ──────────────────────────
+  // Ya no depende de @mediapipe/camera_utils (esa librería CDN tampoco se
+  // carga más) — getUserMedia directo, la detección corre en su propio loop
+  // (ver "Detección + dibujo" más abajo), no atada al ritmo de la cámara.
   useEffect(() => {
     if (!scriptsLoaded || cameraConsent !== 'accepted') return
-    const HolisticCtor = window.Holistic
-    const CameraCtor   = window.Camera
-    if (!HolisticCtor || !CameraCtor) {
-      setScriptsError('MediaPipe no se cargó correctamente.')
-      return
-    }
     const videoEl = videoRef.current
     if (!videoEl) return
+    let cancelled = false
 
-    const holistic = new HolisticCtor({
-      locateFile: f =>
-        `https://cdn.jsdelivr.net/npm/@mediapipe/holistic@${MEDIAPIPE_HOLISTIC_VER}/${f}`
-    })
-    holistic.setOptions({
-      modelComplexity:        0,
-      // 00_capture.py (con el que se grabaron los datos de entrenamiento) usa
-      // el filtro de suavizado temporal de MediaPipe por defecto (True). Acá
-      // estaba apagado — eso desalinea el ruido/tembleque de los landmarks en
-      // vivo respecto a los datos con los que se entrenó el modelo.
-      smoothLandmarks:        true,
-      enableSegmentation:     false,
-      refineFaceLandmarks:    false,
-      // Alineado con min_detection_confidence/min_tracking_confidence=0.6 de
-      // 00_capture.py. Bajar minTrackingConfidence de 0.65 a 0.6 hace que
-      // MediaPipe no suelte el tracking de la mano ante frames ligeramente
-      // ruidosos, reduciendo el parpadeo que cortaba el buffer a la mitad.
-      minDetectionConfidence: 0.6,
-      minTrackingConfidence:  0.6,
-    })
-    holistic.onResults((results) => handleResultsRef.current(results))
-    holisticRef.current = holistic
-
-    const camera = new CameraCtor(videoEl, {
-      onFrame: async () => {
-        if (!holisticRef.current || videoEl.readyState < 2) return
-        try {
-          await holisticRef.current.send({ image: videoEl })
-        } catch (_) {
-          // ignorar frame fallido
-        }
+    navigator.mediaDevices.getUserMedia({
+      video: {
+        // Preview bajo: menos decode/composición; MediaPipe ya ve 160×120.
+        width: { ideal: 320, max: 480 },
+        height: { ideal: 240, max: 360 },
+        frameRate: { ideal: 30, max: 30 },
+        facingMode: 'user',
       },
-      width: 480, height: 360,
     })
-    cameraRef.current = camera
-
-    camera.start()
-      .then(() => setCameraOk(true))
-      .catch(e => setCameraError(
+      .then((stream) => {
+        if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return }
+        mediaStreamRef.current = stream
+        const track = stream.getVideoTracks()[0]
+        if (track?.applyConstraints) {
+          track.applyConstraints({
+            width: { ideal: 320, max: 480 },
+            height: { ideal: 240, max: 360 },
+            frameRate: { ideal: 30, max: 30 },
+          }).catch(() => {})
+        }
+        videoEl.srcObject = stream
+        return videoEl.play()
+      })
+      .then(() => { if (!cancelled) setCameraOk(true) })
+      .catch((e) => setCameraError(
         e?.name === 'NotAllowedError'
           ? 'Permiso de cámara denegado. Habilítalo en tu navegador.'
           : 'No se pudo acceder a la cámara.'
       ))
 
     return () => {
-      try { camera.stop()    } catch (_) {}
-      try { holistic.close() } catch (_) {}
-      holisticRef.current = null
-      cameraRef.current   = null
+      cancelled = true
+      mediaStreamRef.current?.getTracks().forEach((t) => t.stop())
+      mediaStreamRef.current = null
+      videoEl.srcObject = null
       setCameraOk(false)
     }
   }, [scriptsLoaded, cameraConsent, cameraRetryKey])
@@ -423,15 +404,101 @@ export default function InterpretScreen({ onBack, onHome }) {
   }
 
   // ── Voz ───────────────────────────────────────────────────────────────────
-  function speak(text) {
-    if (!audioRef.current || !text) return
-    if (!window?.speechSynthesis) return
+  // Cola (no cancel+speak): en Chrome, cancel() seguido de speak() en el mismo
+  // tick deja caer frases — sobre todo cortas como "no" / "sí". Cada seña
+  // confirmada debe oírse siempre.
+  function pickSpanishVoice() {
+    if (spanishVoiceRef.current) return spanishVoiceRef.current
     try {
-      window.speechSynthesis.cancel()
+      const voices = window.speechSynthesis?.getVoices?.() || []
+      const es = voices.find((v) => /^es(-|_)/i.test(v.lang))
+        || voices.find((v) => /spanish|español/i.test(v.name))
+      if (es) spanishVoiceRef.current = es
+    } catch (_) { /* ignore */ }
+    return spanishVoiceRef.current
+  }
+
+  function flushSpeakQueue() {
+    if (speakBusyRef.current) return
+    if (!audioRef.current || !window?.speechSynthesis) {
+      speakQueueRef.current = []
+      return
+    }
+    const item = speakQueueRef.current.shift()
+    if (!item) return
+    const text = typeof item === 'string' ? item : item.text
+    const attempt = typeof item === 'string' ? 0 : (item.attempt || 0)
+
+    speakBusyRef.current = true
+    let started = false
+    let finished = false
+    try {
+      // Chrome a veces deja speechSynthesis en paused=true sin audio.
+      window.speechSynthesis.resume()
       const u = new window.SpeechSynthesisUtterance(text)
-      u.lang = 'es-ES'; u.rate = 1; u.pitch = 1
+      u.lang = 'es-ES'
+      u.rate = 1
+      u.pitch = 1
+      const voice = pickSpanishVoice()
+      if (voice) u.voice = voice
+
+      const done = () => {
+        if (finished) return
+        finished = true
+        speakBusyRef.current = false
+        if (speakTimerRef.current) clearTimeout(speakTimerRef.current)
+        // Respiro entre palabras: evita el bug de cola en Chrome.
+        speakTimerRef.current = setTimeout(() => flushSpeakQueue(), 40)
+      }
+      u.onstart = () => { started = true }
+      u.onend = done
+      u.onerror = done
       window.speechSynthesis.speak(u)
-    } catch (e) { console.warn(e) }
+
+      // Si Chrome traga speak() sin start/end (frases cortas / estado raro),
+      // reintentar hasta 2 veces — no debe perderse ninguna seña.
+      if (speakTimerRef.current) clearTimeout(speakTimerRef.current)
+      speakTimerRef.current = setTimeout(() => {
+        if (finished) return
+        if (started || window.speechSynthesis.speaking || window.speechSynthesis.pending) {
+          return // onend cerrará
+        }
+        finished = true
+        speakBusyRef.current = false
+        if (attempt < 2) {
+          try { window.speechSynthesis.cancel(); window.speechSynthesis.resume() } catch (_) { /* ignore */ }
+          speakQueueRef.current.unshift({ text, attempt: attempt + 1 })
+          speakTimerRef.current = setTimeout(() => flushSpeakQueue(), 80)
+        } else {
+          flushSpeakQueue()
+        }
+      }, 400)
+    } catch (e) {
+      console.warn(e)
+      speakBusyRef.current = false
+      flushSpeakQueue()
+    }
+  }
+
+  function speak(text) {
+    const t = String(text || '').trim()
+    if (!audioRef.current || !t) return
+    if (!window?.speechSynthesis) return
+    speakQueueRef.current.push(t)
+    flushSpeakQueue()
+  }
+
+  function stopSpeech() {
+    speakQueueRef.current = []
+    speakBusyRef.current = false
+    if (speakTimerRef.current) {
+      clearTimeout(speakTimerRef.current)
+      speakTimerRef.current = null
+    }
+    try {
+      window.speechSynthesis?.cancel()
+      window.speechSynthesis?.resume()
+    } catch (_) { /* ignore */ }
   }
 
   // ── Confirmar seña ────────────────────────────────────────────────────────
@@ -446,21 +513,16 @@ export default function InterpretScreen({ onBack, onHome }) {
     speak(text)
   }
 
-  function updateCaptureHud(len, { showHud, status }) {
+  function updateCaptureHud(_len, { showHud, status }) {
     if (statusTextRef.current && status) {
       statusTextRef.current.textContent = status
     }
+    // Solo opacidad: el hueco del HUD está siempre reservado → la card de
+    // cámara no baja ni salta entre seña y seña.
     if (!bufferHudRef.current) return
-    bufferHudRef.current.style.display = showHud ? 'block' : 'none'
-    if (!showHud) return
-    const pct = Math.min(100, (len / LIVE_MIN_FRAMES) * 100)
-    if (bufferBarRef.current) {
-      bufferBarRef.current.style.width = `${pct}%`
-      bufferBarRef.current.style.background = len >= LIVE_MIN_FRAMES ? '#94D08E' : '#E9CF7E'
-    }
-    if (bufferTextRef.current) {
-      bufferTextRef.current.textContent = `${len}/${LIVE_MIN_FRAMES}`
-    }
+    bufferHudRef.current.style.opacity = showHud ? '1' : '0'
+    bufferHudRef.current.dataset.active = showHud ? '1' : '0'
+    bufferHudRef.current.setAttribute('aria-hidden', showHud ? 'false' : 'true')
   }
 
   // Solo toca refs y setState setters (identidades estables) → useCallback
@@ -474,9 +536,11 @@ export default function InterpretScreen({ onBack, onHome }) {
     lastSignRef.current       = ''
     cooldownRef.current       = 0
     apiInFlightRef.current    = false
+    lastLiveAtRef.current     = 0
     handVisibleRef.current    = false
-    lhFilterRef.current?.reset()
-    rhFilterRef.current?.reset()
+    drawLeftRef.current = null
+    drawRightRef.current = null
+    if (handBadgeRef.current) handBadgeRef.current.style.display = 'none'
     setHandVisible(false)
     setBufferLen(0)
     setInCooldown(false)
@@ -494,6 +558,7 @@ export default function InterpretScreen({ onBack, onHome }) {
     prevFrameRef.current      = null
     stillCountRef.current     = 0
     peakMovementRef.current   = 0
+    lastLiveAtRef.current     = 0
 
     setDisplaySign(prediction)
     setDisplayConf(confidence)
@@ -585,72 +650,31 @@ export default function InterpretScreen({ onBack, onHome }) {
     const video  = videoRef.current
     if (!canvas || !video) return
 
-    const w = video.videoWidth  || 480
-    const h = video.videoHeight || 360
-    if (canvas.width !== w) canvas.width = w
-    if (canvas.height !== h) canvas.height = h
-    const ctx = canvas.getContext('2d')
-    ctx.save()
-    ctx.clearRect(0, 0, canvas.width, canvas.height)
-
     const hasLeft  = !!results.leftHandLandmarks
     const hasRight = !!results.rightHandLandmarks
     const hasHands = hasLeft || hasRight
 
-    // ── Suavizado One-Euro (anti-tembleque) — SOLO para DIBUJAR ──────────────
-    // Importante: el filtro se aplica únicamente a lo que se ve en pantalla,
-    // NO a lo que recibe el modelo. El modelo se entrenó con el suavizado
-    // propio de MediaPipe (00_capture.py), no con One-Euro encima; filtrarle
-    // la entrada le bajaba los picos de movimiento y le corría la señal, y
-    // empeoraba el reconocimiento. El reconocedor usa los landmarks crudos.
-    // Se reinicia el filtro de la mano ausente para que al reaparecer no
-    // interpole desde el frame viejo.
-    const now = (typeof performance !== 'undefined' ? performance.now() : Date.now())
-    let leftLm = null, rightLm = null
-    if (hasLeft) {
-      leftLm = vecToLandmarks(rhFilterRef.current.filter(landmarksToVec(results.leftHandLandmarks), now))
-    } else {
-      rhFilterRef.current.reset()
-    }
-    if (hasRight) {
-      rightLm = vecToLandmarks(lhFilterRef.current.filter(landmarksToVec(results.rightHandLandmarks), now))
-    } else {
-      lhFilterRef.current.reset()
-    }
-
-    // ── Solo dibuja manos (igual que 07_gnn_predict.py) ─────────────────────
-    const drawConn = window.drawConnectors
-    const drawLm   = window.drawLandmarks
-    if (drawConn && drawLm) {
-      try {
-        if (leftLm) {
-          drawConn(ctx, leftLm, HAND_CONNECTIONS,
-            { color: '#3b82f6', lineWidth: 3 })
-          drawLm(ctx, leftLm,
-            { color: '#60a5fa', lineWidth: 1, radius: 3 })
-        }
-        if (rightLm) {
-          drawConn(ctx, rightLm, HAND_CONNECTIONS,
-            { color: '#9333ea', lineWidth: 3 })
-          drawLm(ctx, rightLm,
-            { color: '#c084fc', lineWidth: 1, radius: 3 })
-        }
-      } catch (e) {
-        console.warn('Error dibujando landmarks:', e)
-      }
-    }
-
-    ctx.restore()
+    // Overlay: siempre el frame actual. Sin manos → puntos fuera YA
+    // (antes NO_HAND_GRACE los dejaba “pegados” ~1 s).
+    drawLeftRef.current = hasLeft ? copyHandLandmarks(results.leftHandLandmarks) : null
+    drawRightRef.current = hasRight ? copyHandLandmarks(results.rightHandLandmarks) : null
 
     const wasHandVisible = handVisibleRef.current
     handVisibleRef.current = hasHands
-    if (wasHandVisible !== hasHands) setHandVisible(hasHands)
+    if (wasHandVisible !== hasHands) {
+      // Solo al aparecer/desaparecer (raro), no cada frame.
+      setHandVisible(hasHands)
+      if (handBadgeRef.current) {
+        handBadgeRef.current.style.display = hasHands ? '' : 'none'
+      }
+    }
 
     if (cooldownRef.current > 0) cooldownRef.current--
 
     const cooling = cooldownRef.current > 0
     if (inCooldownRef.current !== cooling) {
       inCooldownRef.current = cooling
+      // Cooldown es raro (tras confirmar seña); ahí sí podemos pintar React.
       setInCooldown(cooling)
     }
 
@@ -658,10 +682,8 @@ export default function InterpretScreen({ onBack, onHome }) {
     if (!hasHands) {
       noHandCountRef.current++
 
-      // Parpadeo momentáneo en medio de un gesto: no tocar el buffer, solo
-      // saltar el frame. MediaPipe casi siempre recupera el tracking en 1-3
-      // frames; tratarlo como "se acabó la seña" de una vez rompe capturas
-      // válidas a la mitad.
+      // Parpadeo momentáneo: conservar BUFFER para no romper la seña, pero
+      // los puntos ya se limpiaron arriba (no se quedan pegados).
       if (handWasVisibleRef.current && noHandCountRef.current < NO_HAND_GRACE) {
         const status = mlMode ? 'Detectando…' : 'Servidor IA no conectado'
         updateCaptureHud(landmarkBufferRef.current.length, { showHud: true, status })
@@ -677,6 +699,7 @@ export default function InterpretScreen({ onBack, onHome }) {
       prevFrameRef.current      = null
       stillCountRef.current     = 0
       peakMovementRef.current   = 0
+      lastLiveAtRef.current     = 0
       handWasVisibleRef.current = false
 
       const status = !runningRef.current
@@ -730,10 +753,8 @@ export default function InterpretScreen({ onBack, onHome }) {
       if (movement < stopThreshold) stillCountRef.current++
       else stillCountRef.current = 0
 
-      // Fin de seña: hubo un gesto real (el pico superó MOVED_MIN) y el
-      // movimiento lleva STOP_FRAMES por debajo del umbral → terminó. Predice
-      // YA con los frames reales capturados (padBuffer los remuestrea a SEQ_LEN),
-      // sin esperar a llenar la ventana. Se dispara una sola vez por parada.
+      // Fin de seña (principal): gesto real + pausa breve → predice YA con
+      // los frames capturados (padBuffer → SEQ_LEN). No espera 24.
       if (
         !cooling && !apiInFlightRef.current &&
         gestureHappened &&
@@ -743,30 +764,101 @@ export default function InterpretScreen({ onBack, onHome }) {
         const snapshot = [...landmarkBufferRef.current]
         landmarkBufferRef.current = []
         peakMovementRef.current   = 0
+        lastLiveAtRef.current     = 0
+        stillCountRef.current     = 0
         runPrediction(snapshot, { finalize: true })
       }
-      // Respaldo: si el gesto sigue en movimiento continuo y llena la ventana
-      // sin detenerse, se evalúa igual (el control de estabilidad de 3
-      // predicciones seguidas evita confirmar de más).
-      else if (!cooling && len >= LIVE_MIN_FRAMES) {
+      // Respaldo en movimiento continuo: desde MIN_FRAMES, cada LIVE_STRIDE
+      // frames (estabilidad de 3 predicciones evita falsos positivos).
+      else if (
+        !cooling && !apiInFlightRef.current &&
+        gestureHappened &&
+        len >= MIN_FRAMES &&
+        (len - lastLiveAtRef.current) >= LIVE_STRIDE
+      ) {
+        lastLiveAtRef.current = len
         runPrediction(landmarkBufferRef.current)
       }
     }
 
+    const gesturing = peakMovementRef.current >= MOVED_MIN && stillCountRef.current === 0
     const showHud = runningRef.current && mlAvailableRef.current && len > 0 && !cooling
     const status = !runningRef.current
       ? (cameraOk ? 'Listo' : 'Conectando…')
       : !mlMode
         ? 'Servidor IA no conectado'
-        : len >= LIVE_MIN_FRAMES
-          ? 'Detectando…'
-          : len > 0
-            ? `Capturando… ${len}/${LIVE_MIN_FRAMES}`
+        : gesturing
+          ? 'Escuchando…'
+          : len >= MIN_FRAMES
+            ? 'Pausa para confirmar…'
             : 'Haz la seña'
-    updateCaptureHud(len, { showHud, status })
+    updateCaptureHud(len, { showHud, status, gesturing })
   }
 
   handleResultsRef.current = handleResults
+
+  // ── Detección + dibujo ─────────────────────────────────────────────────────
+  // Detect → paint en el mismo tick (mínima latencia de puntos). Canvas de
+  // inferencia chico (160×120) + cámara ~320p para que MediaPipe no se atrase.
+  useEffect(() => {
+    let lastVideoTime = -1
+    let overlayCtx = null
+    if (!detectCanvasRef.current) {
+      detectCanvasRef.current = document.createElement('canvas')
+      detectCanvasRef.current.width = DETECT_W
+      detectCanvasRef.current.height = DETECT_H
+    }
+    const detectCanvas = detectCanvasRef.current
+    const detectCtx = detectCanvas.getContext('2d', {
+      alpha: false,
+      willReadFrequently: false,
+      desynchronized: true,
+    })
+
+    const loop = (ts) => {
+      detectRafRef.current = requestAnimationFrame(loop)
+      const canvas = canvasRef.current
+      const video = videoRef.current
+      if (!canvas || !video || video.readyState < 2) return
+
+      const hand = handLandmarkerRef.current
+      const t = video.currentTime
+      if (hand && t !== lastVideoTime) {
+        lastVideoTime = t
+        try {
+          detectCtx.drawImage(video, 0, 0, DETECT_W, DETECT_H)
+          const handResult = hand.detectForVideo(detectCanvas, ts)
+          handleResultsRef.current(adaptHandResult(handResult))
+        } catch (e) {
+          console.warn('detectForVideo:', e)
+        }
+      }
+
+      const w = video.videoWidth || 320
+      const h = video.videoHeight || 240
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w
+        canvas.height = h
+        overlayCtx = null
+      }
+      if (!overlayCtx) {
+        overlayCtx = canvas.getContext('2d', { alpha: true, desynchronized: true })
+      }
+      overlayCtx.clearRect(0, 0, w, h)
+      try {
+        if (drawLeftRef.current) {
+          drawHandDots(overlayCtx, drawLeftRef.current, { color: '#60a5fa', radius: 2.5 })
+        }
+        if (drawRightRef.current) {
+          drawHandDots(overlayCtx, drawRightRef.current, { color: '#c084fc', radius: 2.5 })
+        }
+      } catch (e) {
+        console.warn('Error dibujando landmarks:', e)
+      }
+    }
+    detectRafRef.current = requestAnimationFrame(loop)
+    return () => { if (detectRafRef.current) cancelAnimationFrame(detectRafRef.current) }
+  }, [])
 
   // ── Controles ─────────────────────────────────────────────────────────────
   function startDetect() {
@@ -778,7 +870,7 @@ export default function InterpretScreen({ onBack, onHome }) {
 
   function stopDetect() {
     setRunning(false)
-    window?.speechSynthesis?.cancel()
+    stopSpeech()
   }
 
   const handleReset = useCallback(() => {
@@ -792,7 +884,7 @@ export default function InterpretScreen({ onBack, onHome }) {
     setBufferLen(0)
     setInCooldown(false)
     if (sentenceClearRef.current) clearTimeout(sentenceClearRef.current)
-    window?.speechSynthesis?.cancel()
+    stopSpeech()
   }, [resetPipelineState])
 
   function retryMlConnection() {
@@ -814,8 +906,7 @@ export default function InterpretScreen({ onBack, onHome }) {
     if (!mlMode)                   return 'Servidor IA no conectado'
     if (!handVisible)              return 'Muestra una mano'
     if (displaySign && inCooldown) return `${displaySign.replace(/_/g, ' ')} · ${Math.round(displayConf * 100)}%`
-    if (bufferLen >= LIVE_MIN_FRAMES) return 'Detectando…'
-    if (bufferLen > 0)             return `Capturando… ${bufferLen}/${LIVE_MIN_FRAMES}`
+    if (bufferLen > 0)             return 'Escuchando…'
     return 'Haz la seña'
   })()
 
@@ -897,8 +988,8 @@ export default function InterpretScreen({ onBack, onHome }) {
                   )}
 
                   <div className="p-4 pb-0 sm:p-5 sm:pb-0">
-                    <div className="mb-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                      <div>
+                    <div className="mb-3 flex min-h-[3.25rem] items-start justify-between gap-3">
+                      <div className="min-w-0">
                         <p className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-[0.22em] text-pastel-ink/70">
                           <Icon name="camera" className="h-3.5 w-3.5" strokeWidth={2.25} /> Tu cámara
                         </p>
@@ -909,28 +1000,25 @@ export default function InterpretScreen({ onBack, onHome }) {
                           {statusLabel}
                         </p>
                       </div>
+                      {/* Siempre en el layout (opacity); si usáramos display:none
+                          la card saltaba al mostrar/ocultar entre señas. */}
                       <div
                         ref={bufferHudRef}
-                        className="hidden shrink-0 rounded-xl border-2 border-white/60 bg-white/80 px-3 py-2"
+                        data-active="0"
+                        className="flex h-[3.25rem] w-[5.5rem] shrink-0 flex-col items-center justify-center rounded-xl border-2 border-white/60 bg-white/80 px-2 opacity-0 transition-opacity duration-200"
+                        aria-hidden="true"
                       >
-                        <p className="text-[10px] font-bold uppercase tracking-wider text-pastel-sub">Captura</p>
-                        <div className="mt-1 flex items-center gap-2">
-                          <div className="h-2 w-20 overflow-hidden rounded-full bg-pastel-purple/50">
-                            <div
-                              ref={bufferBarRef}
-                              className="h-full rounded-full"
-                              style={{ width: '0%', background: '#E9CF7E' }}
-                            />
-                          </div>
-                          <span ref={bufferTextRef} className="text-xs font-bold tabular-nums text-pastel-ink">
-                            0/{LIVE_MIN_FRAMES}
-                          </span>
+                        <p className="text-[10px] font-bold uppercase tracking-wider text-pastel-sub">En vivo</p>
+                        <div className="live-dots mt-1.5" aria-hidden="true">
+                          <span className="live-dot" />
+                          <span className="live-dot" />
+                          <span className="live-dot" />
                         </div>
                       </div>
                     </div>
                   </div>
 
-                  <div className="relative mx-4 mb-4 aspect-video overflow-hidden rounded-[1.25rem] border-2 border-white/70 bg-black shadow-inner sm:mx-5 sm:mb-5">
+                  <div className="relative mx-4 mb-4 aspect-video overflow-hidden rounded-[1.25rem] border-2 border-dashed border-pastel-ink/15 bg-white shadow-inner sm:mx-5 sm:mb-5 [background-image:radial-gradient(rgba(45,42,38,0.07)_1px,transparent_1px)] [background-size:18px_18px]">
                     <video ref={videoRef} autoPlay playsInline muted
                       className="absolute inset-0 h-full w-full object-cover"
                       style={{ transform: 'scaleX(-1)' }} />
@@ -938,10 +1026,14 @@ export default function InterpretScreen({ onBack, onHome }) {
                       className="absolute inset-0 h-full w-full pointer-events-none"
                       style={{ transform: 'scaleX(-1)' }} />
 
-                    {!scriptsLoaded && !scriptsError && (
+                    {/* MediaPipe se precarga en segundo plano al montar. El
+                        overlay solo aparece DESPUÉS de conceder la cámara, y
+                        únicamente si aún no terminó de cargar — si ya estaba
+                        listo, se salta directo a conectar la cámara. */}
+                    {cameraConsent === 'accepted' && !scriptsLoaded && !scriptsError && (
                       <CameraOverlay icon="clock" title="Cargando MediaPipe…" />
                     )}
-                    {scriptsError && (
+                    {cameraConsent === 'accepted' && scriptsError && (
                       <CameraOverlay icon="alert" title="Error cargando MediaPipe" subtitle={scriptsError} />
                     )}
                     {scriptsLoaded && cameraConsent === 'accepted' && !cameraOk && !cameraError && (
@@ -958,7 +1050,7 @@ export default function InterpretScreen({ onBack, onHome }) {
                     )}
 
                     {running && !mlMode && !mlConnecting && (
-                      <div className="absolute inset-0 flex items-center justify-center bg-pastel-ink/75 p-6 backdrop-blur-sm">
+                      <div className="absolute inset-0 flex items-center justify-center bg-pastel-ink/80 p-6">
                         <div className="max-w-sm rounded-2xl border-2 border-pastel-purple-line bg-[#FAF6EC] p-5 text-center shadow-xl">
                           <Icon name="alert" className="mx-auto h-9 w-9 text-pastel-grape" strokeWidth={1.75} />
                           <p className="mt-2 text-lg font-extrabold text-pastel-ink">Servidor IA no conectado</p>
@@ -985,32 +1077,37 @@ export default function InterpretScreen({ onBack, onHome }) {
                       </div>
                     )}
 
-                    <div className="absolute left-3 top-3 z-20 flex items-center gap-1.5 rounded-xl border-2 border-white/20 bg-black/50 px-2.5 py-1.5 text-xs font-bold text-white backdrop-blur">
+                    <div className="absolute left-3 top-3 z-20 flex items-center gap-1.5 rounded-xl border-2 border-white/20 bg-black/60 px-2.5 py-1.5 text-xs font-bold text-white">
                       <span className={'h-2 w-2 rounded-full ' + (running ? 'bg-red-400 animate-pulse' : cameraOk ? 'bg-green-400' : 'bg-white/50')} />
                       {running ? 'REC' : cameraOk ? 'Lista' : '…'}
                     </div>
-                    {handVisible && (
-                      <div className="absolute right-3 top-3 z-20 rounded-xl border-2 border-pastel-green-line/80 bg-black/55 px-2.5 py-1.5 text-xs font-bold text-pastel-green backdrop-blur">
-                        Manos detectadas
-                      </div>
+                    <div
+                      ref={handBadgeRef}
+                      className="absolute right-3 top-3 z-20 rounded-xl border-2 border-pastel-green-line/80 bg-black/65 px-2.5 py-1.5 text-xs font-bold text-pastel-green"
+                      style={{ display: handVisible ? undefined : 'none' }}
+                    >
+                      Manos detectadas
+                    </div>
+
+                    {/* Estos overlays van DENTRO del recuadro de video (no de la
+                        card completa) para que solo tapen el área de la imagen,
+                        no los controles de abajo (ver "Empezar a interpretar"). */}
+                    {cameraConsent === null && (
+                      <CameraPermissionPrompt
+                        onAccept={acceptCameraPermission}
+                        onDecline={declineCameraPermission}
+                      />
+                    )}
+                    {cameraConsent === 'declined' && !cameraOk && (
+                      <CameraOverlay
+                        icon="camera"
+                        title="Cámara no activada"
+                        subtitle="Sin permiso de cámara no podemos interpretar tus señas. Puedes concederlo cuando quieras."
+                        actionLabel="Conceder permisos"
+                        onAction={acceptCameraPermission}
+                      />
                     )}
                   </div>
-
-                  {scriptsLoaded && cameraConsent === null && (
-                    <CameraPermissionPrompt
-                      onAccept={acceptCameraPermission}
-                      onDecline={declineCameraPermission}
-                    />
-                  )}
-                  {scriptsLoaded && cameraConsent === 'declined' && !cameraOk && (
-                    <CameraOverlay
-                      icon="camera"
-                      title="Cámara no activada"
-                      subtitle="Sin permiso de cámara no podemos interpretar tus señas. Puedes concederlo cuando quieras."
-                      actionLabel="Conceder permisos"
-                      onAction={acceptCameraPermission}
-                    />
-                  )}
 
                   {/* Controles */}
                   <div className="flex flex-wrap items-center gap-3 border-t-2 border-white/40 px-4 py-4 sm:px-5" data-tutorial="interpret-start">
@@ -1088,7 +1185,7 @@ export default function InterpretScreen({ onBack, onHome }) {
                       </div>
                     </>
                   ) : (
-                    <div className="mt-4 flex flex-col items-center rounded-xl border-2 border-dashed border-pastel-ink/10 bg-pastel-cream/50 px-4 py-8 text-center">
+                    <div className="mt-4 flex flex-col items-center rounded-xl border-2 border-dashed border-pastel-ink/15 bg-white px-4 py-8 text-center [background-image:radial-gradient(rgba(45,42,38,0.06)_1px,transparent_1px)] [background-size:16px_16px]">
                       <Icon name="sign" className="h-9 w-9 text-pastel-sub/50" strokeWidth={1.5} />
                       <p className="mt-2 text-sm font-semibold text-pastel-sub">
                         Aquí aparecerá la seña reconocida
@@ -1127,7 +1224,7 @@ export default function InterpretScreen({ onBack, onHome }) {
       </AppPageMain>
 
       <AppPageFooter>
-        <p className="text-xs text-pastel-sub">GNN + LSTM · solo manos · MediaPipe Holistic</p>
+        <p className="text-xs text-pastel-sub">GNN + LSTM · solo manos · MediaPipe Tasks Vision (GPU)</p>
       </AppPageFooter>
 
       <ModeTutorial
@@ -1197,11 +1294,11 @@ function OutputCard({ title, empty, emptyIcon, hasContent, children }) {
 
 function CameraPermissionPrompt({ onAccept, onDecline }) {
   return (
-    <div className="absolute inset-0 z-30 flex animate-permission-overlay-in items-center justify-center overflow-y-auto bg-pastel-ink/78 p-3 sm:p-5">
-      <div className="my-auto w-full max-w-sm animate-permission-card-in rounded-2xl border-2 border-pastel-purple-line bg-[#FAF6EC] p-4 text-center shadow-xl sm:p-5">
+    <div className="camera-ambient-bg absolute inset-0 z-30 flex animate-permission-overlay-in items-center justify-center overflow-y-auto p-3 sm:p-5">
+      <div className="my-auto w-full max-w-sm animate-permission-card-in rounded-2xl border-2 border-dashed border-pastel-ink/15 bg-white/95 p-4 text-center sm:p-5">
         <Icon
           name="camera"
-          className="animate-float mx-auto h-8 w-8 text-pastel-grape sm:h-9 sm:w-9"
+          className="animate-float mx-auto h-8 w-8 text-pastel-sub/60 sm:h-9 sm:w-9"
           strokeWidth={1.75}
           style={{ animationDuration: '3.5s' }}
         />
@@ -1241,12 +1338,12 @@ function CameraPermissionPrompt({ onAccept, onDecline }) {
 
 function CameraOverlay({ icon, title, subtitle, actionLabel, onAction }) {
   return (
-    <div className="absolute inset-0 z-30 flex items-center justify-center overflow-y-auto bg-pastel-ink/78 p-3 text-center backdrop-blur-sm sm:p-5">
-      <div className="my-auto w-full max-w-sm rounded-2xl border-2 border-pastel-purple-line bg-[#FAF6EC] p-4 shadow-xl sm:p-5">
-        <Icon name={icon} className="mx-auto h-9 w-9 text-pastel-grape" strokeWidth={1.75} />
-        <p className="mt-3 text-base font-extrabold text-pastel-ink sm:text-lg">{title}</p>
+    <div className="camera-ambient-bg absolute inset-0 z-30 flex items-center justify-center overflow-y-auto p-4 text-center sm:p-6">
+      <div className="my-auto flex w-full max-w-sm flex-col items-center px-2">
+        <Icon name={icon} className="h-9 w-9 text-pastel-sub/50" strokeWidth={1.5} />
+        <p className="mt-3 text-sm font-semibold text-pastel-sub sm:text-base">{title}</p>
         {subtitle && (
-          <p className="mt-2 text-xs font-semibold leading-relaxed text-pastel-sub sm:text-sm">{subtitle}</p>
+          <p className="mt-2 text-xs font-semibold leading-relaxed text-pastel-sub/80 sm:text-sm">{subtitle}</p>
         )}
         {actionLabel && onAction && (
           <button

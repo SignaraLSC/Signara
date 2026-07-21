@@ -1,5 +1,5 @@
 /**
- * Traduce texto español → animación 3D LSM (pose-viewer).
+ * Traduce texto español → animación 3D LSC (pose-viewer).
  */
 
 import { fetchPoseBlobUrl } from './poseApi.js'

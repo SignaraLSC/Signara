@@ -51,7 +51,7 @@ export default function ModeSelection({ onSelect, onBack }) {
                 title="Traducir"
                 headline="Habla o escribe, el avatar señará por ti"
                 description="Convierte texto o voz en lengua de señas con un avatar animado en tiempo real."
-                features={['Entrada por texto', 'Micrófono en vivo', 'Avatar personalizable']}
+                features={['Entrada por texto', 'Micrófono en vivo', 'Traducción inmediata']}
                 icon={<TranslateIcon />}
                 cta="Empezar a traducir"
                 onClick={() => onSelect('translate')}

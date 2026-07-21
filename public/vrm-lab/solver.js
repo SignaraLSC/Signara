@@ -39,11 +39,19 @@ export const CONFIG = {
   // ── Cabeza (Fase 3) ── nariz/orejas ya vienen en pose_world (33 puntos),
   // no hace falta grabar nada extra. Ejes por calibrar con el panel 🔧 Cabeza.
   headYawAxis:   'y',  // eje de girar la cabeza de lado a lado (NO)
-  headPitchAxis: 'x',  // eje de asentir arriba/abajo (SÍ)
+  headPitchAxis: 'x',  // eje de asentir / alzar (arriba-abajo)
   headYawSign:   1,
-  headPitchSign: 1,
-  headGain:      1.3,  // el movimiento de cabeza real es sutil; se amplifica un poco
+  // VRM: +X en la cabeza baja la barbilla; MediaPipe “nariz arriba” debe
+  // mapear a alzar → signo negativo.
+  headPitchSign: -1,
+  headGain:      2.2,  // MediaPipe da pitch muy pequeño; amplificar para que se vea
   headSmooth:    0.5,
+  // Si la mano entra en la zona cara/cuello (SED, etc.), se suma este alza
+  // máximo de cabeza (rad) en pitch (X). General: sin lista de tokens.
+  headNeckAssist: 0.75,
+  headNeckAssistTokens: ['TENGO_SED'],
+  // Atracción a la garganta; fade temporal en el baker evita tirón al salir.
+  wristNeckPull: 0.42,
 
   // ── Dedos (Fase 2) ──
   fingerGain: 1.0,   // escala del doblez de dedos (1 = ángulo real)

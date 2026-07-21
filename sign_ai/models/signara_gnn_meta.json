@@ -1,6 +1,6 @@
 {
   "normalize_inputs": true,
-  "best_val_acc": 95.65,
+  "best_val_acc": 92.59,
   "classes": [
     "ADIOS",
     "BIEN",
@@ -14,7 +14,10 @@
     "NO",
     "PERDON",
     "POR_FAVOR",
+    "PRUEBA_MUNECA",
     "SED",
-    "SI"
+    "SI",
+    "TENGO_SED",
+    "TE_AMO"
   ]
 }

@@ -22,12 +22,13 @@ import {
   trimTrailOut,
 } from './vrmSolver.js'
 import { setIdlePose } from './vrmIdlePose.js'
+import { smoothFaceSeq, lerpExpr, NEUTRAL_EXPR } from './vrmFaceSolver.js'
 
 export function createBaker(vrm) {
   const getBone = (n) => vrm.humanoid.getNormalizedBoneNode(n)
 
-  const LEAD_IN_MS = 400 // duración de la entrada suave reposo → seña
-  const SIGN_SLOWDOWN = 1.5 // el cuerpo de la seña se reproduce más lento (natural)
+  const LEAD_IN_MS = 280 // entrada reposo → seña (antes 400 ms se sentía lenta)
+  const SIGN_SLOWDOWN = 1.0 // ritmo del grabado (antes 1.15 se sentía “arrastrado”)
 
   // Apunta `bone` para que su "hacia el hijo" mire a targetWorld (Vector3).
   function aimBone(bone, childBone, targetWorld) {
@@ -231,6 +232,55 @@ export function createBaker(vrm) {
       const off = T.clone().sub(C_avatar)
       return Math.abs(off.x) < TORSO_HALF_WIDTH && off.y < TORSO_UP && off.y > -TORSO_DOWN && off.z < TORSO_MIN_FWD
     }
+    // Ramp 0→1 entre a y b (suave; evita cortes duros 0/1).
+    function soft01(v, a, b) {
+      if (b === a) return v >= b ? 1 : 0
+      return Math.max(0, Math.min(1, (v - a) / (b - a)))
+    }
+    // Zona cara/cuello con bordes SUAVES. Antes un umbral duro (p.ej. x>0.18
+    // → weight=0) soltaba de golpe la atracción al cuello y la mano “caía”
+    // en un frame — tirón que rompe SED y similares.
+    function neckZoneFromOffset(wo) {
+      if (!wo || wo.length < 3) return 0
+      const x = Math.abs(wo[0]), y = wo[1], z = wo[2]
+      const wx = 1 - soft01(x, 0.11, 0.24)
+      const wy = soft01(y, -0.01, 0.02) * (1 - soft01(y, 0.26, 0.40))
+      const wz = soft01(z, 0.08, 0.14) * (1 - soft01(z, 0.40, 0.56))
+      return Math.max(0, Math.min(1, wx * wy * wz))
+    }
+    function neckZoneWeight(T, wo) {
+      const fromOff = neckZoneFromOffset(wo)
+      if (fromOff > 0.001) return fromOff
+      const off = T.clone().sub(C_avatar)
+      const nx = Math.abs(off.x) / (shoulderHalfW * 1.25)
+      const wx = 1 - soft01(nx, 0.55, 1.05)
+      const wy = soft01(off.y, -shoulderHalfW * 0.05, shoulderHalfW * 0.08)
+        * (1 - soft01(off.y, shoulderHalfW * 1.6, shoulderHalfW * 2.4))
+      const wz = soft01(off.z, shoulderHalfW * 0.08, shoulderHalfW * 0.18)
+        * (1 - soft01(off.z, shoulderHalfW * 2.6, shoulderHalfW * 3.6))
+      return Math.max(0, Math.min(1, wx * wy * wz))
+    }
+    // Atrae la muñeca hacia la garganta. weight debe venir YA suavizado en el
+    // tiempo (ver smoothNeckWeightSeq) para no soltar de golpe.
+    function pullWristToNeck(T, weight) {
+      if (weight < 0.02) return T
+      const pull = (CONFIG.wristNeckPull ?? 0.42) * weight
+      const throat = new THREE.Vector3(0, shoulderHalfW * 0.32, shoulderHalfW * 0.55)
+      const off = T.clone().sub(C_avatar)
+      off.lerp(throat, pull)
+      return C_avatar.clone().add(off)
+    }
+    // Asimétrico: entra rápido a la zona, SALE lento — evita el tirón al
+    // alejar un poco la mano de la cabeza.
+    function smoothNeckWeightSeq(ws, attack = 0.55, release = 0.14) {
+      let acc = 0
+      return ws.map((w) => {
+        const t = w == null ? 0 : w
+        const a = t > acc ? attack : release
+        acc += a * (t - acc)
+        return acc < 0.015 ? 0 : acc
+      })
+    }
     // Cuando las dos manos se juntan (p.ej. GRACIAS): la de ABAJO (derecha)
     // no debe meterse en el pecho ni ocupar el mismo volumen que la de
     // ARRIBA (izquierda en barbilla). Se apilan: misma X aprox., Y separada,
@@ -299,6 +349,11 @@ export function createBaker(vrm) {
       [CONFIG.headPitchAxis]: h.pitch,
     })
 
+    // Cara (boca/ojos): landmarks de labios/ojos → pesos de expresión VRM.
+    // Igual que la cabeza, se hornea por frame y se resetea a neutral en la
+    // transición reposo↔seña (ver vrmFaceSolver.js).
+    const exprSmooth = smoothFaceSeq(frames)
+
     // 2) Suavizar antes de orientar (mata tembleque/saltos).
     const pick = (arr, side, key) => arr.map((r) => (r[side] ? r[side][key] : null))
     const put = (arr, side, key, seq) => arr.forEach((r, i) => { if (r[side]) r[side][key] = seq[i] })
@@ -342,8 +397,11 @@ export function createBaker(vrm) {
     // mismo un salto. Por eso suavizamos la SECUENCIA de extensión en el
     // tiempo antes de decidir cuánto amortiguar, y así la transición hacia
     // el modo "brazo recto" es siempre gradual.
+    // 3a) Objetivos de muñeca SIN atracción a cuello todavía — guardamos el
+    // weight crudo. Luego suavizamos el weight en el tiempo (sale lento) y
+    // recién ahí jalamos; si jaláramos con el weight crudo, al rozar el borde
+    // de la zona la mano caía de golpe.
     const allTg = []
-    const extRaw = { right: [], left: [] }
     for (let i = 0; i < frames.length; i++) {
       const dirs = rawDirs[i]
       const tg = {}
@@ -353,7 +411,8 @@ export function createBaker(vrm) {
         const scale = (B.L1 + B.L2) / (armLenRef[name] || d.recArmLen)
         let T = C_avatar.clone().addScaledVector(new THREE.Vector3(...d.wristOffset), scale)
         T = avoidTorso(T)
-        tg[name] = { B, d, S, T }
+        const neckW = neckZoneWeight(T, d.wristOffset)
+        tg[name] = { B, d, S, T, neckW }
       }
       if (tg.right && tg.left) {
         const gap = tg.right.T.distanceTo(tg.left.T)
@@ -363,19 +422,42 @@ export function createBaker(vrm) {
           const pull = CONFIG.handAttract * (1 - gap / near)
           tg.right.T.lerp(mid, pull)
           tg.left.T.lerp(mid, pull)
-          // La atracción puede volver a meter la mano al torso (ej. al
-          // juntarlas cerca del pecho) — re-chequear tras el jalón.
           tg.right.T.copy(avoidTorso(tg.right.T))
           tg.left.T.copy(avoidTorso(tg.left.T))
         }
-        // Apilar si están cerca: mano baja delante del pecho y debajo de la
-        // alta, sin atravesar tronco ni la otra mano (GRACIAS).
         stackHands(tg)
+        for (const name of ['right', 'left']) {
+          if (!tg[name]) continue
+          tg[name].neckW = Math.max(
+            tg[name].neckW || 0,
+            neckZoneWeight(tg[name].T, tg[name].d?.wristOffset),
+          )
+        }
       }
+      allTg.push(tg)
+    }
+    // Suavizar weight / atracción a cuello solo en whitelist (TENGO_SED).
+    // En HOLA la mano en la sien no debe jalarse al cuello ni alzar cabeza.
+    const neckAssistList = CONFIG.headNeckAssistTokens
+    const neckTok = (dataset.token || '').toUpperCase()
+    const useNeckAssist = Array.isArray(neckAssistList) && neckAssistList.length > 0
+      && neckAssistList.some((t) => neckTok === String(t).toUpperCase() || neckTok.includes(String(t).toUpperCase()))
+    for (const name of ['right', 'left']) {
+      const rawW = allTg.map((tg) => (tg[name] ? tg[name].neckW : null))
+      const smoothW = useNeckAssist ? smoothNeckWeightSeq(rawW) : rawW.map(() => 0)
+      for (let i = 0; i < allTg.length; i++) {
+        const t = allTg[i][name]
+        if (!t) continue
+        t.neckW = smoothW[i] || 0
+        if (useNeckAssist && t.neckW > 0.02) t.T = pullWristToNeck(t.T, t.neckW)
+      }
+    }
+    const extRaw = { right: [], left: [] }
+    for (let i = 0; i < allTg.length; i++) {
+      const tg = allTg[i]
       for (const name of ['right', 'left']) {
         extRaw[name].push(tg[name] ? tg[name].S.distanceTo(tg[name].T) / (tg[name].B.L1 + tg[name].B.L2) : null)
       }
-      allTg.push(tg)
     }
     const extSmooth = {
       right: smoothScalarSeqLocal(extRaw.right, 0.25),
@@ -422,6 +504,42 @@ export function createBaker(vrm) {
       }
       Object.assign(pose, fingSmooth[i]) // dedos ya suavizados
       pose.head = headEuler(headSmooth[i]) // cabeza (asentir/girar), independiente de brazos
+      // Asistencia de cuello SOLO en tokens whitelist (p.ej. TENGO_SED).
+      // En HOLA la mano toca la sien → un assist genérico movía la cabeza mal.
+      {
+        const allowList = CONFIG.headNeckAssistTokens
+        const tok = (dataset.token || '').toUpperCase()
+        const allowAssist = !allowList || allowList.length === 0
+          ? false
+          : allowList.some((t) => tok === String(t).toUpperCase() || tok.includes(String(t).toUpperCase()))
+        if (allowAssist) {
+          const axis = CONFIG.headPitchAxis || 'x'
+          const maxAssist = CONFIG.headNeckAssist ?? 0.75
+          let w = 0
+          for (const side of ['right', 'left']) {
+            const t = tg[side]
+            if (!t) continue
+            w = Math.max(w, t.neckW || neckZoneWeight(t.T, t.d?.wristOffset))
+          }
+          if (w > 0.05) {
+            const sign = CONFIG.headPitchSign ?? -1
+            const assist = maxAssist * (0.55 + 0.45 * w)
+            const cur = pose.head[axis] || 0
+            const target = assist * sign
+            pose.head[axis] = sign >= 0 ? Math.max(cur, target) : Math.min(cur, target)
+            pose.neck = {
+              x: axis === 'x' ? assist * 0.55 * sign : 0,
+              y: axis === 'y' ? assist * 0.55 * sign : 0,
+              z: 0,
+            }
+          } else {
+            pose.neck = { x: 0, y: 0, z: 0 }
+          }
+        } else {
+          pose.neck = { x: 0, y: 0, z: 0 }
+        }
+      }
+      pose.expr = exprSmooth[i] // boca/ojos, independiente de brazos y cabeza
       poses.push(pose)
     }
     // Blindaje de bordes: si un brazo activo en la seña no se detectó en el
@@ -533,7 +651,7 @@ export function createBaker(vrm) {
     // frena/acelera en reposo sin anular la velocidad justo en el empalme.
     const TRANS_STEPS = 8
     const smoothstep = (t) => t * t * (3 - 2 * t)
-    const transition = (sideData, fingerA, fingerB, steps, stepMs, headA, headB) => {
+    const transition = (sideData, fingerA, fingerB, steps, stepMs, headA, headB, exprA, exprB, neckA, neckB) => {
       const activeSides = Object.keys(sideData)
       const out = []
       for (let s = 1; s <= steps; s++) {
@@ -568,6 +686,8 @@ export function createBaker(vrm) {
         const bones = new Set([...Object.keys(fingerA), ...Object.keys(fingerB)])
         bones.forEach((k) => { pose[k] = lerpEuler(fingerA[k], fingerB[k], a) })
         if (headA || headB) pose.head = slerpEuler(headA, headB, a)
+        if (neckA || neckB) pose.neck = slerpEuler(neckA || NEUTRAL, neckB || NEUTRAL, a)
+        if (exprA || exprB) pose.expr = lerpExpr(exprA, exprB, a)
         out.push({ duration: stepMs, pose })
       }
       return out
@@ -585,6 +705,8 @@ export function createBaker(vrm) {
         }
       }
       pose.head = NEUTRAL
+      pose.neck = NEUTRAL
+      pose.expr = NEUTRAL_EXPR
       return pose
     }
 
@@ -683,12 +805,12 @@ export function createBaker(vrm) {
     const transSteps = TRANS_STEPS - 1
     const entryStepMs = LEAD_IN_MS / TRANS_STEPS
     const exitStepMs = 480 / TRANS_STEPS
-    const entryKfs = transition(entrySides, restFingers, fingersOf(first), transSteps, entryStepMs, NEUTRAL, first.head)
+    const entryKfs = transition(entrySides, restFingers, fingersOf(first), transSteps, entryStepMs, NEUTRAL, first.head, NEUTRAL_EXPR, first.expr, NEUTRAL, first.neck)
     // Empalme exacto con frame 0: mismo pose y duración del primer frame de la
     // seña, sin duplicar keyframe (evita micro-pausa por tramo de delta cero).
     entryKfs.push({ duration: dur, pose: { ...first } })
     const signKfsBody = poses.length > 1 ? poses.slice(1).map((p) => ({ duration: dur, pose: p })) : []
-    const exitKfs = transition(exitSides, fingersOf(last), restFingers, transSteps, exitStepMs, last.head, NEUTRAL)
+    const exitKfs = transition(exitSides, fingersOf(last), restFingers, transSteps, exitStepMs, last.head, NEUTRAL, last.expr, NEUTRAL_EXPR, last.neck, NEUTRAL)
     exitKfs.push({ duration: exitStepMs, pose: buildExactRestPose(activeSides) })
     const all = [...entryKfs, ...signKfsBody, ...exitKfs]
 

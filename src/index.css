@@ -604,9 +604,9 @@ button,
 }
 
 .camera-ambient-bg {
-  /* Blanco + puntos (sin degradado): overlays de carga/permisos más limpios. */
-  background-color: #ffffff;
-  background-image: radial-gradient(rgba(45, 42, 38, 0.07) 1px, transparent 1px);
+  /* Gris + puntos: el card blanco destaca encima. */
+  background-color: #E8E6E0;
+  background-image: radial-gradient(rgba(45, 42, 38, 0.08) 1px, transparent 1px);
   background-size: 18px 18px;
 }
 

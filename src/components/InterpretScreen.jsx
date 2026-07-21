@@ -1018,7 +1018,7 @@ export default function InterpretScreen({ onBack, onHome }) {
                     </div>
                   </div>
 
-                  <div className="relative mx-4 mb-4 aspect-video overflow-hidden rounded-[1.25rem] border-2 border-dashed border-pastel-ink/15 bg-white shadow-inner sm:mx-5 sm:mb-5 [background-image:radial-gradient(rgba(45,42,38,0.07)_1px,transparent_1px)] [background-size:18px_18px]">
+                  <div className="relative mx-4 mb-4 aspect-video overflow-hidden rounded-[1.25rem] border-2 border-dashed border-pastel-ink/15 bg-[#E8E6E0] shadow-inner sm:mx-5 sm:mb-5 [background-image:radial-gradient(rgba(45,42,38,0.08)_1px,transparent_1px)] [background-size:18px_18px]">
                     <video ref={videoRef} autoPlay playsInline muted
                       className="absolute inset-0 h-full w-full object-cover"
                       style={{ transform: 'scaleX(-1)' }} />
@@ -1295,10 +1295,10 @@ function OutputCard({ title, empty, emptyIcon, hasContent, children }) {
 function CameraPermissionPrompt({ onAccept, onDecline }) {
   return (
     <div className="camera-ambient-bg absolute inset-0 z-30 flex animate-permission-overlay-in items-center justify-center overflow-y-auto p-3 sm:p-5">
-      <div className="my-auto w-full max-w-sm animate-permission-card-in rounded-2xl border-2 border-dashed border-pastel-ink/15 bg-white/95 p-4 text-center sm:p-5">
+      <div className="my-auto w-full max-w-sm animate-permission-card-in rounded-2xl border-2 border-pastel-purple-line bg-white p-4 text-center shadow-[0_16px_40px_-12px_rgba(45,42,38,0.35)] sm:p-5">
         <Icon
           name="camera"
-          className="animate-float mx-auto h-8 w-8 text-pastel-sub/60 sm:h-9 sm:w-9"
+          className="animate-float mx-auto h-8 w-8 text-pastel-grape sm:h-9 sm:w-9"
           strokeWidth={1.75}
           style={{ animationDuration: '3.5s' }}
         />

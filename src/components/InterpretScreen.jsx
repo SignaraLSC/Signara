@@ -121,26 +121,36 @@ function adaptHandResult(res) {
       label: cat?.categoryName,
       score: cat?.score ?? 0,
       x: lm[i]?.[0]?.x ?? 0.5,
+      used: false,
     })
   }
   // Primero etiquetas confiables de MediaPipe.
   for (const h of scored) {
     if (h.score < 0.35) continue
-    if (h.label === 'Left' && !leftHandLandmarks) leftHandLandmarks = h.landmarks
-    else if (h.label === 'Right' && !rightHandLandmarks) rightHandLandmarks = h.landmarks
+    if (h.label === 'Left' && !leftHandLandmarks) { leftHandLandmarks = h.landmarks; h.used = true }
+    else if (h.label === 'Right' && !rightHandLandmarks) { rightHandLandmarks = h.landmarks; h.used = true }
   }
-  // Respaldo: por posición en imagen (x menor = izquierda del frame).
-  // Evita perder la mano izq. cuando handedness falla o score baja.
-  if (scored.length === 1) {
-    const h = scored[0]
-    if (!leftHandLandmarks && !rightHandLandmarks) {
-      if (h.x < 0.5) leftHandLandmarks = h.landmarks
-      else rightHandLandmarks = h.landmarks
-    }
-  } else if (scored.length >= 2 && (!leftHandLandmarks || !rightHandLandmarks)) {
-    const sorted = [...scored].sort((a, b) => a.x - b.x)
+  // Respaldo: por posición en imagen (x menor = izquierda del frame), SOLO
+  // entre las manos que el paso anterior NO usó. Si MediaPipe etiqueta las
+  // DOS manos igual (típico justo en señas que se cruzan/juntan, ej.
+  // GRACIAS), el paso de arriba deja un slot vacío — sin este filtro, el
+  // respaldo podía volver a agarrar la MISMA mano ya asignada (si quedaba
+  // más a la derecha en X) y la otra mano real se perdía del todo.
+  const remaining = scored.filter((h) => !h.used)
+  if (remaining.length === 1 && !leftHandLandmarks && !rightHandLandmarks) {
+    const h = remaining[0]
+    if (h.x < 0.5) leftHandLandmarks = h.landmarks
+    else rightHandLandmarks = h.landmarks
+  } else if (remaining.length >= 2 && (!leftHandLandmarks || !rightHandLandmarks)) {
+    const sorted = [...remaining].sort((a, b) => a.x - b.x)
     if (!leftHandLandmarks) leftHandLandmarks = sorted[0].landmarks
     if (!rightHandLandmarks) rightHandLandmarks = sorted[sorted.length - 1].landmarks
+  } else if (remaining.length === 1) {
+    // Queda exactamente un slot libre (el otro ya se resolvió por
+    // etiqueta) — la única mano que sobra va ahí, sea cual sea su posición.
+    const h = remaining[0]
+    if (!leftHandLandmarks) leftHandLandmarks = h.landmarks
+    else rightHandLandmarks = h.landmarks
   }
   return { leftHandLandmarks, rightHandLandmarks }
 }
@@ -254,6 +264,16 @@ export default function InterpretScreen({ onBack, onHome }) {
   const speakQueueRef = useRef([])
   const speakBusyRef = useRef(false)
   const speakTimerRef = useRef(null)
+  // speakTimerRef es un timer COMPARTIDO entre el aviso de "Chrome se tragó
+  // la frase" (400ms) y el "respiro" antes de la siguiente de la cola
+  // (40ms/80ms) de utterances DISTINTAS. Si stopSpeech() corta la utterance
+  // en vuelo justo cuando otra ya arrancó, el onerror/onend tardío de la
+  // cancelada puede limpiar/pisar el timer de la nueva (misma ref). Cada
+  // llamada a flushSpeakQueue que arranca una utterance real captura el
+  // generation actual; sus callbacks solo tocan speakTimerRef/speakBusyRef
+  // si siguen siendo la generación vigente — así una cancelación o una
+  // utterance más nueva invalida automáticamente los callbacks viejos.
+  const speakGenRef = useRef(0)
   const spanishVoiceRef = useRef(null)
 
   // UI state
@@ -430,6 +450,8 @@ export default function InterpretScreen({ onBack, onHome }) {
     const attempt = typeof item === 'string' ? 0 : (item.attempt || 0)
 
     speakBusyRef.current = true
+    const myGen = ++speakGenRef.current
+    const isStale = () => myGen !== speakGenRef.current
     let started = false
     let finished = false
     try {
@@ -445,6 +467,7 @@ export default function InterpretScreen({ onBack, onHome }) {
       const done = () => {
         if (finished) return
         finished = true
+        if (isStale()) return // otra utterance ya tomó la posta — no tocar su timer/busy
         speakBusyRef.current = false
         if (speakTimerRef.current) clearTimeout(speakTimerRef.current)
         // Respiro entre palabras: evita el bug de cola en Chrome.
@@ -459,7 +482,7 @@ export default function InterpretScreen({ onBack, onHome }) {
       // reintentar hasta 2 veces — no debe perderse ninguna seña.
       if (speakTimerRef.current) clearTimeout(speakTimerRef.current)
       speakTimerRef.current = setTimeout(() => {
-        if (finished) return
+        if (finished || isStale()) return
         if (started || window.speechSynthesis.speaking || window.speechSynthesis.pending) {
           return // onend cerrará
         }
@@ -475,7 +498,7 @@ export default function InterpretScreen({ onBack, onHome }) {
       }, 400)
     } catch (e) {
       console.warn(e)
-      speakBusyRef.current = false
+      if (!isStale()) speakBusyRef.current = false
       flushSpeakQueue()
     }
   }
@@ -491,6 +514,11 @@ export default function InterpretScreen({ onBack, onHome }) {
   function stopSpeech() {
     speakQueueRef.current = []
     speakBusyRef.current = false
+    // Invalida los callbacks (done/timeout) de la utterance que estaba en
+    // vuelo — cancel() dispara su onerror/onend de forma asíncrona, y sin
+    // esto ese callback tardío podía limpiar/pisar el timer de una
+    // utterance NUEVA que ya haya arrancado para cuando llegue.
+    speakGenRef.current++
     if (speakTimerRef.current) {
       clearTimeout(speakTimerRef.current)
       speakTimerRef.current = null

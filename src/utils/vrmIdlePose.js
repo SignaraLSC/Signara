@@ -31,6 +31,13 @@ const VRM_IDLE = {
   head: { x: 0, y: 0, z: 0 },
 }
 
+const EXPR_NAMES = ['aa', 'ih', 'ou', 'ee', 'oh', 'blink']
+
 export function setIdlePose(vrm) {
   applyPose(vrm, VRM_IDLE)
+  // Reposo también en la cara: boca cerrada, sin parpadeo forzado — evita
+  // que quede "pegada" una expresión de la última seña reproducida.
+  if (vrm.expressionManager) {
+    EXPR_NAMES.forEach((n) => vrm.expressionManager.setValue(n, 0))
+  }
 }

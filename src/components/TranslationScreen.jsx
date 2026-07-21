@@ -380,18 +380,18 @@ export default function TranslationScreen({
               </AppPageStagger>
             </AppPageHeading>
 
-            <div className="mt-7 grid grid-cols-1 gap-6 lg:grid-cols-12 lg:items-start lg:gap-8">
-              <AppPageStagger className="flex flex-col gap-5 lg:col-span-5">
-                <TextInputPanel
-                  ref={inputRef}
-                  initialMode={initialMode}
-                  onSubmit={handlePanelSubmit}
-                  onLiveWord={handleLiveWord}
-                  busy={busy}
-                  pendingWord={pendingWord}
-                  missedWord={missedWord}
-                />
+            <div className="translate-layout mt-7">
+              <TextInputPanel
+                ref={inputRef}
+                initialMode={initialMode}
+                onSubmit={handlePanelSubmit}
+                onLiveWord={handleLiveWord}
+                busy={busy}
+                pendingWord={pendingWord}
+                missedWord={missedWord}
+              />
 
+              <div className="ta-dijiste animate-motion-enter [animation-delay:140ms]">
                 <OutputCard
                   color="neutral"
                   icon={<TextIcon />}
@@ -400,12 +400,22 @@ export default function TranslationScreen({
                   empty="Tu texto aparecerá aquí."
                   hasContent={!!originalText}
                 >
-                  <p className="text-base font-bold leading-relaxed text-pastel-ink sm:text-lg">
-                    &quot;{originalText}&quot;
-                  </p>
+                  {/* Alto FIJO (no max-height): antes crecía en vivo con cada
+                      palabra hasta tocar el tope, lo que se veía como que la
+                      card se "agrandaba" mientras hablabas. Con h-40 fijo
+                      queda del mismo tamaño desde el primer carácter, con
+                      scroll interno para lo que no entre — y de paso sigue
+                      protegiendo al avatar (misma fila del grid en desktop). */}
+                  <div className="h-40 overflow-y-auto pr-1">
+                    <p className="text-base font-bold leading-relaxed text-pastel-ink sm:text-lg">
+                      &quot;{originalText}&quot;
+                    </p>
+                  </div>
                 </OutputCard>
+              </div>
 
-                {wordChips.length > 0 && (
+              {wordChips.length > 0 && (
+                <div className="ta-palabras animate-motion-enter [animation-delay:210ms]">
                   <OutputCard
                     color="blue"
                     icon={<SignIcon />}
@@ -421,25 +431,23 @@ export default function TranslationScreen({
                       <SignChips signs={wordChips} activeIndex={-1} />
                     </div>
                   </OutputCard>
-                )}
-              </AppPageStagger>
+                </div>
+              )}
 
-              <div className="animate-motion-scale-in lg:col-span-7">
+              <div className="ta-avatar animate-motion-scale-in">
                 <div className="relative flex h-full flex-col overflow-hidden rounded-[2rem] border-[3px] border-pastel-blue-line bg-pastel-blue p-5 shadow-[0_24px_50px_-28px_rgba(147,190,240,0.7)] sm:p-7">
                   <div className="relative mb-4">
                     <p className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-[0.22em] text-pastel-ink/70">
                       <Icon name="eye" className="h-3.5 w-3.5" strokeWidth={2.25} /> Mira aquí
                     </p>
                     <p className="mt-1 text-xl font-extrabold text-pastel-ink sm:text-2xl">
-                      {busy
-                        ? 'Generando seña…'
-                        : hasPose3d && !useSigner
-                          ? poseFinished
-                            ? `Seña ${SIGNED_LANG_LABEL} (final)`
-                            : `Seña ${SIGNED_LANG_LABEL} (3D)`
-                          : signerMounted
-                            ? `Seña ${SIGNED_LANG_LABEL} (avatar 3D)`
-                            : 'Escribe para ver la animación'}
+                      {hasPose3d && !useSigner
+                        ? poseFinished
+                          ? `Seña ${SIGNED_LANG_LABEL} (final)`
+                          : `Seña ${SIGNED_LANG_LABEL} (3D)`
+                        : signerMounted
+                          ? `Seña ${SIGNED_LANG_LABEL} (avatar 3D)`
+                          : 'Escribe para ver la animación'}
                     </p>
                   </div>
 
@@ -473,7 +481,7 @@ export default function TranslationScreen({
                       <div className="flex flex-col items-center justify-center px-6 text-center">
                         <Icon name="user" className="h-12 w-12 text-pastel-ink/30" strokeWidth={1.5} />
                         <p className="mt-3 text-sm font-semibold text-pastel-sub">
-                          {busy ? 'Cargando animación 3D…' : 'Cargando avatar…'}
+                          Cargando avatar…
                         </p>
                       </div>
                     )}

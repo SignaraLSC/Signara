@@ -148,140 +148,148 @@ const TextInputPanel = forwardRef(function TextInputPanel(
   }
 
   return (
-    <form onSubmit={submit} className="w-full" data-tutorial="translate-input">
-      {/* Selector de modo */}
-      <div className="mb-3 grid grid-cols-2 gap-2">
-        <ModeTab
-          active={inputMode === 'text' && !listening}
-          icon={<PenIcon />}
-          label="Escribir"
-          hint="Texto + Traducir"
-          onClick={pickTextMode}
-        />
-        <ModeTab
-          active={inputMode === 'voice' || listening}
-          icon={<MicIcon />}
-          label="Hablar"
-          hint="Micrófono en vivo"
-          onClick={pickVoiceMode}
-          disabled={!supported || busy}
-        />
-      </div>
-
-      <div
-        className={
-          'overflow-hidden rounded-[1.25rem] border-[3px] bg-white shadow-[0_12px_28px_-16px_rgba(45,42,38,0.35)] transition ' +
-          (listening
-            ? 'border-palette-azure ring-4 ring-pastel-blue/40'
-            : 'border-pastel-blue-line')
-        }
-      >
-        <div className="flex items-center gap-2 px-2.5 py-2 sm:gap-3 sm:px-3 sm:py-2.5">
-          <button
-            type="button"
-            onClick={listening ? stop : pickVoiceMode}
-            disabled={!supported}
-            title={supported ? (listening ? 'Detener micrófono' : 'Activar micrófono') : 'Voz no disponible'}
-            className={
-              'relative inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-xl transition-all duration-300 focus:outline-none focus:ring-4 focus:ring-pastel-blue/40 sm:h-12 sm:w-12 ' +
-              (listening
-                ? 'bg-palette-azure text-white shadow-[0_8px_24px_-6px_rgba(46,124,248,0.55)]'
-                : 'border-2 border-pastel-ink/15 bg-pastel-blue/60 text-palette-azure hover:border-pastel-blue-line hover:bg-pastel-blue') +
-              (!supported ? ' opacity-40 cursor-not-allowed' : '')
-            }
-            aria-pressed={listening}
-          >
-            {listening && <span className="absolute inset-0 rounded-xl bg-palette-azure/30 animate-pulse-ring" />}
-            <MicIcon size={22} />
-          </button>
-
-          <input
-            ref={inputRef}
-            type="text"
-            value={value}
-            onChange={(e) => setValue(e.target.value)}
-            onFocus={() => { if (listening) stop(); setInputMode('text') }}
-            placeholder={
-              listening
-                ? 'Habla ahora — el avatar señará al instante'
-                : 'Escribe aquí tu mensaje en español…'
-            }
-            className="min-w-0 flex-1 bg-transparent outline-none px-1 py-2 text-base font-semibold text-pastel-ink placeholder:text-pastel-sub/70 sm:text-lg"
-            disabled={busy}
+    // display:contents: el <form> desaparece de la caja visual y sus dos
+    // mitades (ta-tabsinput / ta-examples) pasan a ser items directos de la
+    // grilla .translate-layout del padre — así el avatar puede intercalarse
+    // ENTRE ellas en móvil sin duplicar el componente ni romper el submit.
+    <form onSubmit={submit} className="contents">
+      <div className="ta-tabsinput animate-motion-enter" data-tutorial="translate-input">
+        {/* Selector de modo */}
+        <div className="mb-3 grid grid-cols-2 gap-2">
+          <ModeTab
+            active={inputMode === 'text' && !listening}
+            icon={<PenIcon />}
+            label="Escribir"
+            hint="Texto + Traducir"
+            onClick={pickTextMode}
           />
-
-          {!listening && (
-            <button
-              type="submit"
-              disabled={busy || !value.trim()}
-              className="inline-flex h-11 shrink-0 items-center justify-center gap-1.5 rounded-xl bg-palette-azure px-3 text-sm font-bold text-white shadow-[0_6px_16px_-6px_rgba(46,124,248,0.5)] transition hover:brightness-105 focus:outline-none focus:ring-4 focus:ring-pastel-blue disabled:cursor-not-allowed disabled:opacity-50 sm:h-12 sm:gap-2 sm:px-4"
-            >
-              {busy ? <Spinner /> : (
-                <>
-                  <span className="hidden min-[400px]:inline">Traducir</span>
-                  <ArrowIcon />
-                </>
-              )}
-            </button>
-          )}
-
-          {listening && (
-            <span className="inline-flex h-11 shrink-0 items-center gap-1.5 rounded-xl bg-palette-azure px-3 text-xs font-extrabold text-white sm:h-12 sm:px-3.5">
-              <span className="h-1.5 w-1.5 rounded-full bg-white animate-pulse" />
-              EN VIVO
-            </span>
-          )}
+          <ModeTab
+            active={inputMode === 'voice' || listening}
+            icon={<MicIcon />}
+            label="Hablar"
+            hint="Micrófono en vivo"
+            onClick={pickVoiceMode}
+            disabled={!supported || busy}
+          />
         </div>
-      </div>
 
-      {/* Ejemplos rápidos */}
-      {!listening && (
-        <div className="mt-4" data-tutorial="translate-examples">
-          <p className="mb-2 text-xs font-extrabold uppercase tracking-wider text-palette-azure">
-            Prueba con un clic
-          </p>
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-            {EXAMPLES.map(({ text, icon }) => (
+        <div
+          className={
+            'overflow-hidden rounded-[1.25rem] border-[3px] bg-white shadow-[0_12px_28px_-16px_rgba(45,42,38,0.35)] transition ' +
+            (listening
+              ? 'border-palette-azure ring-4 ring-pastel-blue/40'
+              : 'border-pastel-blue-line')
+          }
+        >
+          <div className="flex items-center gap-2 px-2.5 py-2 sm:gap-3 sm:px-3 sm:py-2.5">
+            <button
+              type="button"
+              onClick={listening ? stop : pickVoiceMode}
+              disabled={!supported}
+              title={supported ? (listening ? 'Detener micrófono' : 'Activar micrófono') : 'Voz no disponible'}
+              className={
+                'relative inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-xl transition-all duration-300 focus:outline-none focus:ring-4 focus:ring-pastel-blue/40 sm:h-12 sm:w-12 ' +
+                (listening
+                  ? 'bg-palette-azure text-white shadow-[0_8px_24px_-6px_rgba(46,124,248,0.55)]'
+                  : 'border-2 border-pastel-ink/15 bg-pastel-blue/60 text-palette-azure hover:border-pastel-blue-line hover:bg-pastel-blue') +
+                (!supported ? ' opacity-40 cursor-not-allowed' : '')
+              }
+              aria-pressed={listening}
+            >
+              {listening && <span className="absolute inset-0 rounded-xl bg-palette-azure/30 animate-pulse-ring" />}
+              <MicIcon size={22} />
+            </button>
+
+            <input
+              ref={inputRef}
+              type="text"
+              value={value}
+              onChange={(e) => setValue(e.target.value)}
+              onFocus={() => { if (listening) stop(); setInputMode('text') }}
+              placeholder={
+                listening
+                  ? 'Habla ahora — el avatar señará al instante'
+                  : 'Escribe aquí tu mensaje en español…'
+              }
+              className="min-w-0 flex-1 bg-transparent outline-none px-1 py-2 text-base font-semibold text-pastel-ink placeholder:text-pastel-sub/70 sm:text-lg"
+              disabled={busy}
+            />
+
+            {!listening && (
               <button
-                key={text}
-                type="button"
-                disabled={busy}
-                onClick={() => runExample(text)}
-                className="group flex flex-col items-center gap-1 rounded-2xl border-2 border-pastel-ink/10 bg-white px-2 py-3 text-center transition hover:-translate-y-0.5 hover:border-pastel-blue-line hover:bg-pastel-blue/50 hover:shadow-[0_10px_24px_-14px_rgba(45,42,38,0.35)] disabled:opacity-50"
+                type="submit"
+                disabled={busy || !value.trim()}
+                className="inline-flex h-11 shrink-0 items-center justify-center gap-1.5 rounded-xl bg-palette-azure px-3 text-sm font-bold text-white shadow-[0_6px_16px_-6px_rgba(46,124,248,0.5)] transition hover:brightness-105 focus:outline-none focus:ring-4 focus:ring-pastel-blue disabled:cursor-not-allowed disabled:opacity-50 sm:h-12 sm:gap-2 sm:px-4"
               >
-                <Icon name={icon} className="h-6 w-6 text-palette-azure transition group-hover:scale-110" strokeWidth={1.75} />
-                <span className="text-[11px] font-bold leading-tight text-pastel-ink sm:text-xs">{text}</span>
+                {busy ? <Spinner /> : (
+                  <>
+                    <span className="hidden min-[400px]:inline">Traducir</span>
+                    <ArrowIcon />
+                  </>
+                )}
               </button>
-            ))}
+            )}
+
+            {listening && (
+              <span className="inline-flex h-11 shrink-0 items-center gap-1.5 rounded-xl bg-palette-azure px-3 text-xs font-extrabold text-white sm:h-12 sm:px-3.5">
+                <span className="h-1.5 w-1.5 rounded-full bg-white animate-pulse" />
+                EN VIVO
+              </span>
+            )}
           </div>
         </div>
-      )}
+      </div>
 
-      {listening && (
-        <div className="mt-3 flex flex-wrap items-center gap-2 text-xs font-semibold text-pastel-sub">
-          <span className="inline-flex items-center gap-1.5 rounded-full border-2 border-pastel-blue-line/60 bg-pastel-blue/60 px-3 py-1 text-palette-azure">
-            <span className="h-1.5 w-1.5 rounded-full bg-palette-azure animate-pulse" />
-            Escuchando… cada palabra se convierte en seña
-          </span>
-          {pendingWord && (
-            <span className="inline-flex items-center gap-1 rounded-full border-2 border-pastel-blue-line bg-pastel-blue px-2.5 py-1 text-palette-azure animate-pulse">
-              &quot;{pendingWord}&quot;…
-            </span>
-          )}
-          {missedWord && (
-            <span className="inline-flex items-center rounded-full border-2 border-pastel-ink/10 bg-white px-2.5 py-1 line-through opacity-60">
-              {missedWord}
-            </span>
-          )}
-        </div>
-      )}
+      <div className="ta-examples animate-motion-enter [animation-delay:70ms]">
+        {/* Ejemplos rápidos */}
+        {!listening && (
+          <div data-tutorial="translate-examples">
+            <p className="mb-2 text-xs font-extrabold uppercase tracking-wider text-palette-azure">
+              Prueba con un clic
+            </p>
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+              {EXAMPLES.map(({ text, icon }) => (
+                <button
+                  key={text}
+                  type="button"
+                  disabled={busy}
+                  onClick={() => runExample(text)}
+                  className="group flex flex-col items-center gap-1 rounded-2xl border-2 border-pastel-ink/10 bg-white px-2 py-3 text-center transition hover:-translate-y-0.5 hover:border-pastel-blue-line hover:bg-pastel-blue/50 hover:shadow-[0_10px_24px_-14px_rgba(45,42,38,0.35)] disabled:opacity-50"
+                >
+                  <Icon name={icon} className="h-6 w-6 text-palette-azure transition group-hover:scale-110" strokeWidth={1.75} />
+                  <span className="text-[11px] font-bold leading-tight text-pastel-ink sm:text-xs">{text}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
 
-      {!supported && (
-        <p className="mt-2 text-xs font-bold text-pastel-pink">Tu navegador no soporta reconocimiento de voz.</p>
-      )}
-      {error && error !== 'no-speech' && error !== 'aborted' && (
-        <p className="mt-2 text-xs font-bold text-pastel-pink">Error de voz: {error}</p>
-      )}
+        {listening && (
+          <div className="flex flex-wrap items-center gap-2 text-xs font-semibold text-pastel-sub">
+            <span className="inline-flex items-center gap-1.5 rounded-full border-2 border-pastel-blue-line/60 bg-pastel-blue/60 px-3 py-1 text-palette-azure">
+              <span className="h-1.5 w-1.5 rounded-full bg-palette-azure animate-pulse" />
+              Escuchando… cada palabra se convierte en seña
+            </span>
+            {pendingWord && (
+              <span className="inline-flex items-center gap-1 rounded-full border-2 border-pastel-blue-line bg-pastel-blue px-2.5 py-1 text-palette-azure animate-pulse">
+                &quot;{pendingWord}&quot;…
+              </span>
+            )}
+            {missedWord && (
+              <span className="inline-flex items-center rounded-full border-2 border-pastel-ink/10 bg-white px-2.5 py-1 line-through opacity-60">
+                {missedWord}
+              </span>
+            )}
+          </div>
+        )}
+
+        {!supported && (
+          <p className="mt-2 text-xs font-bold text-pastel-pink">Tu navegador no soporta reconocimiento de voz.</p>
+        )}
+        {error && error !== 'no-speech' && error !== 'aborted' && (
+          <p className="mt-2 text-xs font-bold text-pastel-pink">Error de voz: {error}</p>
+        )}
+      </div>
     </form>
   )
 })

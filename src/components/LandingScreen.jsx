@@ -12,9 +12,10 @@ export default function LandingScreen({ onStart, onStartTranslate, onStartInterp
   return (
     <div className="landing-page-bg motion-page relative min-h-screen font-display text-pastel-ink">
       <div className="pointer-events-none absolute inset-0 overflow-hidden" aria-hidden="true">
-        <div className="absolute -left-24 top-32 h-64 w-64 rounded-full bg-pastel-purple/25 blur-3xl" />
-        <div className="absolute -right-20 top-[45%] h-56 w-56 rounded-full bg-pastel-green/20 blur-3xl" />
-        <div className="absolute bottom-32 left-1/3 h-48 w-48 rounded-full bg-pastel-blue/20 blur-3xl" />
+        {/* Sin blur-3xl: gradientes planos baratos (el blur llenaba la GPU). */}
+        <div className="absolute -left-24 top-32 h-64 w-64 rounded-full bg-pastel-purple/30" />
+        <div className="absolute -right-20 top-[45%] h-56 w-56 rounded-full bg-pastel-green/25" />
+        <div className="absolute bottom-32 left-1/3 h-48 w-48 rounded-full bg-pastel-blue/25" />
       </div>
 
       <header className="landing-nav-glass">
@@ -97,7 +98,7 @@ export default function LandingScreen({ onStart, onStartTranslate, onStartInterp
                 ¿Qué resuelve Signara?
                 <ArrowDownIcon />
               </div>
-              <CardStack onStart={onStart} />
+              <CardStack />
             </div>
           </div>
         </div>
@@ -141,7 +142,7 @@ export default function LandingScreen({ onStart, onStartTranslate, onStartInterp
             <SmileySticker className="-top-8 right-0 hidden md:block" />
           </div>
 
-          <div className="motion-stagger mt-12 grid grid-cols-1 gap-6 md:grid-cols-3">
+          <div className="motion-stagger mt-12 grid grid-cols-1 gap-6 md:grid-cols-2">
             <FeatureCard
               color="blue"
               tag="Voz y texto"
@@ -157,14 +158,6 @@ export default function LandingScreen({ onStart, onStartTranslate, onStartInterp
               description="Apunta la cámara a las señas y conviértelas en texto o voz al instante."
               icon={<CameraIcon />}
               onStart={onStartInterpret || onStart}
-            />
-            <FeatureCard
-              color="green"
-              tag="Animado"
-              title="Avatar 3D"
-              description="Un avatar realiza las señas con movimientos naturales y fáciles de seguir."
-              icon={<AvatarIcon />}
-              onStart={onStartTranslate || onStart}
             />
           </div>
         </div>
@@ -500,15 +493,17 @@ const STACK_COLORS = {
   purple: { border: 'border-pastel-purple-line', box: 'bg-pastel-purple/50' },
 }
 
-function ContentCard({ color, number, icon, title, description, onStart, className = '' }) {
+function ContentCard({ color, number, icon, title, description, active, onActivate, className = '' }) {
   const c = STACK_COLORS[color]
   return (
     <button
-      onClick={onStart}
+      type="button"
+      onClick={onActivate}
       className={
         'group absolute w-[200px] rounded-[1.75rem] border-2 bg-white p-5 text-left shadow-[0_24px_48px_-28px_rgba(45,42,38,0.5)] transition-all duration-300 ' +
         'hover:z-40 hover:-translate-y-4 hover:rotate-0 hover:scale-[1.05] hover:shadow-[0_34px_60px_-26px_rgba(45,42,38,0.55)] ' +
         'focus-visible:z-40 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-pastel-ink/10 ' +
+        (active ? 'z-40 -translate-y-4 rotate-0 scale-[1.05] shadow-[0_34px_60px_-26px_rgba(45,42,38,0.55)] ' : '') +
         c.border +
         ' ' +
         className
@@ -516,9 +511,6 @@ function ContentCard({ color, number, icon, title, description, onStart, classNa
     >
       <div className="flex items-center justify-between">
         <span className="text-xl font-extrabold text-pastel-ink">{number}</span>
-        <span className="flex h-8 w-8 items-center justify-center rounded-full border-2 border-pastel-ink/15 bg-white text-pastel-ink opacity-0 transition group-hover:opacity-100 [&>svg]:h-3.5 [&>svg]:w-3.5">
-          <ArrowRightIcon />
-        </span>
       </div>
       <div className="mt-2 h-0.5 w-full rounded-full bg-pastel-ink/10" />
       <div className="my-5 flex justify-center">
@@ -532,7 +524,13 @@ function ContentCard({ color, number, icon, title, description, onStart, classNa
   )
 }
 
-function CardStack({ onStart }) {
+function CardStack() {
+  // Las cards solo se "levantan" para leerlas mejor (como el hover en
+  // desktop) — tocarlas en móvil NO debe navegar a ningún lado, solo mostrar
+  // el contenido completo de esa card.
+  const [active, setActive] = useState(null)
+  const toggle = (i) => setActive((prev) => (prev === i ? null : i))
+
   return (
     <div className="relative mx-auto h-[400px] w-full max-w-[460px]">
       <ContentCard
@@ -541,7 +539,8 @@ function CardStack({ onStart }) {
         icon={<ChatIcon />}
         title="Sin barreras"
         description="Habla con personas sordas aunque no sepas señas."
-        onStart={onStart}
+        active={active === 0}
+        onActivate={() => toggle(0)}
         className="left-0 top-8 z-[1] -rotate-[8deg]"
       />
       <ContentCard
@@ -550,7 +549,8 @@ function CardStack({ onStart }) {
         icon={<BoltIcon />}
         title="Al instante"
         description="Traduce e interpreta en tiempo real, sin intérprete."
-        onStart={onStart}
+        active={active === 1}
+        onActivate={() => toggle(1)}
         className="left-1/2 top-0 z-[2] -translate-x-1/2 rotate-0"
       />
       <ContentCard
@@ -559,7 +559,8 @@ function CardStack({ onStart }) {
         icon={<HeartIcon />}
         title="Para todos"
         description="Comunicación accesible e inclusiva para cualquiera."
-        onStart={onStart}
+        active={active === 2}
+        onActivate={() => toggle(2)}
         className="right-0 top-8 z-[3] rotate-[8deg]"
       />
     </div>
@@ -661,15 +662,6 @@ function CameraIcon() {
     <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
       <path d="M4 7h3l1.5-2h7L17 7h3a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V8a1 1 0 0 1 1-1z" />
       <circle cx="12" cy="13" r="3.5" />
-    </svg>
-  )
-}
-
-function AvatarIcon() {
-  return (
-    <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <circle cx="12" cy="8" r="4" />
-      <path d="M5 21c0-3.87 3.13-7 7-7s7 3.13 7 7" />
     </svg>
   )
 }

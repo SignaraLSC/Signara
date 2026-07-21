@@ -23,28 +23,36 @@ import { createBaker } from '../utils/vrmBaker.js'
 import { playSolverAnim } from '../utils/vrmPlayer.js'
 
 const AVATAR_URL = '/avatar/signara-avatar.vrm'
+// Subir esto invalida el cache en memoria tras cambios del baker (SED/cuello, etc.).
+const BAKE_CACHE_VER = 6
+/** @type {Record<string, unknown>} */
+const sharedBakeCache = {}
+/** @type {Record<string, unknown>} */
+const sharedDatasetCache = {}
+
+// Señales frecuentes: hornear en idle para que la 1ª reproducción no espere bake.
+const PREFETCH_TOKENS = [
+  'HOLA', 'SI', 'NO', 'GRACIAS', 'POR_FAVOR', 'TENGO_SED', 'BIEN', 'MAL',
+  'COMO_ESTAS', 'DE_NADA', 'ADIOS',
+]
 
 const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, onFinish }, ref) {
   const canvasRef = useRef(null)
   const sceneRef = useRef(null)
   const vrmRef = useRef(null)
   const bakerRef = useRef(null)
-  const cacheRef = useRef({}) // token -> dataset crudo de la API
-  const bakeCacheRef = useRef({}) // token -> keyframes ya horneados (evita re-bake lento)
   const queueRef = useRef([])
   const playingRef = useRef(false)
   const cancelPlayRef = useRef(null)
   const [avatarReady, setAvatarReady] = useState(false)
   const [avatarError, setAvatarError] = useState(false)
-  const [status, setStatus] = useState('idle') // 'idle' | 'loading' | 'playing' (de una seña)
-  const [everPlayed, setEverPlayed] = useState(false)
 
   const fetchDataset = useCallback(async (token) => {
-    if (cacheRef.current[token]) return cacheRef.current[token]
+    if (sharedDatasetCache[token]) return sharedDatasetCache[token]
     const res = await fetch(`${apiUrl}/sign/${token}`)
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const data = await res.json()
-    cacheRef.current[token] = data
+    sharedDatasetCache[token] = data
     return data
   }, [apiUrl])
 
@@ -54,8 +62,15 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
     if (!canvas) return
     let cancelled = false
 
-    const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true })
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2))
+    // Nitidez en card: antialias + pixelRatio hasta 2 (el blur venía de
+    // forzar 1× sin AA en pantallas HiDPI).
+    const renderer = new THREE.WebGLRenderer({
+      canvas,
+      antialias: true,
+      alpha: true,
+      powerPreference: 'high-performance',
+    })
+    renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1))
     const w = canvas.clientWidth, h = canvas.clientHeight
     renderer.setSize(w, h, false)
 
@@ -81,20 +96,37 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
 
     let lastMs = performance.now()
     let animId
-    const render = () => {
+    let lastDrawMs = 0
+    const render = (nowMs) => {
       animId = requestAnimationFrame(render)
-      const nowMs = performance.now()
-      if (vrmRef.current) vrmRef.current.update((nowMs - lastMs) / 1000)
+      // Idle ~20 fps; al reproducir seña, full rAF.
+      const playing = playingRef.current
+      if (!playing && nowMs - lastDrawMs < 50) return
+      lastDrawMs = nowMs
+      const dt = (nowMs - lastMs) / 1000
       lastMs = nowMs
+      if (vrmRef.current) vrmRef.current.update(dt)
       renderer.render(scene, camera)
     }
-    render()
+    animId = requestAnimationFrame(render)
 
+    THREE.Cache.enabled = true
     const loader = new GLTFLoader()
     loader.register((parser) => new VRMLoaderPlugin(parser))
     loader.loadAsync(AVATAR_URL).then((gltf) => {
       if (cancelled) return
       const vrm = gltf.userData.vrm
+      vrm.scene.traverse((obj) => {
+        if (obj.isMesh) {
+          obj.frustumCulled = true
+          if (obj.material) {
+            const mats = Array.isArray(obj.material) ? obj.material : [obj.material]
+            for (const m of mats) {
+              if (m) m.toneMapped = false
+            }
+          }
+        }
+      })
       scene.add(vrm.scene)
       setIdlePose(vrm)
       vrmRef.current = vrm
@@ -124,24 +156,45 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
     }
   }, [])
 
+  // Precarga bake de señas frecuentes en idle (sin mensaje en UI).
+  useEffect(() => {
+    if (!avatarReady || !bakerRef.current) return
+    let cancelled = false
+    ;(async () => {
+      for (const token of PREFETCH_TOKENS) {
+        if (cancelled) return
+        const key = `${BAKE_CACHE_VER}:${token}`
+        if (sharedBakeCache[key]) continue
+        try {
+          const dataset = await fetchDataset(token)
+          if (cancelled || !bakerRef.current) return
+          sharedBakeCache[key] = bakerRef.current.bakeSolver(dataset)
+        } catch {
+          // Token no disponible en esta API — seguir con el resto.
+        }
+        // Ceder un frame entre bakes para no congelar la UI.
+        await new Promise((r) => requestAnimationFrame(r))
+      }
+    })()
+    return () => { cancelled = true }
+  }, [avatarReady, fetchDataset])
+
   const processQueue = useCallback(async () => {
     if (playingRef.current) return
-    if (queueRef.current.length === 0) { setStatus('idle'); onFinish?.(); return }
-    if (!vrmRef.current || !bakerRef.current) return // el avatar aún está cargando; reintenta cuando termine
+    if (queueRef.current.length === 0) { onFinish?.(); return }
+    if (!vrmRef.current || !bakerRef.current) return
     playingRef.current = true
     const token = queueRef.current.shift()
     onSign?.(token)
     try {
-      setStatus('loading')
-      let keyframes = bakeCacheRef.current[token]
+      const key = `${BAKE_CACHE_VER}:${token}`
+      let keyframes = sharedBakeCache[key]
       if (!keyframes) {
         const dataset = await fetchDataset(token)
         keyframes = bakerRef.current.bakeSolver(dataset)
-        bakeCacheRef.current[token] = keyframes
+        sharedBakeCache[key] = keyframes
       }
       setIdlePose(vrmRef.current)
-      setStatus('playing')
-      setEverPlayed(true)
       cancelPlayRef.current = playSolverAnim(vrmRef.current, keyframes, () => {
         playingRef.current = false
         processQueue()
@@ -153,8 +206,6 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
     }
   }, [fetchDataset, onSign, onFinish])
 
-  // Si la cola llegó antes de que el VRM terminara de cargar, reintenta apenas
-  // esté listo (evita perder la primera palabra si el usuario escribe rápido).
   useEffect(() => {
     if (avatarReady && queueRef.current.length && !playingRef.current) processQueue()
   }, [avatarReady, processQueue])
@@ -172,7 +223,6 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
       playingRef.current = false
       queueRef.current = []
       if (vrmRef.current) setIdlePose(vrmRef.current)
-      setStatus('idle')
     },
   }), [processQueue])
 
@@ -182,11 +232,6 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
       {!avatarReady && !avatarError && (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
           <span className="text-xs text-pastel-sub">Cargando avatar…</span>
-        </div>
-      )}
-      {avatarReady && status === 'loading' && !everPlayed && (
-        <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
-          <span className="text-xs text-pastel-sub">Cargando animación…</span>
         </div>
       )}
       {avatarError && (

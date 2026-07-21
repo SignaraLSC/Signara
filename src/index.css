@@ -22,6 +22,32 @@ body {
   background: #F7F3EA;
 }
 
+/* El cursor de texto parpadeante que aparece al tocar cualquier letra de la
+   página (botones, párrafos, títulos...) no es un bug de markup — es
+   "navegación con cursor" (caret browsing), un modo de accesibilidad del
+   navegador que se activa sin querer con F7 y permite posicionar un cursor
+   de texto en cualquier texto de la página. Una web no puede desactivar el
+   modo en sí, pero SÍ puede ocultar el cursor visualmente con
+   caret-color — se aplica a toda la página y se restaura solo donde de
+   verdad hace falta (los inputs reales de texto), para no perder el cursor
+   de escritura ahí. */
+* {
+  caret-color: transparent;
+}
+input,
+textarea,
+[contenteditable='true'] {
+  caret-color: auto;
+}
+
+/* Además, dentro de botones/iconos tampoco debe poder seleccionarse texto
+   ni posicionarse el cursor — ahí nunca hay nada editable. */
+button,
+[role="button"] {
+  -webkit-user-select: none;
+  user-select: none;
+}
+
 /* Fondo del landing — claro tipo papel estilo "Synapse" */
 .landing-page-bg {
   position: relative;
@@ -56,20 +82,13 @@ body {
            shadow-[0_30px_70px_-40px_rgba(45,42,38,0.55)];
   }
 
-  /* Barra fija tipo Apple: vidrio esmerilado + saturación */
+  /* Nav: fondo sólido (sin backdrop-filter) — el blur permanente competía
+     con WebGL/MediaPipe y hacía lenta toda la app. */
   .landing-nav-glass {
     @apply fixed inset-x-0 top-0 z-50;
-    background-color: rgba(247, 243, 234, 0.62);
-    -webkit-backdrop-filter: saturate(180%) blur(20px);
-    backdrop-filter: saturate(180%) blur(20px);
+    background-color: rgba(247, 243, 234, 0.96);
     border-bottom: 1px solid rgba(45, 42, 38, 0.08);
     box-shadow: 0 1px 0 rgba(255, 255, 255, 0.45) inset;
-  }
-
-  @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
-    .landing-nav-glass {
-      background-color: rgba(247, 243, 234, 0.94);
-    }
   }
 
   /* Capa modal: blur tipo Apple, sin oscurecer fuerte */
@@ -113,9 +132,7 @@ body {
   }
 
   .tutorial-mobile-header {
-    background: rgba(250, 246, 236, 0.96);
-    backdrop-filter: blur(10px);
-    -webkit-backdrop-filter: blur(10px);
+    background: rgba(250, 246, 236, 0.98);
     box-shadow: 0 1px 0 rgba(45, 42, 38, 0.06);
   }
 
@@ -510,6 +527,61 @@ body {
   }
 }
 
+/* Pantalla Traducir: en móvil el avatar va DEBAJO del cuadro de texto/mic y
+   ARRIBA de "Prueba con un clic" (no como bloque aparte antes de todo el
+   panel); en desktop (lg) vuelve a las dos columnas de siempre. Se usa
+   grid-template-areas en vez de simple `order` porque hay que intercalar el
+   avatar ENTRE dos mitades de un mismo componente (TextInputPanel), cuyo
+   <form> raíz usa display:contents para que sus dos mitades cuenten como
+   items directos de esta grilla. */
+.translate-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas:
+    'tabsinput'
+    'avatar'
+    'examples'
+    'dijiste'
+    'palabras';
+  gap: 1.5rem;
+}
+/* Sin combinador `>`: ta-tabsinput/ta-examples son hijos del <form
+   className="contents"> (grid item por promoción de caja), no hijos DOM
+   directos de .translate-layout — el selector de hijo directo no los
+   alcanzaría aunque el layout sí los trate como items de esta grilla. */
+/* min-width:0 en cada item: por defecto un item de grid tiene
+   min-width:auto, que toma el ancho mínimo de contenido de TODO lo que hay
+   adentro (texto largo, botones, etc.) — eso puede forzar la columna a ser
+   más ancha que el viewport y romper el responsive en móvil. flex-col (el
+   layout anterior) no tenía este problema porque ese min-content-width
+   automático solo afecta el eje principal (altura en flex-col), no el ancho. */
+.ta-tabsinput,
+.ta-avatar,
+.ta-examples,
+.ta-dijiste,
+.ta-palabras {
+  min-width: 0;
+}
+.ta-tabsinput { grid-area: tabsinput; }
+.ta-avatar { grid-area: avatar; }
+.ta-examples { grid-area: examples; }
+.ta-dijiste { grid-area: dijiste; }
+.ta-palabras { grid-area: palabras; }
+
+@media (min-width: 1024px) {
+  .translate-layout {
+    grid-template-columns: minmax(0, 5fr) minmax(0, 7fr);
+    grid-template-areas:
+      'tabsinput avatar'
+      'examples avatar'
+      'dijiste avatar'
+      'palabras avatar';
+    column-gap: 2rem;
+    row-gap: 1.25rem;
+    align-items: start;
+  }
+}
+
 @keyframes gradient-flow {
   0%, 100% { background-position: 0% 50%; }
   50% { background-position: 100% 50%; }
@@ -518,4 +590,69 @@ body {
 @keyframes gradient-text-flow {
   0%, 100% { background-position: 0% center; }
   50% { background-position: 100% center; }
+}
+
+/* Overlay de cámara (permisos / cargando / conectando): difuminado azul↔morado */
+@keyframes camera-ambient-shift {
+  0%,
+  100% {
+    background-position: 0% 40%;
+  }
+  50% {
+    background-position: 100% 60%;
+  }
+}
+
+.camera-ambient-bg {
+  /* Gris + puntos: el card blanco destaca encima. */
+  background-color: #E8E6E0;
+  background-image: radial-gradient(rgba(45, 42, 38, 0.08) 1px, transparent 1px);
+  background-size: 18px 18px;
+}
+
+/* Indicador “En vivo”: 3 puntos (sin filter: blur animado — re-pinta capas). */
+@keyframes live-dot-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.82);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.live-dots {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.live-dot {
+  display: block;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 9999px;
+  background: linear-gradient(135deg, #2E7CF8 0%, #7E64C9 100%);
+  animation: live-dot-pulse 1.15s ease-in-out infinite;
+}
+
+.live-dot:nth-child(2) {
+  animation-delay: 0.18s;
+}
+
+.live-dot:nth-child(3) {
+  animation-delay: 0.36s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .camera-ambient-bg,
+  .live-dot {
+    animation: none;
+  }
+
+  .live-dot {
+    opacity: 0.85;
+  }
 }

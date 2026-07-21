@@ -39,11 +39,21 @@ export const CONFIG = {
   // ── Cabeza (Fase 3) ── nariz/orejas ya vienen en pose_world (33 puntos),
   // no hace falta grabar nada extra. Ejes por calibrar con el panel 🔧 Cabeza.
   headYawAxis:   'y',  // eje de girar la cabeza de lado a lado (NO)
-  headPitchAxis: 'x',  // eje de asentir arriba/abajo (SÍ)
+  headPitchAxis: 'x',  // eje de asentir / alzar (arriba-abajo)
   headYawSign:   1,
-  headPitchSign: 1,
-  headGain:      1.3,  // el movimiento de cabeza real es sutil; se amplifica un poco
+  // VRM: +X en la cabeza baja la barbilla; MediaPipe “nariz arriba” debe
+  // mapear a alzar → signo negativo.
+  headPitchSign: -1,
+  headGain:      2.2,  // MediaPipe da pitch muy pequeño; amplificar para que se vea
   headSmooth:    0.5,
+  // Alza de cabeza solo en señas whitelist (TENGO_SED). En HOLA la mano toca
+  // la sien y un assist genérico hacía un movimiento raro de cabeza/cuello.
+  headNeckAssist: 0.75,
+  headNeckAssistTokens: ['TENGO_SED'],
+  // Atracción a la garganta (0..1). No demasiado alta: si el weight cae un
+  // poco al alejarse, un pull fuerte se nota como tirón. El fade temporal
+  // (smoothNeckWeightSeq) hace el resto.
+  wristNeckPull: 0.42,
 
   // ── Dedos (Fase 2) ──
   fingerGain: 1.0,   // escala del doblez de dedos (1 = ángulo real)

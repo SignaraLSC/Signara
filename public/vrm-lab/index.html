@@ -81,7 +81,7 @@
     import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
     import { VRMLoaderPlugin } from '@pixiv/three-vrm';
     import { setIdlePose, translateToLSC, playKeyframes } from './animations.js?v=lab4';
-    import { frameToArmDirs, frameFingers, frameWristBasis, frameHandBasis, despikeWristSeq, frameHeadRotation, smoothHeadSeq, activeArms, smoothPoseSeq, smoothVecSeq, trimLeadIn, trimTrailOut, CONFIG } from './solver.js?v=lab28';
+    import { frameToArmDirs, frameFingers, frameWristBasis, frameHandBasis, despikeWristSeq, frameHeadRotation, smoothHeadSeq, activeArms, smoothPoseSeq, smoothVecSeq, trimLeadIn, trimTrailOut, CONFIG } from './solver.js?v=lab32';
 
     const statusEl = document.getElementById('status');
     const setStatus = (msg, kind = '') => { statusEl.textContent = msg; statusEl.className = kind; };
@@ -635,6 +635,33 @@
         const off = T.clone().sub(C_avatar);
         return Math.abs(off.x) < TORSO_HALF_WIDTH && off.y < TORSO_UP && off.y > -TORSO_DOWN && off.z < TORSO_MIN_FWD;
       }
+      function neckZoneWeight(T, wo) {
+        if (wo && wo.length >= 3) {
+          const x = Math.abs(wo[0]), y = wo[1], z = wo[2];
+          if (!(x > 0.18 || y < 0.015 || y > 0.32 || z < 0.12 || z > 0.48)) {
+            const cx = 1 - x / 0.18;
+            const cy = 0.4 + 0.6 * Math.min(1, (y - 0.015) / 0.1);
+            const cz = 0.5 + 0.5 * Math.min(1, (z - 0.12) / 0.12);
+            return Math.max(0, Math.min(1, cx * cy * cz));
+          }
+        }
+        const off = T.clone().sub(C_avatar);
+        const nx = Math.abs(off.x) / (shoulderHalfW * 1.15);
+        if (nx > 1) return 0;
+        if (off.y < shoulderHalfW * 0.05 || off.y > shoulderHalfW * 2.2) return 0;
+        if (off.z < shoulderHalfW * 0.15 || off.z > shoulderHalfW * 3.2) return 0;
+        const cx = 1 - nx;
+        const cy = 0.4 + 0.6 * Math.min(1, (off.y - shoulderHalfW * 0.05) / (shoulderHalfW * 1.0));
+        return Math.max(0, Math.min(1, cx * cy));
+      }
+      function pullWristToNeck(T, weight) {
+        if (weight < 0.05) return T;
+        const pull = (CONFIG.wristNeckPull ?? 0.55) * weight;
+        const throat = new THREE.Vector3(0, shoulderHalfW * 0.32, shoulderHalfW * 0.55);
+        const off = T.clone().sub(C_avatar);
+        off.lerp(throat, pull);
+        return C_avatar.clone().add(off);
+      }
       // Cuando las dos manos se juntan (p.ej. GRACIAS): la de ABAJO (derecha)
       // no debe meterse en el pecho ni ocupar el mismo volumen que la de
       // ARRIBA (izquierda en barbilla). Se apilan: misma X aprox., Y separada,
@@ -765,7 +792,9 @@
           const scale = (B.L1 + B.L2) / (armLenRef[name] || d.recArmLen);
           let T = C_avatar.clone().addScaledVector(new THREE.Vector3(...d.wristOffset), scale);
           T = avoidTorso(T);
-          tg[name] = { B, d, S, T };
+          const neckW = neckZoneWeight(T, d.wristOffset);
+          if (neckW > 0) T = pullWristToNeck(T, neckW);
+          tg[name] = { B, d, S, T, neckW };
         }
         if (tg.right && tg.left) {
           const gap = tg.right.T.distanceTo(tg.left.T);
@@ -832,6 +861,30 @@
         }
         Object.assign(pose, fingSmooth[i]);   // dedos ya suavizados
         pose.head = headEuler(headSmooth[i]);  // cabeza (asentir/girar), independiente de brazos
+        {
+          const axis = CONFIG.headPitchAxis || 'x';
+          const maxAssist = CONFIG.headNeckAssist ?? 0.75;
+          let w = 0;
+          for (const side of ['right', 'left']) {
+            const t = tg[side];
+            if (!t) continue;
+            w = Math.max(w, t.neckW || neckZoneWeight(t.T, t.d && t.d.wristOffset));
+          }
+          if (w > 0.05) {
+            const sign = CONFIG.headPitchSign ?? -1;
+            const assist = maxAssist * (0.55 + 0.45 * w);
+            const cur = pose.head[axis] || 0;
+            const target = assist * sign;
+            pose.head[axis] = sign >= 0 ? Math.max(cur, target) : Math.min(cur, target);
+            pose.neck = {
+              x: axis === 'x' ? assist * 0.55 * sign : 0,
+              y: axis === 'y' ? assist * 0.55 * sign : 0,
+              z: 0,
+            };
+          } else {
+            pose.neck = { x: 0, y: 0, z: 0 };
+          }
+        }
         poses.push(pose);
       }
       // Blindaje de bordes: si un brazo activo en la seña no se detectó en el

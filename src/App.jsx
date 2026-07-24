@@ -39,10 +39,10 @@ function ScreenFallback() {
         backgroundSize: '18px 18px',
       }}
     >
-      <div className="flex flex-col items-center gap-3 rounded-2xl border-2 border-pastel-ink/15 bg-white/90 px-10 py-8 text-pastel-sub">
-        <span className="h-8 w-8 animate-spin rounded-full border-4 border-pastel-ink/10 border-t-pastel-grape" />
-        <span className="text-sm font-semibold">Cargando…</span>
-      </div>
+      <span
+        className="h-8 w-8 animate-spin rounded-full border-4 border-pastel-ink/10 border-t-pastel-grape"
+        aria-label="Cargando"
+      />
     </div>
   )
 }
@@ -123,6 +123,7 @@ export default function App() {
       importInterpret()
       preloadAvatarVrm()
       // Dinámico: no meter MediaPipe en el bundle del landing.
+      // Segmenter (fondo estudio) se carga solo si el usuario lo activa.
       import('./utils/handLandmarker.js').then((m) => m.warmupHandLandmarker())
     }
   }, [screen])

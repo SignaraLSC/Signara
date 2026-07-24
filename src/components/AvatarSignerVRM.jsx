@@ -25,7 +25,7 @@ import { parsePlayToken } from '../utils/directionalVerbs.js'
 
 const AVATAR_URL = '/avatar/signara-avatar.vrm'
 // Subir esto invalida el cache en memoria tras cambios del baker (SED/cuello, etc.).
-const BAKE_CACHE_VER = 51 // PERDON: sin overrides de manos (solo grabación)
+const BAKE_CACHE_VER = 54 // PERDON: no inventar pila de manos
 /** @type {Record<string, unknown>} */
 const sharedBakeCache = {}
 /** @type {Record<string, unknown>} */
@@ -34,7 +34,7 @@ const sharedDatasetCache = {}
 // Señales frecuentes: hornear en idle para que la 1ª reproducción no espere bake.
 const PREFETCH_TOKENS = [
   'HOLA', 'SI', 'NO', 'GRACIAS', 'POR_FAVOR', 'TENGO_SED', 'BIEN', 'MAL',
-  'COMO_ESTAS', 'DE_NADA', 'ADIOS',
+  'COMO_ESTAS', 'DE_NADA', 'ADIOS', 'SCOOBA', 'TE_AMO',
 ]
 
 const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, onFinish }, ref) {

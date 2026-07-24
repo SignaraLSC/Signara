@@ -186,11 +186,15 @@ export function createBaker(vrm) {
     // Overrides mínimos de giro de palma (solo donde el +45° global no basta).
     // MAL: pulgar abajo → hace falta ~−100° (menos de −90°).
     const token = (dataset.token || '').toUpperCase()
-    const WRIST_OVERRIDES = { MAL: (-100 * Math.PI) / 180 }
+    const WRIST_OVERRIDES = {
+      MAL: (-100 * Math.PI) / 180,
+      // SCOOBA: palma de la mano en boca más de frente al rostro.
+      SCOOBA: (55 * Math.PI) / 180,
+    }
     // Overrides calibrados contra la fuente 'pose' — no aplican si se está
     // probando 'hand' (esa fuente tiene su propio giro base, wristRollHand).
     const bakeWristRoll = CONFIG.wristSource === 'hand'
-      ? CONFIG.wristRollHand
+      ? (token in WRIST_OVERRIDES ? WRIST_OVERRIDES[token] : CONFIG.wristRollHand)
       : (token in WRIST_OVERRIDES ? WRIST_OVERRIDES[token] : CONFIG.wristRoll)
     const R = {
       up: getBone('rightUpperArm'), lo: getBone('rightLowerArm'),
@@ -357,6 +361,10 @@ export function createBaker(vrm) {
       const dy = Math.abs(hiT.y - loT.y)
       // Más separación horizontal que vertical → lado a lado, no pila.
       if (dx >= dy && dx > shoulderHalfW * 0.18) return
+      // PERDON/FAMILIA: ruido de profundidad a veces deja dy≈dx y ESTO
+      // inventaba una pila (una mano al cuello, la otra a la cintura).
+      // Solo reforzar pilas YA claras en la toma (ΔY claramente dominante).
+      if (dy < dx * 1.2 || dy < shoulderHalfW * 0.12) return
       const sepY = shoulderHalfW * 0.16
       const minFwdLo = shoulderHalfW * 0.58 // clearance pecho para la mano baja
       const stackZ = shoulderHalfW * 0.08 // baja un poco más hacia cámara
@@ -388,16 +396,28 @@ export function createBaker(vrm) {
       a.y = midY
       b.y = midY
     }
-    const frames = dataset.frames || []
+    const framesIn = dataset.frames || []
+    // Quitar frames sin ninguna mano (p.ej. último frame de SCOOBA con lh en ceros).
+    const frames = framesIn.filter((f) => {
+      const handOk = (h) =>
+        Array.isArray(h) && h.some((p) => p && Math.abs(p[0]) + Math.abs(p[1]) + Math.abs(p[2] || 0) > 1e-6)
+      return handOk(f.lh) || handOk(f.rh)
+    })
+    if (!frames.length) return []
+    const bakeToken = (dataset.token || '').toUpperCase()
+    // Señales con mano en cara/boca O manos lado a lado: no apilar ni
+    // avoidTorso duro (inventaba “una arriba / una abajo” en PERDON).
+    const NEAR_FACE_SIGNS = new Set(['HOLA', 'SCOOBA', 'PERDON', 'GRACIAS', 'TENGO_SED'])
+    const SIDE_BY_SIDE_SIGNS = new Set(['PERDON', 'FAMILIA', 'BIEN', 'MAL'])
+    const nearFace = NEAR_FACE_SIGNS.has(bakeToken)
+    const sideBySide = SIDE_BY_SIDE_SIGNS.has(bakeToken)
+    const skipStack = nearFace || sideBySide
     // 1) Datos crudos por frame: IK (wristDir, reachFrac, pole) + muñeca + dedos.
     const rawDirs = frames.map((f) => frameToArmDirs(f, arms))
     // Base de la muñeca: 'hand' (frameHandBasis, 21 landmarks) es la fuente por
     // defecto para todas las señas (ver CONFIG.wristSource en vrmSolver.js).
-    // NEAR_FACE_SIGNS fuerza frameHandBasis en señas puntuales aunque la fuente
-    // global fuera 'pose' — hoy es redundante con wristSource='hand' pero se
-    // deja por si algún día se vuelve a 'pose' como default.
-    const NEAR_FACE_SIGNS = new Set(['HOLA'])
-    const useHandBasis = CONFIG.wristSource === 'hand' || NEAR_FACE_SIGNS.has((dataset.token || '').toUpperCase())
+    // NEAR_FACE_SIGNS fuerza frameHandBasis aunque la fuente global fuera 'pose'.
+    const useHandBasis = CONFIG.wristSource === 'hand' || nearFace
     const rawWri = frames.map((f) => {
       const pb = frameWristBasis(f, arms)
       const hb = frameHandBasis(f, arms)
@@ -505,14 +525,16 @@ export function createBaker(vrm) {
         const S = B.up.getWorldPosition(new THREE.Vector3()) // hombro (fijo, no depende de la pose)
         const scale = (B.L1 + B.L2) / (armLenRef[name] || d.recArmLen)
         let T = C_avatar.clone().addScaledVector(new THREE.Vector3(...d.wristOffset), scale)
-        T = avoidTorso(T)
+        // Cerca de cara/boca: no empujar con avoidTorso (aplana SCOOBA/HOLA…).
+        if (!nearFace) T = avoidTorso(T)
         const neckW = neckZoneWeight(T, d.wristOffset)
         tg[name] = { B, d, S, T, neckW }
       }
       if (tg.right && tg.left) {
         const gap = tg.right.T.distanceTo(tg.left.T)
         const near = 1.0 * (R.L1 + R.L2)
-        if (gap < near) {
+        // SCOOBA/cerca de cara: NO atraer manos al centro (rompe boca + barrido).
+        if (!nearFace && gap < near) {
           const mid = tg.right.T.clone().add(tg.left.T).multiplyScalar(0.5)
           const pull = CONFIG.handAttract * (1 - gap / near)
           tg.right.T.lerp(mid, pull)
@@ -520,8 +542,10 @@ export function createBaker(vrm) {
           tg.right.T.copy(avoidTorso(tg.right.T))
           tg.left.T.copy(avoidTorso(tg.left.T))
         }
-        stackHands(tg)
-        levelSideBySideHands(tg)
+        if (!skipStack) {
+          stackHands(tg)
+          levelSideBySideHands(tg)
+        }
         for (const name of ['right', 'left']) {
           if (!tg[name]) continue
           tg[name].neckW = Math.max(
@@ -546,6 +570,27 @@ export function createBaker(vrm) {
         if (!t) continue
         t.neckW = smoothW[i] || 0
         if (useNeckAssist && t.neckW > 0.02) t.T = pullWristToNeck(t.T, t.neckW)
+      }
+    }
+    // SCOOBA: la mano que barre apenas se mueve en la toma (~12% ancho).
+    // Amplificar el ΔX de la mano móvil para que el barrido se lea en el VRM.
+    if (bakeToken === 'SCOOBA') {
+      for (const side of ['right', 'left']) {
+        const xs = allTg.map((tg) => (tg[side] ? tg[side].T.x : null)).filter((x) => x != null)
+        if (xs.length < 4) continue
+        const minX = Math.min(...xs)
+        const maxX = Math.max(...xs)
+        const span = maxX - minX
+        // Mano fija (la de la boca): span muy chico → no tocar.
+        if (span < shoulderHalfW * 0.06) continue
+        const targetSpan = shoulderHalfW * 0.7
+        if (span >= targetSpan) continue
+        const mid = (minX + maxX) * 0.5
+        const gain = Math.min(2.6, targetSpan / Math.max(span, 1e-4))
+        for (const tg of allTg) {
+          if (!tg[side]) continue
+          tg[side].T.x = mid + (tg[side].T.x - mid) * gain
+        }
       }
     }
     // Verbo direccional: re-dirige TODA la seña hacia el destino pedido
@@ -654,8 +699,12 @@ export function createBaker(vrm) {
             wri.normal = rotArrYaw(wri.normal, qYaw)
           }
         }
-        stackHands(tg)
-        levelSideBySideHands(tg)
+        if (sideBySide) {
+          levelSideBySideHands(tg)
+        } else if (!nearFace) {
+          stackHands(tg)
+          levelSideBySideHands(tg)
+        }
         for (const n of active) tg[n].T.copy(avoidTorso(tg[n].T))
       }
     }

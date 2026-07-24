@@ -12,7 +12,7 @@ const HAND_MODEL_URL =
 let sharedHandLandmarker = null
 let sharedHandPromise = null
 // Subir al cambiar umbrales/opciones (el singleton no se recrea solo).
-const LANDMARKER_REV = 2
+const LANDMARKER_REV = 3
 let sharedRev = 0
 
 export function getSharedHandLandmarker() {
@@ -28,10 +28,11 @@ export function getSharedHandLandmarker() {
       baseOptions: { modelAssetPath: HAND_MODEL_URL, delegate },
       runningMode: 'VIDEO',
       numHands: 2,
-      // Umbrales más bajos: la mano izq. (y far/edge) se perdía mucho a 0.5.
+      // Detección un poco permisiva (izq. lejos); presencia más estricta
+      // para no inventar una 2ª mano fantasma al entrar al encuadre.
       minHandDetectionConfidence: 0.35,
-      minTrackingConfidence: 0.35,
-      minHandPresenceConfidence: 0.35,
+      minTrackingConfidence: 0.4,
+      minHandPresenceConfidence: 0.45,
     })
     let hand
     try {

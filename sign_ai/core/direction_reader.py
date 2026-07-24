@@ -3,30 +3,19 @@ direction_reader.py — Fase 2B: lectura geométrica de dirección desde cámara
 
 Complemento del GNN (que solo reconoce la seña AISLADA, ej. "AYUDA"): para
 verbos direccionales, lee la trayectoria de la mano activa dentro de los
-mismos 30 frames que ya llegan a /predict y clasifica hacia dónde se dirigió
-el gesto (self/listener/third/group_self), igual que el lado del avatar
-(vrmBaker.js) hace en reversa para SALIDA. Ver
-DIRECTIONAL_VERBS en directional_verbs.py para el mapeo dirección → palabra.
+mismos frames que ya llegan a /predict y clasifica hacia dónde se dirigió
+el gesto (self/listener/third/group_self). Ver DIRECTIONAL_VERBS en
+directional_verbs.py para el mapeo dirección → palabra.
 
-Restricción real (decisión tomada 2026-07-21, ver memoria signara-sign-
-grammar-roadmap.md): /predict solo recibe landmarks de MANO (frames 30×126,
-lh 63 + rh 63 — ver core/preprocess.py), no hay pose/hombros en tiempo real
-(se sacó al migrar a MediaPipe Tasks Vision por lag). Sin esa referencia de
-cuerpo:
-  - El landmark 0 (muñeca) de cada mano es el ORIGEN de esa mano en el
-    formato de MediaPipe — su propio z es ~0 siempre, así que no sirve para
-    leer profundidad de la trayectoria.
-  - En su lugar, la profundidad ("¿la mano se acercó a la cámara, como
-    empujando hacia el interlocutor?") se aproxima con el TAMAÑO proyectado
-    de la mano (qué tan separados están sus 21 puntos en x,y) — una mano más
-    cerca de la cámara ocupa más píxeles normalizados.
-  - Lateral/vertical (¿se quedó a un lado? ¿barrió de lado a lado?) sí se lee
-    directo de x,y de la muñeca, sin necesitar cuerpo.
+Restricción real (decisión 2026-07-21): /predict solo recibe landmarks de
+MANO (T×126), no pose/hombros. La profundidad se aproxima con el tamaño
+proyectado de la mano; lateral/vertical con x,y de la muñeca.
 
-Esto es deliberadamente aproximado — los umbrales de abajo son un punto de
-partida razonable, no calibrado contra grabaciones reales todavía (no existe
-aún ningún AYUDAME/AYUDANOS/etc. grabado). Recalibrar en cuanto haya tomas
-reales, igual que se hizo con UMBRAL_CONFIANZA/MARGEN_TOP2 del GNN.
+IMPORTANTE — conjugación (2026-07-24):
+En api.py la conjugación está OFF por defecto (SIGNARA_CONJUGATE=0).
+Sin landmarks de pose/hombros, AYUDA neutro se clasificaba como AYUDAME y
+viceversa. Esta heurística queda para cuando existan tomas calibradas de
+AYUDAME / AYUDANOS / TE_AYUDO y se reactive con SIGNARA_CONJUGATE=1.
 """
 
 from __future__ import annotations
@@ -36,17 +25,16 @@ import numpy as np
 WRIST = 0
 N_HAND_LANDMARKS = 21
 
-# Cuántos frames del inicio/final se promedian para el punto de partida y de
-# llegada (suaviza contra un frame ruidoso suelto en los extremos).
 EDGE_WINDOW = 4
 
-# Umbrales sobre coordenadas normalizadas de imagen (x,y en [0,1], escala de
-# mano relativa al propio tamaño de la mano para el "spread").
-MIN_NET_MOVEMENT = 0.03       # por debajo de esto, se considera 'neutral' (sin redirección clara)
-FORWARD_SPREAD_GROWTH = 0.18  # crecimiento relativo del tamaño de mano para contar como "empuje hacia adelante"
-LATERAL_X_THRESHOLD = 0.08    # desplazamiento horizontal neto para contar como 'third'
-SWEEP_MIN_RANGE = 0.14        # rango horizontal total (max-min) para contar como barrido ('group_self')
-SWEEP_MIN_REVERSALS = 1       # al menos un cambio de sentido en x para distinguir barrido de un solo tramo
+# Umbrales conservadores: mejor decir AYUDA que inventar AYUDANOS/AYUDAME.
+MIN_NET_MOVEMENT = 0.055
+FORWARD_SPREAD_GROWTH = 0.32   # empuje claro hacia la cámara (TE_AYUDO)
+LATERAL_X_THRESHOLD = 0.12     # desplazamiento lateral neto (AYUDALO)
+SELF_UP_THRESHOLD = 0.09       # muñeca sube hacia la cara (AYUDAME); y↓ en imagen
+SWEEP_MIN_RANGE = 0.30         # barrido ancho (AYUDANOS)
+SWEEP_MIN_REVERSALS = 2        # ida y vuelta real, no un tembleque
+SWEEP_DOMINANCE = 1.15         # rango X debe dominar al |net| vertical
 
 
 def _hand_block(frames_compact: np.ndarray, side: str) -> np.ndarray:
@@ -90,9 +78,8 @@ def classify_direction(frames_compact: np.ndarray) -> dict:
     """frames_compact: (T, 126) crudo (sin normalizar), tal como llega a /predict.
 
     Devuelve {"direction": str, "debug": {...}}. "direction" es uno de
-    'neutral' | 'self' | 'listener' | 'third' | 'group_self' — mismos nombres
-    que DIRECTION_TARGETS en vrmBaker.js, para que el mapeo a palabra final
-    (directional_verbs.py) sea compartido conceptualmente con el lado avatar.
+    'neutral' | 'self' | 'listener' | 'third' | 'group_self'.
+    Por defecto 'neutral' si no hay señal clara.
     """
     picked = _pick_active_hand(frames_compact)
     if picked is None:
@@ -116,8 +103,6 @@ def classify_direction(frames_compact: np.ndarray) -> dict:
 
     xs = wrist[:, 0]
     x_range = float(xs.max() - xs.min())
-    # cuántas veces la dirección del movimiento en x cambia de signo (barrido
-    # real de lado a lado, no solo ida a un lado).
     dx = np.diff(xs)
     dx = dx[np.abs(dx) > 1e-4]
     reversals = int(np.sum(np.diff(np.sign(dx)) != 0)) if len(dx) > 1 else 0
@@ -131,16 +116,28 @@ def classify_direction(frames_compact: np.ndarray) -> dict:
         "reversals": reversals,
     }
 
-    if x_range >= SWEEP_MIN_RANGE and reversals >= SWEEP_MIN_REVERSALS:
-        return {"direction": "group_self", "debug": debug}
+    # AYUDANOS: barrido lateral amplio con ida-y-vuelta (no tembleque de AYUDA).
+    if (
+        x_range >= SWEEP_MIN_RANGE
+        and reversals >= SWEEP_MIN_REVERSALS
+        and x_range >= abs(float(net[1])) * SWEEP_DOMINANCE
+    ):
+        return {"direction": "group_self", "debug": {**debug, "reason": "sweep"}}
 
+    # TE_AYUDO: la mano crece claramente (se acerca a la cámara).
     if spread_growth >= FORWARD_SPREAD_GROWTH:
-        return {"direction": "listener", "debug": debug}
+        return {"direction": "listener", "debug": {**debug, "reason": "forward"}}
 
     if net_mag < MIN_NET_MOVEMENT:
-        return {"direction": "neutral", "debug": debug}
+        return {"direction": "neutral", "debug": {**debug, "reason": "little_motion"}}
 
-    if abs(net[0]) >= LATERAL_X_THRESHOLD:
-        return {"direction": "third", "debug": debug}
+    # AYUDALO: desplazamiento horizontal neto dominante.
+    if abs(float(net[0])) >= LATERAL_X_THRESHOLD and abs(float(net[0])) >= abs(float(net[1])):
+        return {"direction": "third", "debug": {**debug, "reason": "lateral"}}
 
-    return {"direction": "self", "debug": debug}
+    # AYUDAME: la mano sube hacia la cara (y disminuye en coords de imagen).
+    if float(net[1]) <= -SELF_UP_THRESHOLD and abs(float(net[1])) >= abs(float(net[0])):
+        return {"direction": "self", "debug": {**debug, "reason": "up_to_face"}}
+
+    # Sin evidencia fuerte → AYUDA (neutral). Nunca inventar conjugación.
+    return {"direction": "neutral", "debug": {**debug, "reason": "default_neutral"}}

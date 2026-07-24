@@ -45,15 +45,21 @@ export const INTERPRET_TUTORIAL_STEPS = [
     icon: 'bulb',
   },
   {
+    target: 'interpret-language',
+    title: 'Selecciona el idioma',
+    body: 'A la derecha, encima de «Última seña», elige el idioma de salida. La seña se reconoce en español y luego se traduce.',
+    icon: 'globe',
+  },
+  {
     target: 'interpret-start',
     title: 'Empieza la detección',
-    body: 'Pulsa «Empezar a interpretar» cuando estés listo. Activa «Voz alta» si quieres escuchar cada seña en español.',
+    body: 'Pulsa «Empezar a interpretar» cuando estés listo. Activa «Voz alta» si quieres escuchar cada seña en el idioma elegido.',
     icon: 'play',
   },
   {
     target: 'interpret-results',
     title: 'Última seña detectada',
-    body: 'Aquí aparece la seña reconocida con su nivel de confianza.',
+    body: 'Aquí aparece la seña reconocida (ya traducida al idioma que elegiste) con su nivel de confianza.',
     icon: 'target',
   },
   {

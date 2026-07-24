@@ -92,11 +92,29 @@ export default function useVoiceInput({
 
       // Respaldo (traducción de frase completa): solo cuando ya no hay nada
       // pendiente Y el texto final creció de verdad respecto al último aviso.
+      // En continuous, tras una pausa el API reenvía TODO lo final acumulado
+      // de la sesión — solo entregamos el DELTA de palabras nuevas para no
+      // retraducir / re-apendar la frase entera.
       if (isFullyFinal && finalText && finalText !== lastFinalRef.current) {
-        lastFinalRef.current = finalText
-        const cleaned = finalText.trim()
-        setTranscript(cleaned)
-        if (onResultRef.current) onResultRef.current(cleaned)
+        const prev = (lastFinalRef.current || '').trim()
+        const full = finalText.trim()
+        lastFinalRef.current = full
+        let delta = full
+        if (prev) {
+          const prevW = prev.split(/\s+/).filter(Boolean)
+          const fullW = full.split(/\s+/).filter(Boolean)
+          let i = 0
+          while (
+            i < prevW.length &&
+            i < fullW.length &&
+            prevW[i].localeCompare(fullW[i], 'es', { sensitivity: 'base' }) === 0
+          ) i++
+          delta = i > 0 ? fullW.slice(i).join(' ') : full
+        }
+        if (delta) {
+          setTranscript(delta)
+          if (onResultRef.current) onResultRef.current(delta)
+        }
       }
     }
 

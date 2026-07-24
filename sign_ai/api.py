@@ -31,6 +31,8 @@ from pydantic import BaseModel
 
 from core.gnn_model import GCN_LSTM, SEQ_LEN
 from core.confusion import evaluate_prediction
+from core.direction_reader import classify_direction
+from core.directional_verbs import DIRECTIONAL_VERBS, conjugate
 from core.preprocess import sequence_compact_to_gnn
 
 # ─── Rutas ────────────────────────────────────────────────────────────────────
@@ -125,6 +127,7 @@ class PredictResponse(BaseModel):
     prediction: str
     confidence: float
     is_idle: bool
+    direction: str | None = None  # Fase 2B: solo presente si `prediction` es un verbo direccional
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
@@ -184,10 +187,21 @@ async def predict(req: PredictRequest):
     if prediction is None or prediction == "IDLE":
         return PredictResponse(prediction="", confidence=confidence, is_idle=True)
 
+    # Fase 2B: si el label reconocido es un verbo direccional conocido, leer
+    # la trayectoria de la mano en estos mismos 30 frames y devolver la forma
+    # conjugada ("AYUDAME") en vez de la neutral ("AYUDA"). Ver
+    # core/direction_reader.py — heurística geométrica, no calibrada aún
+    # contra grabaciones reales (no existe todavía ningún AYUDAME grabado).
+    direction = None
+    if prediction in DIRECTIONAL_VERBS:
+        direction = classify_direction(data)["direction"]
+        prediction = conjugate(prediction, direction)
+
     return PredictResponse(
         prediction=prediction,
         confidence=confidence,
         is_idle=False,
+        direction=direction,
     )
 
 

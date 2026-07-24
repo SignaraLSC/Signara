@@ -33,8 +33,10 @@ export const CONFIG = {
   // para matar el ruido de un frame suelto sin aplastar el movimiento real.
   wristSmooth: 0.35, // bajado de 0.5 — quitar el temblor leve residual en pole/
                      // muñeca sin llegar al 0.10 que aplanaba el vaivén real de NO
-  handAttract: 0.7,  // cuando las dos manos están cerca, se juntan un poco más
-                     // (0 = nada, 1 = se tocan del todo)
+  // Antes 0.7: en señas lado a lado (FAMILIA) jalaba las muñecas al mismo
+  // punto y stackHands las dejaba una sobre otra. 0.25 solo acerca un poco
+  // cuando ya están muy juntas (GRACIAS), sin colapsar la separación lateral.
+  handAttract: 0.25,
 
   // ── Cabeza (Fase 3) ── nariz/orejas ya vienen en pose_world (33 puntos),
   // no hace falta grabar nada extra. Ejes por calibrar con el panel 🔧 Cabeza.
@@ -48,12 +50,26 @@ export const CONFIG = {
   headSmooth:    0.5,
   // Alza de cabeza solo en señas whitelist (TENGO_SED). En HOLA la mano toca
   // la sien y un assist genérico hacía un movimiento raro de cabeza/cuello.
-  headNeckAssist: 0.75,
+  // 0.75/0.4 rad dejaban un "tirón" hacia atrás demasiado fuerte; 0.34 rad
+  // (~19°) alza un poco más que 0.28 sin volver al tirón.
+  headNeckAssist: 0.34,
   headNeckAssistTokens: ['TENGO_SED'],
   // Atracción a la garganta (0..1). No demasiado alta: si el weight cae un
   // poco al alejarse, un pull fuerte se nota como tirón. El fade temporal
   // (smoothNeckWeightSeq) hace el resto.
   wristNeckPull: 0.42,
+  // Verbos direccionales (Fase 2 — ver src/utils/directionalVerbs.js): qué
+  // tan fuerte se re-dirige la seña completa hacia el punto de destino
+  // (0..1, constante en toda la seña). Subido de 0.4 a 0.6 (2026-07-21):
+  // con AYUDA real grabado, 0.4 no se sentía como profundidad real en
+  // AYUDAME/TE_AYUDO — el pull competía demasiado con el offset original
+  // de la toma. Seguir calibrando viendo señas reales.
+  directionalPull: 0.6,
+  // AYUDALO (direction 'third'): giro del tronco en profundidad (eje Y),
+  // no inclinación lateral. Un hombro queda un poco más adelantado (+Z) y
+  // el cuerpo “mira” hacia la derecha de pantalla. ~0.2 rad ≈ 11°.
+  // Si se ve al lado contrario, invertir el signo.
+  thirdTorsoYawY: 0.22,
 
   // ── Dedos (Fase 2) ──
   fingerGain: 1.0,   // escala del doblez de dedos (1 = ángulo real)
@@ -446,7 +462,14 @@ export function despikeWristSeq(seq) {
     for (let d = -RADIUS; d <= RADIUS; d++) {
       if (d === 0) continue;
       const j = i + d;
-      if (j >= 0 && j < n && seq[j]) dists.push(angleDeg(seq[i].fwd, seq[j].fwd));
+      if (j >= 0 && j < n && seq[j]) {
+        // También la normal de palma: en AYUDA el fwd se mantiene pero la
+        // normal salta ~100° en un frame → el brazo “se traba” a mitad.
+        dists.push(Math.max(
+          angleDeg(seq[i].fwd, seq[j].fwd),
+          angleDeg(seq[i].normal, seq[j].normal),
+        ));
+      }
     }
     if (dists.length < MIN_NEIGHBORS) continue;
     dists.sort((a, b) => a - b);
@@ -467,6 +490,69 @@ export function despikeWristSeq(seq) {
       };
     } else if (a) out[i] = { fwd: a.fwd, normal: a.normal };
     else if (b) out[i] = { fwd: b.fwd, normal: b.normal };
+  }
+  return out;
+}
+
+// Evita que la normal de palma se “invierta” a mitad de seña (tracking).
+// Si el producto punto con la referencia cae bajo 0, se refleja — en AYUDA
+// la palma debe seguir mirando arriba; un flip a mitad parece un traba.
+export function lockWristHemisphereSeq(seq) {
+  const out = seq.map((v) => (v ? { fwd: v.fwd.slice(), normal: v.normal.slice() } : null));
+  let ref = null;
+  for (let i = 0; i < out.length; i++) {
+    if (!out[i]) continue;
+    if (!ref) { ref = out[i].normal.slice(); continue; }
+    const n = out[i].normal;
+    if (n[0] * ref[0] + n[1] * ref[1] + n[2] * ref[2] < 0) {
+      out[i].normal = [-n[0], -n[1], -n[2]];
+    }
+    const ln = out[i].normal;
+    ref = vnorm([ref[0] * 0.75 + ln[0] * 0.25, ref[1] * 0.75 + ln[1] * 0.25, ref[2] * 0.75 + ln[2] * 0.25]);
+  }
+  return out;
+}
+
+// Misma idea que despikeWristSeq (mediana angular sobre ventana de vecinos)
+// pero genérica para secuencias de vectores planos [x,y,z] — usada para
+// wristOffset (posición, metros) y pole (dirección del codo, unitario).
+// despikeWristSeq solo protegía la ORIENTACIÓN de la muñeca; posición y codo
+// solo se suavizaban (smoothVecSeq/smoothVecRaw), lo que deja pasar un salto
+// de 1 frame como un "brinco y asienta" en vez de rechazarlo — visible sobre
+// todo en señas de dos manos MUY juntas (oclusión entre manos, ej. AYUDA),
+// donde MediaPipe pierde tracking de una mano por 1-2 frames (2026-07-21,
+// reportado con grabación real: "la mano izquierda salta demasiado").
+// `threshold` puede ser un número fijo o `(i) => number` para umbral
+// relativo por frame (ej. proporcional al largo de brazo de la persona).
+export function despikeVec3Seq(seq, threshold) {
+  const n = seq.length;
+  const RADIUS = 3, MIN_NEIGHBORS = 3;
+  const dist = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+  const bad = new Array(n).fill(false);
+  for (let i = 0; i < n; i++) {
+    if (!seq[i]) continue;
+    const dists = [];
+    for (let d = -RADIUS; d <= RADIUS; d++) {
+      if (d === 0) continue;
+      const j = i + d;
+      if (j >= 0 && j < n && seq[j]) dists.push(dist(seq[i], seq[j]));
+    }
+    if (dists.length < MIN_NEIGHBORS) continue;
+    dists.sort((a, b) => a - b);
+    const m = dists.length >> 1;
+    const median = dists.length % 2 ? dists[m] : (dists[m - 1] + dists[m]) / 2;
+    const th = typeof threshold === 'function' ? threshold(i) : threshold;
+    if (median > th) bad[i] = true;
+  }
+  const out = seq.map((v) => (v ? [...v] : null));
+  for (let i = 0; i < n; i++) {
+    if (!bad[i]) continue;
+    let lo = i - 1; while (lo >= 0 && (bad[lo] || !seq[lo])) lo--;
+    let hi = i + 1; while (hi < n && (bad[hi] || !seq[hi])) hi++;
+    const a = lo >= 0 ? seq[lo] : null, b = hi < n ? seq[hi] : null;
+    if (a && b) out[i] = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2];
+    else if (a) out[i] = [...a];
+    else if (b) out[i] = [...b];
   }
   return out;
 }

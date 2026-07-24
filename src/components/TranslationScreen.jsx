@@ -21,11 +21,15 @@ import { useModeTutorial } from '../hooks/useModeTutorial.js'
 import { translateText } from '../utils/translateText.js'
 import { tokenize, normalizeForSearch } from '../utils/textNormalizer.js'
 import { SIGNED_LANG_LABEL } from '../utils/signLanguage.js'
+import { resolveDirectionalForm } from '../utils/directionalVerbs.js'
 
 /**
  * Empareja las palabras del texto con las señas disponibles, reconociendo
  * frases de varias palabras (p.ej. "por favor" → token "POR_FAVOR").
- * Estrategia voraz: intenta unir hasta 3 palabras seguidas con "_".
+ * Estrategia voraz: intenta unir hasta 3 palabras seguidas con "_". Antes de
+ * aceptar un match literal, revisa si esa misma ventana de palabras es una
+ * forma conjugada de un verbo direccional (ver directionalVerbs.js) — así
+ * "ayúdame" resuelve a la toma de AYUDAR redirigida, no queda sin match.
  */
 function matchSignTokens(words, available) {
   if (!available || !available.length) return []
@@ -34,8 +38,11 @@ function matchSignTokens(words, available) {
   while (i < words.length) {
     let hit = null, len = 0
     for (let n = Math.min(3, words.length - i); n >= 1; n--) {
-      const cand = words.slice(i, i + n).join('_')
-      if (available.includes(cand)) { hit = cand; len = n; break }
+      const cand = words.slice(i, i + n)
+      const directional = resolveDirectionalForm(cand, available)
+      if (directional) { hit = directional; len = n; break }
+      const literal = cand.join('_')
+      if (available.includes(literal)) { hit = literal; len = n; break }
     }
     if (hit) { result.push(hit); i += len } else { i += 1 }
   }
@@ -53,6 +60,8 @@ function matchSignTokens(words, available) {
 function tryMatchSuffix(words, available) {
   for (let n = Math.min(3, words.length); n >= 1; n--) {
     const slice = words.slice(words.length - n)
+    const directional = resolveDirectionalForm(slice, available)
+    if (directional) return { token: directional, consumed: n }
     const cand = slice.join('_')
     if (available.includes(cand)) return { token: cand, consumed: n }
   }
@@ -308,18 +317,35 @@ export default function TranslationScreen({
     // handleSubmit) reiniciaría la cola (duplicados / se salta la del medio) y
     // además desmontaba el VRM. liveMatchedRef es síncrono (liveMode es async).
     if (liveMatchedRef.current) {
+      liveMatchedRef.current = false
       setBusy(false)
       return
     }
     if (text?.trim()) handleSubmit(text.trim())
   }, [handleSubmit])
 
-  const handlePanelSubmit = useCallback((text) => {
-    // Ojo: onResult de la voz corre en el MISMO tick que el último onLiveWord.
-    // liveMode (state) aún puede ser false → hay que mirar liveMatchedRef.
-    if (liveMatchedRef.current || liveMode) handleVoiceFinal(text)
-    else handleSubmit(text)
-  }, [liveMode, handleVoiceFinal, handleSubmit])
+  // Apagar mic: limpia UI en vivo. No toca liveMatchedRef — el onResult
+  // final de la sesión aún puede llegar y necesita ese flag.
+  const handleVoiceEnd = useCallback(() => {
+    setLiveMode(false)
+    pendingWordsRef.current = []
+    pendingWordRef.current = ''
+    setPendingWord('')
+  }, [])
+
+  const handlePanelSubmit = useCallback((text, { fromVoice = false } = {}) => {
+    // Voz: cierre de frase del reconocedor (puede ser no-op si ya señaó en vivo).
+    // Texto: SIEMPRE traduce — antes liveMatchedRef quedaba true tras el mic
+    // y el submit escrito caía en handleVoiceFinal sin hacer nada.
+    if (fromVoice) {
+      handleVoiceFinal(text)
+      return
+    }
+    liveMatchedRef.current = false
+    setLiveMode(false)
+    pendingWordsRef.current = []
+    handleSubmit(text)
+  }, [handleVoiceFinal, handleSubmit])
 
   const wordChips = originalText ? tokenize(originalText).map((w) => w.toUpperCase()) : []
   const hasPose3d = translateSource === 'pose3d' && !!poseSrc
@@ -386,6 +412,7 @@ export default function TranslationScreen({
                 initialMode={initialMode}
                 onSubmit={handlePanelSubmit}
                 onLiveWord={handleLiveWord}
+                onVoiceEnd={handleVoiceEnd}
                 busy={busy}
                 pendingWord={pendingWord}
                 missedWord={missedWord}

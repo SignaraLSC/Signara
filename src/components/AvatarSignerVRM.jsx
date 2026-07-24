@@ -21,10 +21,11 @@ import { VRMLoaderPlugin } from '@pixiv/three-vrm'
 import { setIdlePose } from '../utils/vrmIdlePose.js'
 import { createBaker } from '../utils/vrmBaker.js'
 import { playSolverAnim } from '../utils/vrmPlayer.js'
+import { parsePlayToken } from '../utils/directionalVerbs.js'
 
 const AVATAR_URL = '/avatar/signara-avatar.vrm'
 // Subir esto invalida el cache en memoria tras cambios del baker (SED/cuello, etc.).
-const BAKE_CACHE_VER = 6
+const BAKE_CACHE_VER = 50 // PERDON: quietá más atrás
 /** @type {Record<string, unknown>} */
 const sharedBakeCache = {}
 /** @type {Record<string, unknown>} */
@@ -47,12 +48,15 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
   const [avatarReady, setAvatarReady] = useState(false)
   const [avatarError, setAvatarError] = useState(false)
 
-  const fetchDataset = useCallback(async (token) => {
-    if (sharedDatasetCache[token]) return sharedDatasetCache[token]
-    const res = await fetch(`${apiUrl}/sign/${token}`)
+  // citationToken: la grabación real en el servidor (una sola por verbo,
+  // sin importar la dirección) — 'AYUDAR::self' y 'AYUDAR' piden el MISMO
+  // /sign/AYUDAR y comparten caché de dataset; solo el HORNEADO difiere.
+  const fetchDataset = useCallback(async (citationToken) => {
+    if (sharedDatasetCache[citationToken]) return sharedDatasetCache[citationToken]
+    const res = await fetch(`${apiUrl}/sign/${citationToken}`)
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const data = await res.json()
-    sharedDatasetCache[token] = data
+    sharedDatasetCache[citationToken] = data
     return data
   }, [apiUrl])
 
@@ -166,7 +170,7 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
         const key = `${BAKE_CACHE_VER}:${token}`
         if (sharedBakeCache[key]) continue
         try {
-          const dataset = await fetchDataset(token)
+          const dataset = await fetchDataset(token) // tokens de prefetch son siempre formas neutras
           if (cancelled || !bakerRef.current) return
           sharedBakeCache[key] = bakerRef.current.bakeSolver(dataset)
         } catch {
@@ -184,14 +188,17 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
     if (queueRef.current.length === 0) { onFinish?.(); return }
     if (!vrmRef.current || !bakerRef.current) return
     playingRef.current = true
-    const token = queueRef.current.shift()
+    const token = queueRef.current.shift() // ej. 'AYUDAR' o 'AYUDAR::self'
     onSign?.(token)
     try {
+      // El horneado SÍ depende de la dirección (misma grabación, distinto
+      // resultado) — la caché de bake usa el token COMPUESTO completo.
+      const { citationToken, direction } = parsePlayToken(token)
       const key = `${BAKE_CACHE_VER}:${token}`
       let keyframes = sharedBakeCache[key]
       if (!keyframes) {
-        const dataset = await fetchDataset(token)
-        keyframes = bakerRef.current.bakeSolver(dataset)
+        const dataset = await fetchDataset(citationToken)
+        keyframes = bakerRef.current.bakeSolver(dataset, { direction })
         sharedBakeCache[key] = keyframes
       }
       setIdlePose(vrmRef.current)

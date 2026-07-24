@@ -1,11 +1,11 @@
 /**
  * vrmFaceSolver.js — landmarks de cara grabados (00_capture.py, campo
- * `frame.face`) → pesos de expresión VRM (boca: aa/ih/ou/ee/oh · ojos: blink).
+ * `frame.face`) → pesos de expresión VRM:
+ *   boca: aa/ih/ou/ee/oh · ojos: blink · cejas: surprised/angry
  *
- * El avatar (public/avatar/signara-avatar.vrm) es VRM 1.0 y expone estos 6
- * "preset expressions" vía expressionManager (confirmado leyendo
- * extensions.VRMC_vrm.expressions.preset del propio archivo .vrm) — no hay
- * blendshapes personalizados, así que el mapeo va directo a estos nombres.
+ * El avatar (public/avatar/signara-avatar.vrm) es VRM 1.0 y expone estos
+ * presets vía expressionManager (confirmado en el .vrm): aa, ih, ou, ee, oh,
+ * blink, surprised, angry, neutral, relaxed; además morph `sad` en el mesh.
  *
  * Orden EXACTO del array `frame.face` (124 puntos) — debe calzar siempre con
  * FACE_KEEP de sign_ai/00_capture.py, que lo arma así:
@@ -19,7 +19,8 @@
 const OVAL = 0        // 36 puntos (no usado todavía)
 const R_EYE = 36       // 16 puntos
 const L_EYE = 52       // 16 puntos
-// R_BROW = 68 (5), L_BROW = 73 (5) — no usados todavía (cejas)
+const R_BROW = 68      // 5 puntos — FACE_R_BROW [107,66,105,63,70]
+const L_BROW = 73      // 5 puntos — FACE_L_BROW [336,296,334,293,300]
 const LIPS_O = 78      // 20 puntos — orden: FACE_LIPS_O en 00_capture.py
 const LIPS_I = 98      // 20 puntos — orden: FACE_LIPS_I en 00_capture.py
 
@@ -40,6 +41,12 @@ const EYE_L_INNER = L_EYE + 8      // landmark 362 — comisura interna ojo izq
 const EYE_L_TOP = L_EYE + 12     // landmark 386 — párpado superior ojo izq
 const EYE_L_BOTTOM = L_EYE + 4      // landmark 374 — párpado inferior ojo izq
 
+// Cejas: índice 0 ≈ interna (glabela), 2 ≈ centro, 4 ≈ externa.
+const BROW_R_INNER = R_BROW + 0   // landmark 107
+const BROW_R_MID = R_BROW + 2     // landmark 105
+const BROW_L_INNER = L_BROW + 0   // landmark 336
+const BROW_L_MID = L_BROW + 2     // landmark 334
+
 export const FACE_CONFIG = {
   // ── Boca ──
   // Aperture/ancho son RATIOS respecto a la distancia interocular (estable,
@@ -57,10 +64,21 @@ export const FACE_CONFIG = {
   eyeOpenEAR: 0.30,     // EAR típico con el ojo bien abierto
   eyeClosedEAR: 0.12,     // EAR con el ojo cerrado
 
-  smooth: 0.35,       // EMA sobre los 6 canales (evita parpadeo/temblor visual)
+  // ── Cejas ── (coords imagen MediaPipe: Y crece hacia ABAJO)
+  // raise = (párpadoSup.y − cejaCentro.y) / interocular — sube al alzar cejas.
+  // Solo mapeamos ALZAR → surprised. NO mapeamos a angry: el umbral de
+  // “fruncido” disparaba cara de enojo en TODAS las señas (reposo incluído).
+  // PERDON (triste/disculpa) se refuerza en el baker por token, no con angry.
+  neutralBrowRaise: 0.48,
+  browRaiseGain: 4.5,      // solo claramente por encima del neutral → surprised
+
+  smooth: 0.35,       // EMA sobre los canales (evita parpadeo/temblor visual)
 }
 
-const NEUTRAL_EXPR = { aa: 0, ih: 0, ou: 0, ee: 0, oh: 0, blink: 0 }
+const NEUTRAL_EXPR = {
+  aa: 0, ih: 0, ou: 0, ee: 0, oh: 0, blink: 0,
+  surprised: 0, angry: 0, sad: 0,
+}
 
 function dist(a, b) {
   if (!a || !b) return null
@@ -87,8 +105,9 @@ function eyeAspectRatio(face, topIdx, bottomIdx, outerIdx, innerIdx) {
 
 /**
  * Un frame de `dataset.frames` (con su `face`, 124 puntos) → pesos crudos
- * {aa, ih, ou, ee, oh, blink} en 0..1, o null si no hay cara detectada en
- * ese frame (oclusión, fuera de encuadre, grabación vieja sin `face`).
+ * {aa, ih, ou, ee, oh, blink, surprised, angry} en 0..1, o null si no hay
+ * cara detectada en ese frame (oclusión, fuera de encuadre, grabación vieja
+ * sin `face`).
  */
 export function frameFaceExpr(frame) {
   const face = frame.face
@@ -133,9 +152,25 @@ export function frameFaceExpr(frame) {
     if (earL != null) blink = clamp01((C.eyeOpenEAR - earL) / (C.eyeOpenEAR - C.eyeClosedEAR))
   }
 
+  // Cejas → solo surprised si están claramente alzadas. angry siempre 0 aquí
+  // (ver FACE_CONFIG): el mapeo a angry ensuciaba todas las señas.
+  let surprised = 0
+  const browRMid = face[BROW_R_MID], browLMid = face[BROW_L_MID]
+  const eyeRTop = face[EYE_R_TOP], eyeLTop = face[EYE_L_TOP]
+  if (
+    present(browRMid) && present(browLMid) &&
+    present(eyeRTop) && present(eyeLTop)
+  ) {
+    const raiseR = (eyeRTop[1] - browRMid[1]) / interocular
+    const raiseL = (eyeLTop[1] - browLMid[1]) / interocular
+    const raise = (raiseR + raiseL) * 0.5
+    surprised = clamp01((raise - C.neutralBrowRaise) * C.browRaiseGain)
+  }
+
   return {
     aa: clamp01(aa), ih: clamp01(ih), ou: clamp01(ou),
     ee: clamp01(ee), oh: clamp01(oh), blink: clamp01(blink),
+    surprised, angry: 0, sad: 0,
   }
 }
 

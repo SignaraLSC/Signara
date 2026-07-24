@@ -67,6 +67,9 @@ const MIN_FRAMES     = 6
 const STOP_FRAMES = 2      // frames “detenido” para cortar (más ágil en web)
 const STOP_FRAC   = 0.4
 const STOP_ABS    = 0.006
+// Umbral de “hubo gesto” para confirmar. 0.02 (probado al traer conjugaciones)
+// dejaba señas suaves sin reconocer; 0.012 es el valor que ya funcionaba bien
+// en main. El anti-spam de repetir la misma seña lo cubre lastSignRef + pausa.
 const MOVED_MIN   = 0.012
 
 // Respaldo si el gesto no hace pausa: reevaluar en vivo cada LIVE_STRIDE
@@ -1230,7 +1233,9 @@ export default function InterpretScreen({ onBack, onHome }) {
                   hasContent={history.length > 0}
                   empty="Cada seña reconocida aparecerá aquí."
                 >
-                  <ul className="space-y-2">
+                  {/* Se ven ~5 sin scroll; el resto queda adentro con scroll
+                      interno en vez de estirar la card hacia abajo. */}
+                  <ul className="max-h-80 space-y-2 overflow-y-auto pr-1">
                     {history.map((h, i) => (
                       <li
                         key={i}

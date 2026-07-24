@@ -25,7 +25,7 @@ import { parsePlayToken } from '../utils/directionalVerbs.js'
 
 const AVATAR_URL = '/avatar/signara-avatar.vrm'
 // Subir esto invalida el cache en memoria tras cambios del baker (SED/cuello, etc.).
-const BAKE_CACHE_VER = 50 // PERDON: quietá más atrás
+const BAKE_CACHE_VER = 51 // PERDON: sin overrides de manos (solo grabación)
 /** @type {Record<string, unknown>} */
 const sharedBakeCache = {}
 /** @type {Record<string, unknown>} */

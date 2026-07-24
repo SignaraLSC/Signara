@@ -522,22 +522,6 @@ export function createBaker(vrm) {
         }
         stackHands(tg)
         levelSideBySideHands(tg)
-        // PERDON: derecha arriba (móvil), izquierda abajo (quieta).
-        // Quietá más atrás y más bajo la móvil — si queda adelantada, la
-        // móvil cae sobre el antebrazo en vez de rozar la palma.
-        if (token === 'PERDON') {
-          const sep = shoulderHalfW * 0.14
-          if (tg.right.T.y - tg.left.T.y < sep) {
-            const midY = (tg.right.T.y + tg.left.T.y) * 0.5
-            tg.left.T.y = midY - sep * 0.65
-            tg.right.T.y = midY + sep * 0.35
-          }
-          // Acercar X hacia la móvil (debajo), sin clavar 100%.
-          tg.left.T.x += (tg.right.T.x - tg.left.T.x) * 0.6
-          // Móvil más adelante; quietá detrás.
-          tg.right.T.z += shoulderHalfW * 0.2
-          tg.left.T.z = tg.right.T.z - shoulderHalfW * 0.38
-        }
         for (const name of ['right', 'left']) {
           if (!tg[name]) continue
           tg[name].neckW = Math.max(

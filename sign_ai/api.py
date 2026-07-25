@@ -31,6 +31,9 @@ from pydantic import BaseModel
 
 from core.gnn_model import GCN_LSTM, SEQ_LEN
 from core.confusion import evaluate_prediction
+from core.direction_reader import classify_direction
+from core.directional_verbs import DIRECTIONAL_VERBS, conjugate
+from core.handshape_hints import looks_like_ily
 from core.preprocess import sequence_compact_to_gnn
 
 # ─── Rutas ────────────────────────────────────────────────────────────────────
@@ -40,8 +43,16 @@ GNN_LABEL_PATH = "models/labels_gnn.json"
 GNN_META_PATH  = "models/signara_gnn_meta.json"
 ANIM_DIR       = Path(__file__).parent / "animations"
 
-UMBRAL_CONFIANZA = float(os.getenv("SIGNARA_UMBRAL", "0.75"))
-MARGEN_TOP2      = float(os.getenv("SIGNARA_MARGEN_TOP2", "0.16"))
+# Umbral más alto por defecto: evita “adivinar” con confianza media.
+UMBRAL_CONFIANZA = float(os.getenv("SIGNARA_UMBRAL", "0.80"))
+MARGEN_TOP2      = float(os.getenv("SIGNARA_MARGEN_TOP2", "0.18"))
+
+# Fase 2B — conjugación geométrica (AYUDA→AYUDAME/…). OFF por defecto:
+# /predict solo tiene manos (sin hombros). Activar en local con
+# SIGNARA_CONJUGATE=1 tras calibrar (ver CLAUDE.md → Directional verbs).
+ENABLE_CONJUGATE = os.getenv("SIGNARA_CONJUGATE", "0").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 
 # Override manual para probar normalización sin reentrenar. 06_gnn_train.py
 # siempre entrena con normalize_inputs=True y escribe signara_gnn_meta.json,
@@ -111,7 +122,8 @@ async def load_model():
 
     print(f"✅ Modelo GNN cargado — clases: {_labels}")
     print(f"   Normalización: {_normalize_inputs} (fuente: {_normalize_source}) | "
-          f"umbral: {UMBRAL_CONFIANZA} | margen top2: {MARGEN_TOP2}")
+          f"umbral: {UMBRAL_CONFIANZA} | margen top2: {MARGEN_TOP2} | "
+          f"conjugación: {'ON' if ENABLE_CONJUGATE else 'OFF'}")
 
 
 # ─── Schemas ──────────────────────────────────────────────────────────────────
@@ -125,6 +137,7 @@ class PredictResponse(BaseModel):
     prediction: str
     confidence: float
     is_idle: bool
+    direction: str | None = None  # Fase 2B: solo presente si `prediction` es un verbo direccional
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
@@ -177,6 +190,14 @@ async def predict(req: PredictRequest):
         min_margin=MARGEN_TOP2,
     )
 
+    # TE_AMO (forma ILY) el GNN lo confunde mucho con NO/SI en cámara real.
+    ily = looks_like_ily(data)
+    if ily.get("ily") and "TE_AMO" in _labels:
+        te_p = float(probs[_labels.index("TE_AMO")])
+        if prediction in ("NO", "SI", None, "IDLE"):
+            prediction = "TE_AMO"
+            confidence = max(te_p, float(ily.get("score") or 0), UMBRAL_CONFIANZA)
+
     # "IDLE" es una clase real de entrenamiento (mano en reposo), no lo mismo
     # que is_idle=True (que evaluate_prediction devuelve cuando no hay
     # confianza suficiente en NINGUNA clase). Sin este chequeo, una mano
@@ -184,10 +205,18 @@ async def predict(req: PredictRequest):
     if prediction is None or prediction == "IDLE":
         return PredictResponse(prediction="", confidence=confidence, is_idle=True)
 
+    # Fase 2B (opcional): conjugación geométrica. Por defecto OFF —
+    # sin calibrar invertía AYUDA ↔ AYUDAME en uso real.
+    direction = None
+    if ENABLE_CONJUGATE and prediction in DIRECTIONAL_VERBS:
+        direction = classify_direction(data)["direction"]
+        prediction = conjugate(prediction, direction)
+
     return PredictResponse(
         prediction=prediction,
         confidence=confidence,
         is_idle=False,
+        direction=direction,
     )
 
 
@@ -195,7 +224,11 @@ async def predict(req: PredictRequest):
 def list_animations():
     if not ANIM_DIR.exists():
         return {"tokens": []}
-    tokens = [p.stem for p in ANIM_DIR.glob("*.json")]
+    tokens = [
+        p.stem
+        for p in ANIM_DIR.glob("*.json")
+        if p.stem.upper() != "IDLE" and ".prev" not in p.stem.lower()
+    ]
     return {"tokens": sorted(tokens)}
 
 

@@ -21,11 +21,22 @@ import { useModeTutorial } from '../hooks/useModeTutorial.js'
 import { translateText } from '../utils/translateText.js'
 import { tokenize, normalizeForSearch } from '../utils/textNormalizer.js'
 import { SIGNED_LANG_LABEL } from '../utils/signLanguage.js'
+import { resolveDirectionalForm } from '../utils/directionalVerbs.js'
+import { translateToSpanish } from '../utils/translateApi.js'
+import LanguagePicker from './LanguagePicker.jsx'
+import {
+  findOutputLang,
+  getStoredInputLang,
+  storeInputLang,
+} from '../data/outputLanguages.js'
 
 /**
  * Empareja las palabras del texto con las señas disponibles, reconociendo
  * frases de varias palabras (p.ej. "por favor" → token "POR_FAVOR").
- * Estrategia voraz: intenta unir hasta 3 palabras seguidas con "_".
+ * Estrategia voraz: intenta unir hasta 3 palabras seguidas con "_". Antes de
+ * aceptar un match literal, revisa si esa misma ventana de palabras es una
+ * forma conjugada de un verbo direccional (ver directionalVerbs.js) — así
+ * "ayúdame" resuelve a la toma de AYUDAR redirigida, no queda sin match.
  */
 function matchSignTokens(words, available) {
   if (!available || !available.length) return []
@@ -34,8 +45,11 @@ function matchSignTokens(words, available) {
   while (i < words.length) {
     let hit = null, len = 0
     for (let n = Math.min(3, words.length - i); n >= 1; n--) {
-      const cand = words.slice(i, i + n).join('_')
-      if (available.includes(cand)) { hit = cand; len = n; break }
+      const cand = words.slice(i, i + n)
+      const directional = resolveDirectionalForm(cand, available)
+      if (directional) { hit = directional; len = n; break }
+      const literal = cand.join('_')
+      if (available.includes(literal)) { hit = literal; len = n; break }
     }
     if (hit) { result.push(hit); i += len } else { i += 1 }
   }
@@ -53,6 +67,8 @@ function matchSignTokens(words, available) {
 function tryMatchSuffix(words, available) {
   for (let n = Math.min(3, words.length); n >= 1; n--) {
     const slice = words.slice(words.length - n)
+    const directional = resolveDirectionalForm(slice, available)
+    if (directional) return { token: directional, consumed: n }
     const cand = slice.join('_')
     if (available.includes(cand)) return { token: cand, consumed: n }
   }
@@ -78,34 +94,25 @@ export default function TranslationScreen({
   // 00_capture.py y servidas por la API ML en /sign/{token}.
   const [useSigner, setUseSigner] = useState(false)
   const [signerTokens, setSignerTokens] = useState([])
+  const [inputLang, setInputLang] = useState(getStoredInputLang)
+  const [spanishText, setSpanishText] = useState('')
 
   const inputRef = useRef(null)
   const poseBlobRef = useRef(null)
   const pendingWordRef = useRef('')
   const missedTimerRef = useRef(null)
   const signerRef = useRef(null)
-  const availableTokensRef = useRef([])   // tokens con animación grabada disponible
-  // En vivo: si alguna palabra ya se encoló mientras se hablaba, el resultado
-  // final de la voz no debe volver a arrancar todo desde cero (ver
-  // handleVoiceFinal). liveQueueBufferRef guarda tokens que llegaron ANTES de
-  // que el avatar terminara de montarse (useSigner pasa a true de forma
-  // asíncrona), para no perder la primera palabra de la frase.
+  const availableTokensRef = useRef([])
   const liveMatchedRef = useRef(false)
   const liveQueueBufferRef = useRef([])
-  // Espejo síncrono de `useSigner`: en React.StrictMode (dev), las funciones
-  // actualizadoras pasadas a setState se ejecutan DOS VECES a propósito para
-  // detectar efectos secundarios impuros. handleLiveWord llamaba a
-  // signerRef.current.queue(token) DENTRO de un setUseSigner(prev => ...) —
-  // StrictMode la disparaba dos veces, encolando cada palabra dos veces (la
-  // seña se reproducía duplicada). Un ref normal no sufre esa doble
-  // invocación, así que el efecto secundario se decide leyendo el ref, nunca
-  // dentro del updater de setState.
   const useSignerRef = useRef(false)
-  // Últimas 1-2 palabras EN VIVO que no combinaron con nada todavía — se
-  // guardan por si la SIGUIENTE palabra forma una seña de 2-3 palabras
-  // (POR_FAVOR, COMO_ESTAS...). Sin esto, la coincidencia en vivo solo miraba
-  // una palabra a la vez y esas señas nunca se activaban por voz.
   const pendingWordsRef = useRef([])
+  const inputLangRef = useRef(inputLang)
+  const liveTranslateBusyRef = useRef(false)
+  const liveTranslateSeqRef = useRef(0)
+  const lastLiveQueueRef = useRef({ token: '', t: 0 })
+
+  useEffect(() => { inputLangRef.current = inputLang }, [inputLang])
 
   // Precarga el VRM en cuanto hay animaciones: si esperamos a la 1ª palabra,
   // el usuario nota varios segundos de "Cargando avatar…".
@@ -152,6 +159,7 @@ export default function TranslationScreen({
   const resetState = useCallback(() => {
     revokePoseBlob()
     setOriginalText('')
+    setSpanishText('')
     setPoseSrc(null)
     setTranslateSource(null)
     setPoseError(null)
@@ -168,6 +176,9 @@ export default function TranslationScreen({
     liveMatchedRef.current = false
     liveQueueBufferRef.current = []
     pendingWordsRef.current = []
+    liveTranslateSeqRef.current += 1
+    liveTranslateBusyRef.current = false
+    lastLiveQueueRef.current = { token: '', t: 0 }
     if (missedTimerRef.current) clearTimeout(missedTimerRef.current)
   }, [revokePoseBlob])
 
@@ -186,13 +197,21 @@ export default function TranslationScreen({
     setPoseFinished(false)
     revokePoseBlob()
     setPoseSrc(null)
-    // No poner useSigner=false aquí si vamos a seguir con el avatar: desmontar
-    // recarga el VRM entero y se siente lentísimo (y pisa la cola en vivo).
 
-    // ── Primario: avatar 3D de landmarks con animaciones grabadas ──────────────
-    // Si alguna palabra tiene animación propia (grabada con 00_capture.py),
-    // reprodúcela en el esqueleto 3D en vez de pedir la pose a sign.mt.
-    const tokens = tokenize(text).map((w) => w.toUpperCase())
+    // Idioma de entrada → español → tokens de seña.
+    let textEs = text
+    const lang = inputLangRef.current
+    if (lang && lang !== 'es') {
+      try {
+        textEs = await translateToSpanish(text, lang)
+      } catch (e) {
+        console.warn('Traducción a español:', e)
+        textEs = text
+      }
+    }
+    setSpanishText(textEs)
+
+    const tokens = tokenize(textEs).map((w) => w.toUpperCase())
     const available = availableTokensRef.current
     const matched = matchSignTokens(tokens, available)
 
@@ -206,14 +225,14 @@ export default function TranslationScreen({
       return
     }
 
-    // ── Respaldo: pose-viewer de sign.mt ───────────────────────────────────────
+    // Respaldo sign.mt: mejor con el español ya resuelto.
     setUseSigner(false)
     useSignerRef.current = false
     setSignerTokens([])
     try {
-      const result = await translateText(text)
+      const result = await translateText(textEs)
       setTranslateSource(result.source)
-      setOriginalText(result.text || text)
+      if (result.text) setSpanishText(result.text)
 
       if (result.poseSrc) {
         poseBlobRef.current = result.poseSrc
@@ -244,6 +263,14 @@ export default function TranslationScreen({
   // final (handleVoiceFinal → handleSubmit), por eso se sentía "todo junto
   // al final" en vez de en tiempo real.
   const queueLiveToken = useCallback((token) => {
+    if (!token) return
+    // Evita doble seña cuando el mic reenvía la misma 1ª palabra
+    // (típico al cambiar de interim→final o reiniciar transcript).
+    const now = Date.now()
+    const last = lastLiveQueueRef.current
+    if (last.token === token && now - last.t < 1500) return
+    lastLiveQueueRef.current = { token, t: now }
+
     setMissedWord('')
     liveMatchedRef.current = true
     setTranslateSource('signer3d')
@@ -256,6 +283,38 @@ export default function TranslationScreen({
     }
   }, [])
 
+  const flushLiveTranslate = useCallback(() => {
+    const lang = inputLangRef.current
+    if (!lang || lang === 'es') return
+    if (liveTranslateBusyRef.current) return
+    if (!pendingWordsRef.current.length) return
+
+    liveTranslateBusyRef.current = true
+    const seq = ++liveTranslateSeqRef.current
+    const windowPhrase = pendingWordsRef.current.slice(-3).join(' ')
+    ;(async () => {
+      try {
+        const es = await translateToSpanish(windowPhrase, lang)
+        if (seq !== liveTranslateSeqRef.current) return
+        setSpanishText(es)
+        const esWords = tokenize(es).map((w) => w.toUpperCase())
+        const hit = tryMatchSuffix(esWords, availableTokensRef.current)
+        if (hit) {
+          queueLiveToken(hit.token)
+          pendingWordsRef.current = []
+        }
+      } catch (e) {
+        console.warn('Traducción en vivo:', e)
+      } finally {
+        if (seq === liveTranslateSeqRef.current) {
+          liveTranslateBusyRef.current = false
+          // Si llegó otra palabra mientras traduciamos, procesarla.
+          if (pendingWordsRef.current.length) flushLiveTranslate()
+        }
+      }
+    })()
+  }, [queueLiveToken])
+
   const handleLiveWord = useCallback((rawWord) => {
     const cleaned = String(rawWord || '').trim()
     if (!cleaned) return
@@ -264,36 +323,35 @@ export default function TranslationScreen({
     pendingWordRef.current = ''
     setPendingWord('')
 
-    // normalizeForSearch quita acentos ("cómo"→"como") y puntuación que el
-    // reconocedor de voz suele pegar a la ÚLTIMA palabra de la frase
-    // ("favor." con punto) — sin esto esa palabra nunca calzaba con el token
-    // grabado (comparación exacta y sensible a esto). Es la MISMA
-    // normalización que ya usa tokenize() para el modo de texto — antes el
-    // modo de voz no la usaba, por eso fallaba más seguido.
     const normalized = normalizeForSearch(cleaned)
     if (!normalized) return
-    // Combos de hasta 3 palabras (POR_FAVOR, COMO_ESTAS...), mirando la
-    // palabra actual junto con las 1-2 anteriores que aún no combinaron.
-    const candidate = [...pendingWordsRef.current, normalized.toUpperCase()]
-    const hit = tryMatchSuffix(candidate, availableTokensRef.current)
-    if (hit) {
-      queueLiveToken(hit.token)
-      pendingWordsRef.current = candidate.slice(0, candidate.length - hit.consumed)
+
+    const lang = inputLangRef.current
+    // Español: match directo (como antes).
+    if (!lang || lang === 'es') {
+      const candidate = [...pendingWordsRef.current, normalized.toUpperCase()]
+      const hit = tryMatchSuffix(candidate, availableTokensRef.current)
+      if (hit) {
+        queueLiveToken(hit.token)
+        pendingWordsRef.current = candidate.slice(0, candidate.length - hit.consumed)
+        return
+      }
+      pendingWordsRef.current = candidate
+      if (pendingWordsRef.current.length > 2) {
+        const dropped = pendingWordsRef.current.shift()
+        setMissedWord(dropped)
+      }
       return
     }
 
-    // Ninguna combinación que termine en la palabra actual coincide. Se
-    // guarda para la próxima (podría ser el INICIO de una seña de 2-3
-    // palabras) — pero si el buffer ya tiene más de 2 pendientes, la más
-    // vieja ya se probó en todas las combinaciones posibles y nunca combinó
-    // con nada: se descarta como "sin seña" en vez de quedar esperando para
-    // siempre.
-    pendingWordsRef.current = candidate
-    if (pendingWordsRef.current.length > 2) {
+    // Otro idioma: acumular y traducir ventana → español → match.
+    pendingWordsRef.current = [...pendingWordsRef.current, normalized]
+    if (pendingWordsRef.current.length > 4) {
       const dropped = pendingWordsRef.current.shift()
       setMissedWord(dropped)
     }
-  }, [queueLiveToken])
+    flushLiveTranslate()
+  }, [queueLiveToken, flushLiveTranslate])
 
   const handleVoiceFinal = useCallback((text) => {
     pendingWordRef.current = ''
@@ -308,23 +366,51 @@ export default function TranslationScreen({
     // handleSubmit) reiniciaría la cola (duplicados / se salta la del medio) y
     // además desmontaba el VRM. liveMatchedRef es síncrono (liveMode es async).
     if (liveMatchedRef.current) {
+      liveMatchedRef.current = false
       setBusy(false)
       return
     }
     if (text?.trim()) handleSubmit(text.trim())
   }, [handleSubmit])
 
-  const handlePanelSubmit = useCallback((text) => {
-    // Ojo: onResult de la voz corre en el MISMO tick que el último onLiveWord.
-    // liveMode (state) aún puede ser false → hay que mirar liveMatchedRef.
-    if (liveMatchedRef.current || liveMode) handleVoiceFinal(text)
-    else handleSubmit(text)
-  }, [liveMode, handleVoiceFinal, handleSubmit])
+  // Apagar mic: limpia UI en vivo. No toca liveMatchedRef — el onResult
+  // final de la sesión aún puede llegar y necesita ese flag.
+  const handleVoiceEnd = useCallback(() => {
+    setLiveMode(false)
+    pendingWordsRef.current = []
+    pendingWordRef.current = ''
+    setPendingWord('')
+    liveTranslateSeqRef.current += 1
+    liveTranslateBusyRef.current = false
+  }, [])
 
-  const wordChips = originalText ? tokenize(originalText).map((w) => w.toUpperCase()) : []
+  const handlePanelSubmit = useCallback((text, { fromVoice = false } = {}) => {
+    // Voz: cierre de frase del reconocedor (puede ser no-op si ya señaó en vivo).
+    // Texto: SIEMPRE traduce — antes liveMatchedRef quedaba true tras el mic
+    // y el submit escrito caía en handleVoiceFinal sin hacer nada.
+    if (fromVoice) {
+      handleVoiceFinal(text)
+      return
+    }
+    liveMatchedRef.current = false
+    setLiveMode(false)
+    pendingWordsRef.current = []
+    handleSubmit(text)
+  }, [handleVoiceFinal, handleSubmit])
+
+  const wordChips = (spanishText || originalText)
+    ? tokenize(spanishText || originalText).map((w) => w.toUpperCase())
+    : []
   const hasPose3d = translateSource === 'pose3d' && !!poseSrc
+  const inputSpeechLang = findOutputLang(inputLang).speech
 
   const tutorial = useModeTutorial('translate')
+
+  function onInputLangChange(code) {
+    storeInputLang(code)
+    setInputLang(code)
+    pendingWordsRef.current = []
+  }
 
   return (
     <AppPage>
@@ -386,9 +472,23 @@ export default function TranslationScreen({
                 initialMode={initialMode}
                 onSubmit={handlePanelSubmit}
                 onLiveWord={handleLiveWord}
+                onVoiceEnd={handleVoiceEnd}
                 busy={busy}
                 pendingWord={pendingWord}
                 missedWord={missedWord}
+                voiceLang={inputSpeechLang}
+                topSlot={
+                  <LanguagePicker
+                    mode="input"
+                    accent="blue"
+                    fullWidth
+                    value={inputLang}
+                    onChange={onInputLangChange}
+                    className="w-full"
+                    title="Hablo / escribo en"
+                    tutorialId="translate-language"
+                  />
+                }
               />
 
               <div className="ta-dijiste animate-motion-enter [animation-delay:140ms]">
@@ -400,16 +500,15 @@ export default function TranslationScreen({
                   empty="Tu texto aparecerá aquí."
                   hasContent={!!originalText}
                 >
-                  {/* Alto FIJO (no max-height): antes crecía en vivo con cada
-                      palabra hasta tocar el tope, lo que se veía como que la
-                      card se "agrandaba" mientras hablabas. Con h-40 fijo
-                      queda del mismo tamaño desde el primer carácter, con
-                      scroll interno para lo que no entre — y de paso sigue
-                      protegiendo al avatar (misma fila del grid en desktop). */}
                   <div className="h-40 overflow-y-auto pr-1">
                     <p className="text-base font-bold leading-relaxed text-pastel-ink sm:text-lg">
                       &quot;{originalText}&quot;
                     </p>
+                    {spanishText && inputLang !== 'es' && (
+                      <p className="mt-2 text-sm font-semibold text-pastel-sub">
+                        En español: &quot;{spanishText}&quot;
+                      </p>
+                    )}
                   </div>
                 </OutputCard>
               </div>
@@ -434,8 +533,8 @@ export default function TranslationScreen({
                 </div>
               )}
 
-              <div className="ta-avatar animate-motion-scale-in">
-                <div className="relative flex h-full flex-col overflow-hidden rounded-[2rem] border-[3px] border-pastel-blue-line bg-pastel-blue p-5 shadow-[0_24px_50px_-28px_rgba(147,190,240,0.7)] sm:p-7">
+              <div className="ta-avatar animate-motion-scale-in self-start">
+                <div className="relative flex w-full flex-col overflow-hidden rounded-[2rem] border-[3px] border-pastel-blue-line bg-pastel-blue p-5 shadow-[0_24px_50px_-28px_rgba(147,190,240,0.7)] sm:p-7">
                   <div className="relative mb-4">
                     <p className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-[0.22em] text-pastel-ink/70">
                       <Icon name="eye" className="h-3.5 w-3.5" strokeWidth={2.25} /> Mira aquí
@@ -457,10 +556,11 @@ export default function TranslationScreen({
                     </p>
                   )}
 
-                  <div className="relative flex min-h-[360px] flex-1 items-center justify-center overflow-hidden rounded-[1.5rem] bg-[#FAF6EC]/90 sm:min-h-[420px]">
-                    {/* Avatar siempre visible (idle) en cuanto hay animaciones / VRM. */}
+                  {/* Alto fijo (como antes). Nunca h-full/flex-1: la grilla
+                      alargaba el canvas y la cara se veía estirada. */}
+                  <div className="relative h-[360px] w-full overflow-hidden rounded-[1.5rem] bg-[#FAF6EC]/90 sm:h-[420px]">
                     {signerMounted && !hasPose3d && (
-                      <div className="absolute inset-0 h-full w-full">
+                      <div className="absolute inset-0">
                         <AvatarSignerVRM
                           ref={signerRef}
                           apiUrl={ML_API_URL}
@@ -478,7 +578,7 @@ export default function TranslationScreen({
                       </div>
                     ) : null}
                     {!signerMounted && !hasPose3d && (
-                      <div className="flex flex-col items-center justify-center px-6 text-center">
+                      <div className="flex h-full flex-col items-center justify-center px-6 text-center">
                         <Icon name="user" className="h-12 w-12 text-pastel-ink/30" strokeWidth={1.5} />
                         <p className="mt-3 text-sm font-semibold text-pastel-sub">
                           Cargando avatar…
@@ -490,7 +590,8 @@ export default function TranslationScreen({
                   {!originalText && !busy && (
                     <div className="relative mt-4 rounded-2xl border-2 border-dashed border-pastel-ink/15 bg-white/50 px-4 py-3 text-center">
                       <p className="flex items-center justify-center gap-1.5 text-sm font-bold text-pastel-ink">
-                        <Icon name="arrow-up" className="h-4 w-4" strokeWidth={2.25} /> Escribe arriba o elige un ejemplo para empezar
+                        <Icon name="arrow-up" className="h-4 w-4 lg:hidden" strokeWidth={2.25} />
+                        Escribe o elige un ejemplo para empezar
                       </p>
                     </div>
                   )}

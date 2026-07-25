@@ -69,6 +69,35 @@ button,
   background: transparent;
 }
 
+/* Scroll del selector de idioma — fino y pastel */
+.lang-picker-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #BCA4E6 transparent;
+}
+.lang-picker-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+.lang-picker-scroll::-webkit-scrollbar-track {
+  background: transparent;
+  margin: 6px 0;
+}
+.lang-picker-scroll::-webkit-scrollbar-thumb {
+  background: #D4C4F0;
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+.lang-picker-scroll::-webkit-scrollbar-thumb:hover {
+  background: #7E64C9;
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+.lang-picker-scroll::-webkit-scrollbar-button {
+  display: none;
+  height: 0;
+  width: 0;
+}
+
 /* Reusable classes */
 @layer components {
   .glass-card,
@@ -527,13 +556,8 @@ button,
   }
 }
 
-/* Pantalla Traducir: en móvil el avatar va DEBAJO del cuadro de texto/mic y
-   ARRIBA de "Prueba con un clic" (no como bloque aparte antes de todo el
-   panel); en desktop (lg) vuelve a las dos columnas de siempre. Se usa
-   grid-template-areas en vez de simple `order` porque hay que intercalar el
-   avatar ENTRE dos mitades de un mismo componente (TextInputPanel), cuyo
-   <form> raíz usa display:contents para que sus dos mitades cuenten como
-   items directos de esta grilla. */
+/* Traducir: controles a la izquierda, avatar a la derecha (mismo bloque).
+   En móvil el avatar va entre input y ejemplos. TextInputPanel usa display:contents. */
 .translate-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -579,6 +603,9 @@ button,
     column-gap: 2rem;
     row-gap: 1.25rem;
     align-items: start;
+  }
+  .ta-avatar {
+    align-self: start;
   }
 }
 

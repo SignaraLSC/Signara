@@ -16,7 +16,7 @@ function quatOfEuler(e) {
 // Canales de expresión facial (boca/ojos) — pesos 0..1, van por
 // expressionManager en vez de por hueso, así que se interpolan con lerp
 // simple (no tiene sentido un slerp de cuaterniones para un escalar).
-const EXPR_NAMES = ['aa', 'ih', 'ou', 'ee', 'oh', 'blink']
+const EXPR_NAMES = ['aa', 'ih', 'ou', 'ee', 'oh', 'blink', 'surprised', 'angry', 'sad']
 
 export function playSolverAnim(vrm, kfs, onDone) {
   const getBone = (n) => vrm.humanoid.getNormalizedBoneNode(n)

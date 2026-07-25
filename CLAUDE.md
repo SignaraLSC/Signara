@@ -144,6 +144,33 @@ retrain — no re-recording needed (full body is already stored in `data/raw_ful
 - Adjust feature extraction in `sign_ai/00_capture.py` (`extract_full`).
 - Capture data + avatar takes with `00_capture.py`, then retrain with `06_gnn_train.py`.
 
+### Directional verbs (spatial agreement)
+
+LSC *verbos concordantes / direccionales* (AYUDA, PERDON, TE_AMO, …) change
+origin→destination in space. Signara splits this into phases:
+
+| Phase | Role | Key files | Status |
+|-------|------|-----------|--------|
+| **2 (avatar)** | Conjugated Spanish text → redirect one citation take in 3D | `src/utils/directionalVerbs.js`, `vrmBaker.js` | Done for AYUDA, PERDON, TE_AMO |
+| **2B (camera)** | GNN returns citation gloss → geometric trajectory → conjugated word | `sign_ai/core/direction_reader.py`, `directional_verbs.py`, `api.py` | Partial; **OFF by default** |
+| **3** | Real third-person locus / room location memory | — | Not started (fixed side today) |
+
+**Phase 2B:** `/predict` only gets hand landmarks `(T, 126)` (no shoulders).
+Depth is approximated from projected hand size. Keep conjugation off unless
+calibrating: set `SIGNARA_CONJUGATE=1` when starting uvicorn.
+
+```bash
+cd sign_ai
+set SIGNARA_CONJUGATE=1
+uvicorn api:app --port 8000 --reload
+```
+
+Smoke checks in Interpretar: neutral AYUDA → `AYUDA`; toward chest → `AYUDAME`;
+clear lateral sweep → `AYUDANOS`; static TE_AMO (ILY) → `TE_AMO` (do not invent
+`ME_AMAS` without a clear chestward signal). Keep direction keys
+(`self` / `listener` / `third` / `group_self` / …) in sync between the JS and
+Python `DIRECTIONAL_VERBS` tables.
+
 ### Words with multiple valid signs (variants)
 Some words have more than one genuinely different way of signing them (e.g. a
 regional LSC variant), as opposed to just stylistic differences between people.

@@ -15,6 +15,21 @@ import { INTERPRET_TUTORIAL_STEPS } from '../data/modeTutorialSteps.js'
 import { useModeTutorial } from '../hooks/useModeTutorial.js'
 import { ML_API_URL, checkMlApiHealth, getMlApiCache } from '../utils/mlApi.js'
 import { getSharedHandLandmarker } from '../utils/handLandmarker.js'
+import {
+  autoExposeCanvas,
+  composeStudioFrame,
+  fillPersonMaskCanvas,
+  getSharedSelfieSegmenter,
+  keepPrimaryPersonOnly,
+  solidifyBackgroundFromMask,
+} from '../utils/selfieSegmenter.js'
+import LanguagePicker from './LanguagePicker.jsx'
+import {
+  findOutputLang,
+  getStoredOutputLang,
+} from '../data/outputLanguages.js'
+import { translateFromSpanish } from '../utils/translateApi.js'
+import { maybeCorrectTeAmo } from '../utils/handshapeHints.js'
 
 // Migrado de @mediapipe/holistic (legacy) a @mediapipe/tasks-vision:
 // HandLandmarker con GPU, solo manos. FaceLandmarker se pospuso: no se usa
@@ -27,55 +42,44 @@ import { getSharedHandLandmarker } from '../utils/handLandmarker.js'
 // que Interpretar reconozca ~40% más rápido sin perder precisión.
 const SEQ_LEN        = 24
 const HAND_COUNT     = 21
-const UMBRAL         = 0.75
-const STABILITY_NEED = 2
-// Atajo de confirmación rápida (solo camino "live", no en el fin-de-seña que
-// ya confirma con 1 sola predicción): si la confianza es muy alta, no hace
-// falta esperar 2 predicciones idénticas en serie — con una sola predicción
-// muy segura alcanza.
-const HIGH_CONF_INSTANT = 0.90
+// Más estricto: preferimos esperar un frame más a “adivinar” con 0.75.
+const UMBRAL         = 0.82
+const STABILITY_NEED = 3
+// Solo confirma en 1 shot live si es casi seguro (antes 0.90 disparaba de más).
+const HIGH_CONF_INSTANT = 0.96
+// Fin de seña (1 sola predicción): umbral aún un poco más alto.
+const FINALIZE_UMBRAL = 0.86
 const NO_HAND_RESET  = 12
 // Tiempo máximo de espera de /predict antes de abortar. Sin esto, si el
 // servidor ML está frío (Render) o la red falla a medias, el fetch podía
 // quedar colgado indefinidamente con apiInFlightRef en true, bloqueando
 // cualquier predicción nueva sin que el usuario supiera por qué "no responde".
 const PREDICT_TIMEOUT_MS = 12000
-// Tolerancia a pérdida MOMENTÁNEA de tracking (parpadeo típico de MediaPipe
-// en medio de un gesto rápido). Sin esto, un solo frame sin manos detectadas
-// vaciaba el buffer entero y obligaba a reiniciar la seña desde cero — por
-// eso la primera seña (hecha con más cuidado/lentitud) se reconocía rápido
-// y las siguientes parecían "esperar hasta 24": en realidad se reiniciaban
-// varias veces hasta que por casualidad el tracking aguantaba sin cortes.
 // Buffer: tolera parpadeos de tracking sin vaciar la seña.
-// El overlay se limpia al instante (ver handleResults) — no “mano pegada”.
 const NO_HAND_GRACE  = 8
-// Pausa CORTA tras confirmar una seña. Antes eran 30 frames (~1 s), lo que
-// hacía imposible encadenar señas para formar frases en tiempo real: tras cada
-// palabra había un segundo muerto. Ahora es apenas un anti-rebote para no
-// disparar dos veces sobre la misma parada; la protección real contra repetir
-// una seña sin querer es el reinicio del pico (hay que volver a mover la mano
-// —superar MOVED_MIN— antes de que se pueda confirmar otra).
-const POST_CONFIRM_WAIT = 6
-// Mínimo de frames reales para mandar a /predict. El modelo espera SEQ_LEN
-// por shape, pero padBuffer remuestrea señas cortas (como en 00_capture.py) —
-// NO hay que esperar a “llenar 24” en pantalla.
-const MIN_FRAMES     = 6
+const POST_CONFIRM_WAIT = 8
+// Mínimo de frames reales para mandar a /predict.
+const MIN_FRAMES     = 10
 
 // ── Fin de seña (camino principal, tiempo real) ─────────────────────────────
-// Igual que al grabar: haces el gesto con su duración natural y al pausar se
-// confirma. Umbral ADAPTATIVO al pico de movimiento de ESTA seña.
-const STOP_FRAMES = 2      // frames “detenido” para cortar (más ágil en web)
+const STOP_FRAMES = 4
 const STOP_FRAC   = 0.4
 const STOP_ABS    = 0.006
-const MOVED_MIN   = 0.012
+// Gesto dinámico (HOLA, ADIOS…): hace falta movimiento claro.
+const MOVED_MIN   = 0.018
+// Señas casi estáticas (TE_AMO, SI, NO): sostener la forma cuenta como gesto
+// aunque la muñeca casi no se mueva — sin bajar el umbral dinámico de arriba.
+const HELD_MOVED_MIN = 0.003
+const HELD_MIN_FRAMES = 14
 
-// Respaldo si el gesto no hace pausa: reevaluar en vivo cada LIVE_STRIDE
-// frames nuevos, desde MIN_FRAMES (nunca esperar SEQ_LEN=24).
-const LIVE_STRIDE = 3
+const LIVE_STRIDE = 4
 
 // Inferencia: equilibrio velocidad / tracking (izq. sufría a 160×120).
 const DETECT_W = 192
 const DETECT_H = 144
+
+// Dos detecciones muy cerca = casi siempre la misma mano “partida” al entrar.
+const DUP_HAND_DIST = 0.14
 
 // ── Dibujo de la mano: solo puntos (sin líneas del esqueleto). ───────────────
 function copyHandLandmarks(lms) {
@@ -101,6 +105,38 @@ function drawHandDots(ctx, landmarks, { color, radius }) {
   }
 }
 
+function handCentroid(lms) {
+  if (!lms?.length) return { x: 0.5, y: 0.5 }
+  let sx = 0, sy = 0, n = 0
+  for (const p of lms) {
+    if (!p) continue
+    sx += p.x
+    sy += p.y
+    n++
+  }
+  return n ? { x: sx / n, y: sy / n } : { x: 0.5, y: 0.5 }
+}
+
+/** Si MediaPipe ve 2 manos casi en el mismo sitio, se queda con la de mayor score. */
+function dedupeNearHands(scored) {
+  if (scored.length < 2) return scored
+  const byScore = [...scored].sort((a, b) => b.score - a.score)
+  const kept = []
+  for (const h of byScore) {
+    const c = handCentroid(h.landmarks)
+    const w = h.landmarks?.[0]
+    const clash = kept.some((k) => {
+      const ck = handCentroid(k.landmarks)
+      const d = Math.hypot(c.x - ck.x, c.y - ck.y)
+      const wk = k.landmarks?.[0]
+      const wd = (w && wk) ? Math.hypot(w.x - wk.x, w.y - wk.y) : d
+      return Math.min(d, wd) < DUP_HAND_DIST
+    })
+    if (!clash) kept.push(h)
+  }
+  return kept
+}
+
 // HandLandmarker devuelve `landmarks`/`handedness` como listas paralelas (una
 // mano detectada = un índice en cada una), no separadas en left/right como
 // Holistic. Se reconstruye la misma forma {leftHandLandmarks,
@@ -124,9 +160,10 @@ function adaptHandResult(res) {
       used: false,
     })
   }
+  const unique = dedupeNearHands(scored)
   // Primero etiquetas confiables de MediaPipe.
-  for (const h of scored) {
-    if (h.score < 0.35) continue
+  for (const h of unique) {
+    if (h.score < 0.4) continue
     if (h.label === 'Left' && !leftHandLandmarks) { leftHandLandmarks = h.landmarks; h.used = true }
     else if (h.label === 'Right' && !rightHandLandmarks) { rightHandLandmarks = h.landmarks; h.used = true }
   }
@@ -136,7 +173,7 @@ function adaptHandResult(res) {
   // GRACIAS), el paso de arriba deja un slot vacío — sin este filtro, el
   // respaldo podía volver a agarrar la MISMA mano ya asignada (si quedaba
   // más a la derecha en X) y la otra mano real se perdía del todo.
-  const remaining = scored.filter((h) => !h.used)
+  const remaining = unique.filter((h) => !h.used)
   if (remaining.length === 1 && !leftHandLandmarks && !rightHandLandmarks) {
     const h = remaining[0]
     if (h.x < 0.5) leftHandLandmarks = h.landmarks
@@ -214,16 +251,21 @@ function padBuffer(buffer) {
 }
 
 // Movimiento medio (x,y) entre dos frames — igual que mov_entre() en
-// 07_gnn_predict.py. Sin frame previo se considera "sin movimiento" (0),
-// igual que el script de referencia (evita un salto espurio al reaparecer
-// la mano). 42 landmarks × [x,y,z] → compara solo x,y, ignora z.
+// 07_gnn_predict.py. Solo landmarks presentes (evita diluir TE_AMO one-hand
+// con 21 ceros de la mano ausente).
 function frameMovement(prev, curr) {
   if (!prev) return 0
   let sum = 0
+  let n = 0
   for (let i = 0; i < curr.length; i += 3) {
+    const alive =
+      Math.abs(curr[i]) + Math.abs(curr[i + 1]) + Math.abs(curr[i + 2]) > 1e-6 ||
+      Math.abs(prev[i]) + Math.abs(prev[i + 1]) + Math.abs(prev[i + 2]) > 1e-6
+    if (!alive) continue
     sum += Math.abs(curr[i] - prev[i]) + Math.abs(curr[i + 1] - prev[i + 1])
+    n += 2
   }
-  return sum / ((curr.length / 3) * 2)
+  return n > 0 ? sum / n : 0
 }
 
 // ── Componente principal ──────────────────────────────────────────────────────
@@ -232,6 +274,16 @@ export default function InterpretScreen({ onBack, onHome }) {
   const videoRef     = useRef(null)
   const canvasRef    = useRef(null)
   const handLandmarkerRef = useRef(null)
+  const selfieSegmenterRef = useRef(null)
+  const personMaskCanvasRef = useRef(null)
+  const personInferMaskRef = useRef(null)
+  const personFeatherCanvasRef = useRef(null)
+  const personLayerCanvasRef = useRef(null)
+  const personWorkMaskRef = useRef(null)
+  const studioBgCanvasRef = useRef(null)
+  const displayFrameCanvasRef = useRef(null)
+  const blurReadyRef = useRef(false)
+  const studioBgRef = useRef(true)
   const mediaStreamRef    = useRef(null)
   const detectRafRef      = useRef(null)
   const runningRef   = useRef(false)
@@ -274,7 +326,8 @@ export default function InterpretScreen({ onBack, onHome }) {
   // si siguen siendo la generación vigente — así una cancelación o una
   // utterance más nueva invalida automáticamente los callbacks viejos.
   const speakGenRef = useRef(0)
-  const spanishVoiceRef = useRef(null)
+  const outputVoiceRef = useRef(null)
+  const outputLangRef = useRef(getStoredOutputLang())
 
   // UI state
   const [scriptsLoaded, setScriptsLoaded] = useState(false)
@@ -287,6 +340,9 @@ export default function InterpretScreen({ onBack, onHome }) {
   const [mlMode,        setMlMode]        = useState(false)
   const [mlConnecting,  setMlConnecting]  = useState(false)
   const [audioOn,       setAudioOn]       = useState(true)
+  const [studioBg,      setStudioBg]      = useState(() => {
+    try { return localStorage.getItem('signara:studioBg') !== '0' } catch { return true }
+  })
   const [handVisible,   setHandVisible]   = useState(false)
   const [bufferLen,     setBufferLen]     = useState(0)
   const [inCooldown,    setInCooldown]    = useState(false)
@@ -295,16 +351,25 @@ export default function InterpretScreen({ onBack, onHome }) {
   const [latest,        setLatest]        = useState(null)
   const [history,       setHistory]       = useState([])
   const [sentence,      setSentence]      = useState([])
+  const [outputLang,    setOutputLang]    = useState(getStoredOutputLang)
 
   useEffect(() => { runningRef.current = running }, [running])
+  useEffect(() => {
+    outputLangRef.current = outputLang
+    outputVoiceRef.current = null // recalcular voz al cambiar idioma
+  }, [outputLang])
   useEffect(() => {
     audioRef.current = audioOn
     if (!audioOn) stopSpeech()
   }, [audioOn])
-
-  // Chrome carga voces de forma async; calentar lista para acertar es-ES.
   useEffect(() => {
-    const warm = () => { pickSpanishVoice() }
+    studioBgRef.current = studioBg
+    try { localStorage.setItem('signara:studioBg', studioBg ? '1' : '0') } catch { /* ignore */ }
+  }, [studioBg])
+
+  // Chrome carga voces de forma async; calentar lista para acertar idioma.
+  useEffect(() => {
+    const warm = () => { pickVoiceForLang(findOutputLang(outputLangRef.current).speech) }
     warm()
     window.speechSynthesis?.addEventListener?.('voiceschanged', warm)
     return () => {
@@ -351,9 +416,31 @@ export default function InterpretScreen({ onBack, onHome }) {
     return () => {
       cancelled = true
       handLandmarkerRef.current = null
-      // No .close(): el singleton se reutiliza en la siguiente visita.
+      // No .close(): los singletons se reutilizan en la siguiente visita.
     }
   }, [])
+
+  // Segmenter solo con «Fondo estudio» activo.
+  useEffect(() => {
+    if (!studioBg) {
+      blurReadyRef.current = false
+      return
+    }
+    let cancelled = false
+    getSharedSelfieSegmenter()
+      .then((seg) => {
+        if (cancelled) return
+        selfieSegmenterRef.current = seg
+        blurReadyRef.current = true
+      })
+      .catch(() => {
+        if (!cancelled) blurReadyRef.current = false
+      })
+    return () => {
+      cancelled = true
+      blurReadyRef.current = false
+    }
+  }, [studioBg])
 
   // ── Cámara (solo tras consentimiento del usuario) ──────────────────────────
   // Ya no depende de @mediapipe/camera_utils (esa librería CDN tampoco se
@@ -427,15 +514,19 @@ export default function InterpretScreen({ onBack, onHome }) {
   // Cola (no cancel+speak): en Chrome, cancel() seguido de speak() en el mismo
   // tick deja caer frases — sobre todo cortas como "no" / "sí". Cada seña
   // confirmada debe oírse siempre.
-  function pickSpanishVoice() {
-    if (spanishVoiceRef.current) return spanishVoiceRef.current
+  function pickVoiceForLang(speechLang) {
+    const want = String(speechLang || 'es-ES')
+    const prefix = want.slice(0, 2).toLowerCase()
     try {
       const voices = window.speechSynthesis?.getVoices?.() || []
-      const es = voices.find((v) => /^es(-|_)/i.test(v.lang))
-        || voices.find((v) => /spanish|español/i.test(v.name))
-      if (es) spanishVoiceRef.current = es
-    } catch (_) { /* ignore */ }
-    return spanishVoiceRef.current
+      const exact = voices.find((v) => v.lang?.toLowerCase() === want.toLowerCase())
+      const byPrefix = voices.find((v) => v.lang?.toLowerCase().startsWith(prefix))
+      const picked = exact || byPrefix || null
+      if (picked) outputVoiceRef.current = picked
+      return picked || outputVoiceRef.current
+    } catch (_) {
+      return outputVoiceRef.current
+    }
   }
 
   function flushSpeakQueue() {
@@ -447,6 +538,9 @@ export default function InterpretScreen({ onBack, onHome }) {
     const item = speakQueueRef.current.shift()
     if (!item) return
     const text = typeof item === 'string' ? item : item.text
+    const speechLang = typeof item === 'string'
+      ? findOutputLang(outputLangRef.current).speech
+      : (item.speechLang || findOutputLang(outputLangRef.current).speech)
     const attempt = typeof item === 'string' ? 0 : (item.attempt || 0)
 
     speakBusyRef.current = true
@@ -455,22 +549,20 @@ export default function InterpretScreen({ onBack, onHome }) {
     let started = false
     let finished = false
     try {
-      // Chrome a veces deja speechSynthesis en paused=true sin audio.
       window.speechSynthesis.resume()
       const u = new window.SpeechSynthesisUtterance(text)
-      u.lang = 'es-ES'
+      u.lang = speechLang
       u.rate = 1
       u.pitch = 1
-      const voice = pickSpanishVoice()
+      const voice = pickVoiceForLang(speechLang)
       if (voice) u.voice = voice
 
       const done = () => {
         if (finished) return
         finished = true
-        if (isStale()) return // otra utterance ya tomó la posta — no tocar su timer/busy
+        if (isStale()) return
         speakBusyRef.current = false
         if (speakTimerRef.current) clearTimeout(speakTimerRef.current)
-        // Respiro entre palabras: evita el bug de cola en Chrome.
         speakTimerRef.current = setTimeout(() => flushSpeakQueue(), 40)
       }
       u.onstart = () => { started = true }
@@ -478,19 +570,17 @@ export default function InterpretScreen({ onBack, onHome }) {
       u.onerror = done
       window.speechSynthesis.speak(u)
 
-      // Si Chrome traga speak() sin start/end (frases cortas / estado raro),
-      // reintentar hasta 2 veces — no debe perderse ninguna seña.
       if (speakTimerRef.current) clearTimeout(speakTimerRef.current)
       speakTimerRef.current = setTimeout(() => {
         if (finished || isStale()) return
         if (started || window.speechSynthesis.speaking || window.speechSynthesis.pending) {
-          return // onend cerrará
+          return
         }
         finished = true
         speakBusyRef.current = false
         if (attempt < 2) {
           try { window.speechSynthesis.cancel(); window.speechSynthesis.resume() } catch (_) { /* ignore */ }
-          speakQueueRef.current.unshift({ text, attempt: attempt + 1 })
+          speakQueueRef.current.unshift({ text, speechLang, attempt: attempt + 1 })
           speakTimerRef.current = setTimeout(() => flushSpeakQueue(), 80)
         } else {
           flushSpeakQueue()
@@ -503,11 +593,12 @@ export default function InterpretScreen({ onBack, onHome }) {
     }
   }
 
-  function speak(text) {
+  function speak(text, speechLang) {
     const t = String(text || '').trim()
     if (!audioRef.current || !t) return
     if (!window?.speechSynthesis) return
-    speakQueueRef.current.push(t)
+    const lang = speechLang || findOutputLang(outputLangRef.current).speech
+    speakQueueRef.current.push({ text: t, speechLang: lang, attempt: 0 })
     flushSpeakQueue()
   }
 
@@ -530,15 +621,32 @@ export default function InterpretScreen({ onBack, onHome }) {
   }
 
   // ── Confirmar seña ────────────────────────────────────────────────────────
-  function triggerRecognition(sign, confidence) {
-    const text = sign.replace(/_/g, ' ')
-    const det  = { sign, text, confidence }
+  async function triggerRecognition(sign, confidence) {
+    const textEs = sign.replace(/_/g, ' ')
+    const lang = outputLangRef.current
+    const langMeta = findOutputLang(lang)
+    let displayText = textEs
+    if (lang !== 'es') {
+      try {
+        displayText = await translateFromSpanish(textEs, lang)
+      } catch (e) {
+        console.warn('Traducción:', e)
+        displayText = textEs
+      }
+    }
+    const det = {
+      sign,
+      text: textEs,
+      displayText,
+      lang,
+      confidence,
+    }
     setLatest(det)
-    setHistory(h => [det, ...h].slice(0, 8))
-    setSentence(prev => [...prev, sign].slice(-10))
+    setHistory((h) => [det, ...h].slice(0, 8))
+    setSentence((prev) => [...prev, displayText].slice(-10))
     if (sentenceClearRef.current) clearTimeout(sentenceClearRef.current)
     sentenceClearRef.current = setTimeout(() => setSentence([]), 6000)
-    speak(text)
+    speak(displayText, langMeta.speech)
   }
 
   function updateCaptureHud(_len, { showHud, status }) {
@@ -619,42 +727,44 @@ export default function InterpretScreen({ onBack, onHome }) {
         })
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
 
-        const { prediction, confidence, is_idle } = await resp.json()
-
-        if (is_idle || !prediction) return
-
-        // Al quitar la mano: confirmar de inmediato si la confianza es alta
-        if (
-          finalize &&
-          confidence >= UMBRAL &&
-          prediction !== lastSignRef.current
-        ) {
-          confirmSign(prediction, confidence)
-          return
-        }
-
-        // Respaldo "live" (gesto continuo, sin pausa clara): con confianza
-        // muy alta no hace falta esperar STABILITY_NEED predicciones en serie
-        // (ver HIGH_CONF_INSTANT) — evita 2 RTTs extra en el caso ya claro.
-        if (
-          !finalize &&
-          confidence >= HIGH_CONF_INSTANT &&
-          prediction !== lastSignRef.current
-        ) {
-          confirmSign(prediction, confidence)
-          return
-        }
+        const { prediction: rawPred, confidence, is_idle } = await resp.json()
+        // Cinturón en cliente: forma ILY (TE_AMO) gana a NO/SI o a idle.
+        const corrected = maybeCorrectTeAmo(rawPred || 'NO', bufferCopy)
+        const prediction =
+          corrected === 'TE_AMO' && (!rawPred || rawPred === 'NO' || rawPred === 'SI' || is_idle)
+            ? 'TE_AMO'
+            : (rawPred || '')
+        if ((is_idle && prediction !== 'TE_AMO') || !prediction) return
 
         predHistRef.current.push(prediction)
         if (predHistRef.current.length > STABILITY_NEED) {
           predHistRef.current.shift()
         }
-
-        if (
+        const stable =
           predHistRef.current.length >= STABILITY_NEED &&
-          new Set(predHistRef.current).size === 1 &&
+          new Set(predHistRef.current).size === 1
+
+        // Fin de seña: umbral más alto; si ya hubo estabilidad en live, vale
+        // UMBRAL normal. Evita confirmar la primera hipótesis al soltar la mano.
+        if (
+          finalize &&
+          prediction !== lastSignRef.current &&
+          (
+            (stable && confidence >= UMBRAL) ||
+            confidence >= FINALIZE_UMBRAL
+          )
+        ) {
+          confirmSign(prediction, confidence)
+          return
+        }
+
+        // Live: casi nunca 1-shot (HIGH_CONF_INSTANT ≈ 0.96); lo normal es
+        // STABILITY_NEED predicciones idénticas por encima del umbral.
+        if (
+          !finalize &&
+          prediction !== lastSignRef.current &&
           confidence >= UMBRAL &&
-          prediction !== lastSignRef.current
+          (stable || confidence >= HIGH_CONF_INSTANT)
         ) {
           confirmSign(prediction, confidence)
         }
@@ -766,10 +876,15 @@ export default function InterpretScreen({ onBack, onHome }) {
       // Umbral ADAPTATIVO de "detenido": relativo al pico de movimiento de la
       // seña en curso, con un piso absoluto. Robusto al tembleque de MediaPipe
       // (una mano quieta que vibra un poco no cuenta como movimiento).
-      const wasGesture = peakMovementRef.current >= MOVED_MIN
+      const wasGesture =
+        peakMovementRef.current >= MOVED_MIN ||
+        (len >= HELD_MIN_FRAMES && peakMovementRef.current >= HELD_MOVED_MIN)
       if (movement > peakMovementRef.current) peakMovementRef.current = movement
       const stopThreshold = Math.max(STOP_ABS, peakMovementRef.current * STOP_FRAC)
-      const gestureHappened = peakMovementRef.current >= MOVED_MIN
+      // Dinámicas (HOLA…) o sostenidas (TE_AMO, SI…): ambas cuentan como gesto.
+      const gestureHappened =
+        peakMovementRef.current >= MOVED_MIN ||
+        (len >= HELD_MIN_FRAMES && peakMovementRef.current >= HELD_MOVED_MIN)
 
       // Al ARRANCAR una seña nueva (el pico cruza MOVED_MIN tras una parada),
       // se limpia la guarda de "no repetir la última seña". Así se puede
@@ -827,19 +942,45 @@ export default function InterpretScreen({ onBack, onHome }) {
 
   // ── Detección + dibujo ─────────────────────────────────────────────────────
   // Detect → paint en el mismo tick (mínima latencia de puntos). Canvas de
-  // inferencia chico (160×120) + cámara ~320p para que MediaPipe no se atrase.
+  // inferencia chico + blur de fondo (persona nítida) cuando el segmenter listo.
   useEffect(() => {
     let lastVideoTime = -1
+    let lastPaintedTime = -1
+    let lastPaintedBlur = false
     let overlayCtx = null
+    // Máscara sticky: si un frame falla la segmentación, reutilizamos la anterior
+    // (evitar apagar el blur → parpadeo).
+    let maskReady = false
     if (!detectCanvasRef.current) {
       detectCanvasRef.current = document.createElement('canvas')
       detectCanvasRef.current.width = DETECT_W
       detectCanvasRef.current.height = DETECT_H
     }
+    if (!personMaskCanvasRef.current) {
+      personMaskCanvasRef.current = document.createElement('canvas')
+    }
+    if (!personInferMaskRef.current) {
+      personInferMaskRef.current = document.createElement('canvas')
+    }
+    if (!personFeatherCanvasRef.current) {
+      personFeatherCanvasRef.current = document.createElement('canvas')
+    }
+    if (!personLayerCanvasRef.current) {
+      personLayerCanvasRef.current = document.createElement('canvas')
+    }
+    if (!personWorkMaskRef.current) {
+      personWorkMaskRef.current = document.createElement('canvas')
+    }
+    if (!studioBgCanvasRef.current) {
+      studioBgCanvasRef.current = document.createElement('canvas')
+    }
+    if (!displayFrameCanvasRef.current) {
+      displayFrameCanvasRef.current = document.createElement('canvas')
+    }
     const detectCanvas = detectCanvasRef.current
     const detectCtx = detectCanvas.getContext('2d', {
       alpha: false,
-      willReadFrequently: false,
+      willReadFrequently: true,
       desynchronized: true,
     })
 
@@ -850,11 +991,53 @@ export default function InterpretScreen({ onBack, onHome }) {
       if (!canvas || !video || video.readyState < 2) return
 
       const hand = handLandmarkerRef.current
+      const wantStudio = studioBgRef.current && blurReadyRef.current
+      const segmenter = wantStudio ? selfieSegmenterRef.current : null
       const t = video.currentTime
       if (hand && t !== lastVideoTime) {
         lastVideoTime = t
         try {
           detectCtx.drawImage(video, 0, 0, DETECT_W, DETECT_H)
+          // Poca luz: subir exposición solo en el canvas de inferencia.
+          autoExposeCanvas(detectCtx, DETECT_W, DETECT_H)
+          if (segmenter) {
+            try {
+              segmenter.segmentForVideo(video, ts, (result) => {
+                const masks = result?.confidenceMasks
+                const mask = masks?.length > 1 ? masks[1] : masks?.[0]
+                if (!mask) return
+                try {
+                  const displayMask = personMaskCanvasRef.current
+                  const inferMask = personInferMaskRef.current
+                  // Preview: silueta completa (no cortar manos alzadas).
+                  if (!fillPersonMaskCanvas(displayMask, mask, {
+                    softLo: 0.28,
+                    softHi: 0.55,
+                  })) return
+                  // Inferencia: solo persona principal (quien firma).
+                  if (
+                    inferMask.width !== displayMask.width ||
+                    inferMask.height !== displayMask.height
+                  ) {
+                    inferMask.width = displayMask.width
+                    inferMask.height = displayMask.height
+                  }
+                  const ictx = inferMask.getContext('2d', { alpha: true })
+                  ictx.clearRect(0, 0, inferMask.width, inferMask.height)
+                  ictx.drawImage(displayMask, 0, 0)
+                  keepPrimaryPersonOnly(inferMask, { keepSatellites: true })
+                  solidifyBackgroundFromMask(detectCtx, DETECT_W, DETECT_H, inferMask)
+                  maskReady = true
+                } finally {
+                  try {
+                    for (const m of masks || []) m.close?.()
+                  } catch { /* ignore */ }
+                }
+              })
+            } catch {
+              // Mantener maskReady.
+            }
+          }
           const handResult = hand.detectForVideo(detectCanvas, ts)
           handleResultsRef.current(adaptHandResult(handResult))
         } catch (e) {
@@ -868,12 +1051,56 @@ export default function InterpretScreen({ onBack, onHome }) {
         canvas.width = w
         canvas.height = h
         overlayCtx = null
+        lastPaintedTime = -1
       }
       if (!overlayCtx) {
         overlayCtx = canvas.getContext('2d', { alpha: true, desynchronized: true })
       }
-      overlayCtx.clearRect(0, 0, w, h)
+
+      const useBlur = !!(segmenter && maskReady)
+      if (video.style) {
+        video.style.opacity = useBlur ? '0' : '1'
+      }
+
+      const frameCanvas = displayFrameCanvasRef.current
+      if (frameCanvas.width !== w || frameCanvas.height !== h) {
+        frameCanvas.width = w
+        frameCanvas.height = h
+        lastPaintedTime = -1
+      }
+
+      // Solo recomponer cuando hay frame nuevo (el blur es caro).
+      if (t !== lastPaintedTime || useBlur !== lastPaintedBlur) {
+        lastPaintedTime = t
+        lastPaintedBlur = useBlur
+        const fctx = frameCanvas.getContext('2d', { alpha: false })
+        if (useBlur) {
+          composeStudioFrame({
+            destCtx: fctx,
+            video,
+            personMask: personMaskCanvasRef.current,
+            workMask: personWorkMaskRef.current,
+            featherCanvas: personFeatherCanvasRef.current,
+            personLayer: personLayerCanvasRef.current,
+            bgCanvas: studioBgCanvasRef.current,
+            leftHand: drawLeftRef.current,
+            rightHand: drawRightRef.current,
+            w,
+            h,
+          })
+        } else {
+          fctx.imageSmoothingEnabled = true
+          fctx.drawImage(video, 0, 0, w, h)
+        }
+      }
+
       try {
+        if (useBlur) {
+          overlayCtx.clearRect(0, 0, w, h)
+          overlayCtx.drawImage(frameCanvas, 0, 0)
+        } else {
+          overlayCtx.clearRect(0, 0, w, h)
+        }
         if (drawLeftRef.current) {
           drawHandDots(overlayCtx, drawLeftRef.current, { color: '#60a5fa', radius: 2.5 })
         }
@@ -1011,10 +1238,6 @@ export default function InterpretScreen({ onBack, onHome }) {
                       : 'border-pastel-purple-line bg-pastel-purple')
                   }
                 >
-                  {running && displaySign && (
-                    <div className="pointer-events-none absolute inset-0 z-10 rounded-[1.85rem] ring-4 ring-pastel-grape/25 animate-pulse" />
-                  )}
-
                   <div className="p-4 pb-0 sm:p-5 sm:pb-0">
                     <div className="mb-3 flex min-h-[3.25rem] items-start justify-between gap-3">
                       <div className="min-w-0">
@@ -1046,7 +1269,8 @@ export default function InterpretScreen({ onBack, onHome }) {
                     </div>
                   </div>
 
-                  <div className="relative mx-4 mb-4 aspect-video overflow-hidden rounded-[1.25rem] border-2 border-dashed border-pastel-ink/15 bg-[#E8E6E0] shadow-inner sm:mx-5 sm:mb-5 [background-image:radial-gradient(rgba(45,42,38,0.08)_1px,transparent_1px)] [background-size:18px_18px]">
+                  <div className="px-4 pb-4 sm:px-5 sm:pb-5">
+                    <div className="relative aspect-video w-full overflow-hidden rounded-[1.25rem] border-2 border-dashed border-pastel-ink/15 bg-[#E8E6E0] shadow-inner [background-image:radial-gradient(rgba(45,42,38,0.08)_1px,transparent_1px)] [background-size:18px_18px]">
                     <video ref={videoRef} autoPlay playsInline muted
                       className="absolute inset-0 h-full w-full object-cover"
                       style={{ transform: 'scaleX(-1)' }} />
@@ -1096,15 +1320,6 @@ export default function InterpretScreen({ onBack, onHome }) {
                       </div>
                     )}
 
-                    {displaySign && (
-                      <div className="absolute bottom-3 left-1/2 z-20 max-w-[90%] -translate-x-1/2 rounded-xl border-2 border-pastel-grape bg-white px-4 py-2 text-center shadow-[0_8px_24px_-8px_rgba(126,100,201,0.5)]">
-                        <p className="text-base font-extrabold uppercase tracking-wide text-pastel-grape sm:text-lg">
-                          {displaySign.replace(/_/g, ' ')}
-                        </p>
-                        <p className="text-[11px] font-bold text-pastel-sub">{Math.round(displayConf * 100)}% confianza</p>
-                      </div>
-                    )}
-
                     <div className="absolute left-3 top-3 z-20 flex items-center gap-1.5 rounded-xl border-2 border-white/20 bg-black/60 px-2.5 py-1.5 text-xs font-bold text-white">
                       <span className={'h-2 w-2 rounded-full ' + (running ? 'bg-red-400 animate-pulse' : cameraOk ? 'bg-green-400' : 'bg-white/50')} />
                       {running ? 'REC' : cameraOk ? 'Lista' : '…'}
@@ -1136,6 +1351,7 @@ export default function InterpretScreen({ onBack, onHome }) {
                       />
                     )}
                   </div>
+                  </div>
 
                   {/* Controles */}
                   <div className="flex flex-wrap items-center gap-3 border-t-2 border-white/40 px-4 py-4 sm:px-5" data-tutorial="interpret-start">
@@ -1158,6 +1374,16 @@ export default function InterpretScreen({ onBack, onHome }) {
                       </button>
                     )}
 
+                    <label className="inline-flex cursor-pointer select-none items-center gap-2 rounded-xl border-2 border-white/60 bg-white/80 px-3 py-2 text-sm font-bold text-pastel-ink">
+                      <input
+                        type="checkbox"
+                        checked={studioBg}
+                        onChange={(e) => setStudioBg(e.target.checked)}
+                        className="h-4 w-4 accent-pastel-grape"
+                      />
+                      <Icon name="layers" className="h-4 w-4" strokeWidth={2} /> Fondo estudio
+                    </label>
+
                     <label className="ml-auto inline-flex cursor-pointer select-none items-center gap-2 rounded-xl border-2 border-white/60 bg-white/80 px-3 py-2 text-sm font-bold text-pastel-ink">
                       <input
                         type="checkbox"
@@ -1173,7 +1399,7 @@ export default function InterpretScreen({ onBack, onHome }) {
                 {sentence.length > 0 && (
                   <OutputCard title="Conversación" emptyIcon="message" hasContent>
                     <p className="text-xl font-extrabold leading-relaxed tracking-wide text-pastel-ink sm:text-2xl">
-                      {sentence.map((s) => s.replace(/_/g, ' ')).join(' ')}
+                      {sentence.join(' ')}
                     </p>
                   </OutputCard>
                 )}
@@ -1182,13 +1408,20 @@ export default function InterpretScreen({ onBack, onHome }) {
                   <div className="rounded-2xl border-2 border-dashed border-pastel-purple-line bg-pastel-purple/40 px-4 py-4 text-center">
                     <p className="text-sm font-bold text-pastel-ink">
                       Pulsa <strong className="text-pastel-grape">Empezar a interpretar</strong>.
-                      Haz cada seña con movimiento claro. Cuando termines, <strong>quita las manos</strong> del encuadre para confirmar la seña.
+                      Haz cada seña con movimiento claro y completa el gesto. Cuando termines, <strong>pausa o quita las manos</strong> del encuadre para confirmar — el sistema espera un poco más de certeza para no adivinar.
                     </p>
                   </div>
                 )}
               </AppPageStagger>
 
-              <AppPageStagger className="flex flex-col gap-5 lg:col-span-5">
+              <AppPageStagger className="relative z-20 flex flex-col gap-5 overflow-visible lg:col-span-5">
+                {!running && (
+                  <LanguagePicker
+                    value={outputLang}
+                    onChange={setOutputLang}
+                    className="w-full"
+                  />
+                )}
                 <div
                   data-tutorial="interpret-results"
                   className="motion-surface animate-motion-scale-in rounded-[1.5rem] border-[3px] border-pastel-purple-line bg-white p-5 shadow-[0_16px_36px_-22px_rgba(45,42,38,0.35)] sm:p-6"
@@ -1197,8 +1430,13 @@ export default function InterpretScreen({ onBack, onHome }) {
                   {latest ? (
                     <>
                       <p className="mt-3 text-4xl font-extrabold uppercase tracking-tight text-pastel-grape sm:text-5xl">
-                        {latest.sign.replace(/_/g, ' ')}
+                        {(latest.displayText || latest.sign.replace(/_/g, ' '))}
                       </p>
+                      {latest.lang && latest.lang !== 'es' && (
+                        <p className="mt-1 text-xs font-bold text-pastel-sub">
+                          Seña: {latest.sign.replace(/_/g, ' ')} · {findOutputLang(latest.lang).label}
+                        </p>
+                      )}
                       <div className="mt-4">
                         <div className="mb-1 flex justify-between text-xs font-bold text-pastel-sub">
                           <span>Confianza</span>
@@ -1230,7 +1468,9 @@ export default function InterpretScreen({ onBack, onHome }) {
                   hasContent={history.length > 0}
                   empty="Cada seña reconocida aparecerá aquí."
                 >
-                  <ul className="space-y-2">
+                  {/* Se ven ~5 sin scroll; el resto queda adentro con scroll
+                      interno en vez de estirar la card hacia abajo. */}
+                  <ul className="max-h-80 space-y-2 overflow-y-auto pr-1">
                     {history.map((h, i) => (
                       <li
                         key={i}
@@ -1239,7 +1479,9 @@ export default function InterpretScreen({ onBack, onHome }) {
                         <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-white text-xs font-extrabold text-pastel-grape">
                           {i + 1}
                         </span>
-                        <span className="flex-1 text-sm font-bold text-pastel-ink">{h.sign.replace(/_/g, ' ')}</span>
+                        <span className="flex-1 text-sm font-bold text-pastel-ink">
+                          {(h.displayText || h.sign.replace(/_/g, ' '))}
+                        </span>
                         <span className="text-xs font-extrabold text-pastel-sub">{Math.round((h.confidence || 0) * 100)}%</span>
                       </li>
                     ))}

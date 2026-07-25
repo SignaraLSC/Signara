@@ -4,13 +4,23 @@ import Icon from './Icon.jsx'
 
 const EXAMPLES = [
   { text: 'Hola, ¿cómo estás?', icon: 'wave' },
-  { text: 'Necesito ayuda', icon: 'help' },
+  { text: 'Ayúdame', icon: 'help' },
   { text: 'Tengo sed', icon: 'droplet' },
   { text: 'Te amo', icon: 'heart' },
 ]
 
 const TextInputPanel = forwardRef(function TextInputPanel(
-  { initialMode = 'text', onSubmit, onLiveWord, busy = false, pendingWord = '', missedWord = '' },
+  {
+    initialMode = 'text',
+    onSubmit,
+    onLiveWord,
+    onVoiceEnd,
+    busy = false,
+    pendingWord = '',
+    missedWord = '',
+    voiceLang = 'es-ES',
+    topSlot = null,
+  },
   ref
 ) {
   const [value, setValue] = useState('')
@@ -19,10 +29,16 @@ const TextInputPanel = forwardRef(function TextInputPanel(
 
   const onSubmitRef = useRef(onSubmit)
   const onLiveWordRef = useRef(onLiveWord)
+  const onVoiceEndRef = useRef(onVoiceEnd)
   onSubmitRef.current = onSubmit
   onLiveWordRef.current = onLiveWord
+  onVoiceEndRef.current = onVoiceEnd
 
   const liveEmittedRef = useRef([])
+  // Tras limpiar la barra en voz, el API sigue mandando el transcript COMPLETO
+  // de la sesión. Solo mostramos/emitimos a partir de este índice (no
+  // reiniciamos liveEmittedRef — eso re-disparaba todas las señas).
+  const displayFromRef = useRef(0)
 
   // Reconocimiento de voz: el texto interim/final puede llegar acumulado o como
   // delta. Solo emitimos palabras NUEVAS respecto a lo ya enviado. Si el
@@ -45,13 +61,22 @@ const TextInputPanel = forwardRef(function TextInputPanel(
       console.log('[voz][emitNewWords]', { prev: prev.slice(), allWords: allWords.slice(), common })
     }
 
-    // Prefijo roto (nueva frase / reinicio del reconocedor): empezar de cero.
+    // Prefijo roto (reinicio del transcript): NO re-emitir lo ya enviado
+    // desde el último clear. Si no, en inglés/otro idioma la 1ª palabra
+    // (p.ej. "hello") se traduce y seña dos veces.
     if (common < prev.length && common < allWords.length) {
-      for (let i = 0; i < allWords.length; i++) {
+      const already = prev.slice(displayFromRef.current)
+      let shared = 0
+      while (
+        shared < already.length &&
+        shared < allWords.length &&
+        normW(already[shared]) === normW(allWords[shared])
+      ) shared++
+      for (let i = shared; i < allWords.length; i++) {
         const w = allWords[i]
         if (w && onLiveWordRef.current) onLiveWordRef.current(w)
       }
-      liveEmittedRef.current = allWords.slice()
+      liveEmittedRef.current = prev.slice(0, displayFromRef.current).concat(allWords)
       return
     }
 
@@ -71,36 +96,67 @@ const TextInputPanel = forwardRef(function TextInputPanel(
 
   function handleLive(text, isFinal) {
     const cleaned = String(text || '').trim()
-    setValue(cleaned)
     const words = cleaned.split(/\s+/).filter(Boolean)
+    // Barra: solo lo dicho desde el último clear (no todo el historial de sesión).
+    setValue(words.slice(displayFromRef.current).join(' '))
     // Interim: la última palabra puede seguir cambiando, no se emite todavía.
     // Final: ya está confirmada completa, se emite también la última.
     emitNewWords(isFinal ? words : words.slice(0, -1))
   }
 
+  // Tras traducir: barra vacía. En voz HAY que conservar liveEmittedRef —
+  // el reconocedor reenvía todo el transcript tras cada pausa; si lo
+  // reseteamos, se re-emiten (y se re-apendan a "Lo que dijiste") todas
+  // las palabras otra vez.
+  function clearBar({ keepVoiceMemory = false } = {}) {
+    setValue('')
+    if (keepVoiceMemory) {
+      displayFromRef.current = liveEmittedRef.current.length
+    } else {
+      liveEmittedRef.current = []
+      displayFromRef.current = 0
+    }
+  }
+
   const { listening, error, supported, start, stop } = useVoiceInput({
-    lang: 'es-ES',
+    lang: voiceLang || 'es-ES',
     continuous: true,
     onLiveTranscript: handleLive,
     onResult: (text) => {
       if (!text) return
-      if (onSubmitRef.current) onSubmitRef.current(text)
+      if (onSubmitRef.current) onSubmitRef.current(text, { fromVoice: true })
+      clearBar({ keepVoiceMemory: true })
     }
   })
 
+  function stopMicAndNotify() {
+    stop()
+    if (onVoiceEndRef.current) onVoiceEndRef.current()
+  }
+
   const listeningRef = useRef(listening)
-  const stopRef = useRef(stop)
+  const stopRef = useRef(stopMicAndNotify)
   listeningRef.current = listening
-  stopRef.current = stop
+  stopRef.current = stopMicAndNotify
+
+  // Si cambia el idioma de entrada mientras escucha, reiniciar el mic.
+  const prevVoiceLangRef = useRef(voiceLang)
+  useEffect(() => {
+    if (prevVoiceLangRef.current === voiceLang) return
+    prevVoiceLangRef.current = voiceLang
+    if (!listeningRef.current) return
+    try { stop() } catch (_) { /* ignore */ }
+    const t = setTimeout(() => { try { start() } catch (_) { /* ignore */ } }, 200)
+    return () => clearTimeout(t)
+  }, [voiceLang, start, stop])
 
   useImperativeHandle(ref, () => ({
     clear: () => {
       if (listeningRef.current) {
         try { stopRef.current() } catch (_) {}
       }
-      setValue('')
       setInputMode('text')
-      liveEmittedRef.current = []
+      clearBar({ keepVoiceMemory: false })
     },
     isListening: () => listeningRef.current,
     stopMic: () => { if (listeningRef.current) stopRef.current() }
@@ -123,11 +179,14 @@ const TextInputPanel = forwardRef(function TextInputPanel(
     if (e?.preventDefault) e.preventDefault()
     const text = value.trim()
     if (!text || busy) return
-    if (onSubmit) onSubmit(text)
+    if (listening) stopMicAndNotify()
+    if (onSubmit) onSubmit(text, { fromVoice: false })
+    clearBar()
+    setTimeout(() => inputRef.current?.focus(), 50)
   }
 
   function pickTextMode() {
-    if (listening) stop()
+    if (listening) stopMicAndNotify()
     setInputMode('text')
     setTimeout(() => inputRef.current?.focus(), 50)
   }
@@ -135,16 +194,16 @@ const TextInputPanel = forwardRef(function TextInputPanel(
   function pickVoiceMode() {
     if (!supported || busy) return
     setInputMode('voice')
-    setValue('')
-    liveEmittedRef.current = []
+    clearBar({ keepVoiceMemory: false })
     start()
   }
 
   function runExample(text) {
     if (busy || listening) return
-    setValue(text)
     setInputMode('text')
-    if (onSubmit) onSubmit(text)
+    if (onSubmit) onSubmit(text, { fromVoice: false })
+    clearBar()
+    setTimeout(() => inputRef.current?.focus(), 50)
   }
 
   return (
@@ -154,6 +213,7 @@ const TextInputPanel = forwardRef(function TextInputPanel(
     // ENTRE ellas en móvil sin duplicar el componente ni romper el submit.
     <form onSubmit={submit} className="contents">
       <div className="ta-tabsinput animate-motion-enter" data-tutorial="translate-input">
+        {topSlot ? <div className="mb-3">{topSlot}</div> : null}
         {/* Selector de modo */}
         <div className="mb-3 grid grid-cols-2 gap-2">
           <ModeTab
@@ -184,7 +244,7 @@ const TextInputPanel = forwardRef(function TextInputPanel(
           <div className="flex items-center gap-2 px-2.5 py-2 sm:gap-3 sm:px-3 sm:py-2.5">
             <button
               type="button"
-              onClick={listening ? stop : pickVoiceMode}
+              onClick={listening ? stopMicAndNotify : pickVoiceMode}
               disabled={!supported}
               title={supported ? (listening ? 'Detener micrófono' : 'Activar micrófono') : 'Voz no disponible'}
               className={
@@ -205,7 +265,7 @@ const TextInputPanel = forwardRef(function TextInputPanel(
               type="text"
               value={value}
               onChange={(e) => setValue(e.target.value)}
-              onFocus={() => { if (listening) stop(); setInputMode('text') }}
+              onFocus={() => { if (listening) stopMicAndNotify(); setInputMode('text') }}
               placeholder={
                 listening
                   ? 'Habla ahora — el avatar señará al instante'

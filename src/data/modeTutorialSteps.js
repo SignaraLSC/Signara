@@ -6,6 +6,12 @@ export const TRANSLATE_TUTORIAL_STEPS = [
     icon: 'sign',
   },
   {
+    target: 'translate-language',
+    title: 'Idioma de entrada',
+    body: 'Elige en qué idioma hablas o escribes. Signara lo pasa a español y luego a señas.',
+    icon: 'globe',
+  },
+  {
     target: 'translate-input',
     title: 'Escribe o habla',
     body: 'Elige la pestaña Escribir o Hablar. Con voz, el avatar señará palabra a palabra en tiempo real.',
@@ -20,14 +26,8 @@ export const TRANSLATE_TUTORIAL_STEPS = [
   {
     target: 'translate-avatar',
     title: 'Mira las señas aquí',
-    body: 'El avatar reproduce cada seña en orden. Arriba verás cuál está señando ahora.',
+    body: 'A la derecha, el avatar reproduce cada seña en orden.',
     icon: 'eye',
-  },
-  {
-    target: 'translate-picker',
-    title: 'Elige tu intérprete',
-    body: 'Puedes cambiar entre Alex, Anuar y Grace cuando quieras.',
-    icon: 'user',
   },
 ]
 

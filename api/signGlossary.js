@@ -204,6 +204,25 @@ export function glossaryTranslate(text, target) {
   return entry[target] || entry[target.split('-')[0]] || null
 }
 
+/**
+ * Inverso: frase en idioma extranjero → clave española del glosario
+ * (p. ej. "how are you" → "como estas").
+ * @returns {string|null}
+ */
+export function glossaryToSpanish(text, sourceLang) {
+  if (!sourceLang || sourceLang === 'es') return null
+  const q = normalizeKey(text)
+  if (!q) return null
+  const langKey = sourceLang
+  const langShort = sourceLang.split('-')[0]
+  for (const [esKey, map] of Object.entries(GLOSSARY)) {
+    const foreign = map[langKey] || map[langShort]
+    if (!foreign) continue
+    if (normalizeKey(foreign) === q) return esKey
+  }
+  return null
+}
+
 /** Basura conocida de MyMemory / TM pública. */
 export function isJunkTranslation(source, translated) {
   const t = String(translated || '').trim().toLowerCase()
@@ -211,6 +230,10 @@ export function isJunkTranslation(source, translated) {
   if (/mymemory warning/i.test(t)) return true
   if (/speak spanish/i.test(t)) return true
   if (t === 'comp estas') return true
+  // Placeholders / basura de TM pública (p. ej. "testvalue").
+  if (/^(test|dummy|sample|lorem|foo|bar|baz|asdf|qwerty)([_\s.-]?\w*)?$/i.test(t)) return true
+  if (/^[a-z]+value$/i.test(t)) return true
+  if (/^[a-z]{0,4}\d+[a-z]{0,4}$/i.test(t) && !/^(si|no)$/i.test(t)) return true
   const srcWords = normalizeKey(source).split(' ').filter(Boolean).length
   const outWords = t.split(/\s+/).filter(Boolean).length
   // Frases cortas de seña no deberían explotar a oraciones largas.

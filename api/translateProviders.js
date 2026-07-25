@@ -3,7 +3,7 @@
  * Orden: glosario Signara → Google (si hay clave) → MyMemory (filtrado).
  */
 
-import { glossaryTranslate, isJunkTranslation } from './signGlossary.js'
+import { glossaryTranslate, glossaryToSpanish, isJunkTranslation } from './signGlossary.js'
 
 const GOOGLE_URL = 'https://translation.googleapis.com/language/translate/v2'
 const MYMEMORY_URL = 'https://api.mymemory.translated.net/get'
@@ -89,15 +89,23 @@ export async function translateWithFallback(q, source, target, env = {}) {
   const myMemoryEmail = env.myMemoryEmail || ''
   const myMemoryKey = env.myMemoryKey || ''
 
-  const fromGlossary = glossaryTranslate(q, target)
-  if (fromGlossary) {
-    return { translated: fromGlossary, provider: 'glossary' }
+  const fromGlossaryToForeign = glossaryTranslate(q, target)
+  if (fromGlossaryToForeign) {
+    return { translated: fromGlossaryToForeign, provider: 'glossary' }
+  }
+
+  // Entrada multilingüe → español (Traducir: hello → hola).
+  if (target === 'es' && source && source !== 'es') {
+    const toEs = glossaryToSpanish(q, source)
+    if (toEs) {
+      return { translated: toEs, provider: 'glossary' }
+    }
   }
 
   if (googleKey) {
     try {
       const translated = await translateGoogle(q, source, target, googleKey)
-      if (!isJunkTranslation(q, translated)) {
+      if (translated && !isJunkTranslation(q, translated)) {
         return { translated, provider: 'google' }
       }
     } catch (err) {
@@ -109,5 +117,10 @@ export async function translateWithFallback(q, source, target, env = {}) {
     email: myMemoryEmail,
     apiKey: myMemoryKey,
   })
+  if (isJunkTranslation(q, translated)) {
+    const err = new Error('Traducción no usable')
+    err.status = 502
+    throw err
+  }
   return { translated, provider: 'mymemory' }
 }

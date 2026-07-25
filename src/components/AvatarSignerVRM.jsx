@@ -25,7 +25,7 @@ import { parsePlayToken } from '../utils/directionalVerbs.js'
 
 const AVATAR_URL = '/avatar/signara-avatar.vrm'
 // Subir esto invalida el cache en memoria tras cambios del baker (SED/cuello, etc.).
-const BAKE_CACHE_VER = 54 // PERDON: no inventar pila de manos
+const BAKE_CACHE_VER = 74 // TE_AMO self: un poco más afuera
 /** @type {Record<string, unknown>} */
 const sharedBakeCache = {}
 /** @type {Record<string, unknown>} */
@@ -141,18 +141,26 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
       if (!cancelled) setAvatarError(true)
     })
 
+    const root = canvas.parentElement
     const onResize = () => {
-      const w2 = canvas.clientWidth, h2 = canvas.clientHeight
-      if (!w2 || !h2) return
+      const box = root || canvas
+      const w2 = Math.max(1, Math.floor(box.clientWidth))
+      const h2 = Math.max(1, Math.floor(box.clientHeight))
       renderer.setSize(w2, h2, false)
       camera.aspect = w2 / h2
       camera.updateProjectionMatrix()
     }
-    window.addEventListener('resize', onResize)
+    const ro = typeof ResizeObserver !== 'undefined'
+      ? new ResizeObserver(() => onResize())
+      : null
+    if (ro) ro.observe(root || canvas)
+    else window.addEventListener('resize', onResize)
+    requestAnimationFrame(onResize)
     return () => {
       cancelled = true
       cancelAnimationFrame(animId)
-      window.removeEventListener('resize', onResize)
+      if (ro) ro.disconnect()
+      else window.removeEventListener('resize', onResize)
       renderer.dispose()
       sceneRef.current = null
       vrmRef.current = null

@@ -178,8 +178,20 @@ export function createBaker(vrm) {
     // donde empezaba) en vez de un punto inventado que no se percibía bien
     // en pantalla. Se invierte ANTES de todo el pipeline (frames crudos) —
     // así dedos/cabeza/cara quedan consistentes con el movimiento invertido,
-    // no solo la muñeca. Solo AYUDAME usa 'self'; AYUDA y el resto NO.
-    const dataset = (direction === 'self' && Array.isArray(trimmed.frames))
+    // no solo la muñeca.
+    // 'third_self' (ÉL ME AYUDA / ÉL ME PERDONÓ): inversión hacia el pecho +
+    // yaw de tronco al 3º. 'third_group_self' (ELLOS NOS AYUDAN): igual +
+    // barrido de grupo (DIRECTION_TARGETS).
+    // TE_AMO es casi estático (ILY): invertir frames no se percibe — para
+    // self/third_self usa DIRECTION_TARGETS.self (atracción al pecho).
+    const tokenEarly = String(trimmed.token || rawDataset?.token || '').toUpperCase()
+    const reverseForSelf =
+      tokenEarly !== 'TE_AMO' && (
+        direction === 'self' ||
+        direction === 'third_self' ||
+        direction === 'third_group_self'
+      )
+    const dataset = (reverseForSelf && Array.isArray(trimmed.frames))
       ? { ...trimmed, frames: [...trimmed.frames].reverse() }
       : trimmed
     const arms = activeArms(dataset)
@@ -190,6 +202,8 @@ export function createBaker(vrm) {
       MAL: (-100 * Math.PI) / 180,
       // SCOOBA: palma de la mano en boca más de frente al rostro.
       SCOOBA: (55 * Math.PI) / 180,
+      // AYUDA: sin roll global — el +45° volcaba la palma y el puño.
+      AYUDA: 0,
     }
     // Overrides calibrados contra la fuente 'pose' — no aplican si se está
     // probando 'hand' (esa fuente tiene su propio giro base, wristRollHand).
@@ -321,17 +335,46 @@ export function createBaker(vrm) {
     // "ilusión de cercanía" — un movimiento diagonal (arriba+adelante) SÍ es
     // legible en pantalla, a diferencia del Z puro. Y sube de 0.05 (casi
     // nula) a 0.5.
+    // Ayúdanos / ellos nos ayudan: semicírculo frente al pecho (lado ↔ lado).
+    const sweepGroupSelf = (i, n) => {
+      const t = n > 1 ? i / (n - 1) : 0.5 // 0..1 a lo largo de la seña
+      // Smoothstep: velocidad más pareja en el centro (sin “traba” percibida
+      // cuando el barrido lineal se sumaba a un empujón natural que frena).
+      const ts = t * t * (3 - 2 * t)
+      const sweepX = (0.5 - ts) * 2 * shoulderHalfW * 0.85 // de +0.85 a -0.85
+      // Z más adelante: el brazo no “entra” al pecho a mitad del barrido.
+      return new THREE.Vector3(sweepX, shoulderHalfW * 0.08, shoulderHalfW * 0.58)
+    }
     const DIRECTION_TARGETS = {
       listener: () => new THREE.Vector3(0, shoulderHalfW * 0.5, shoulderHalfW * 1.0),
+      // TE_AMO me amas / me ama: atraer al pecho medio (C_avatar = hombros;
+      // Y≈0 queda a altura de boca/cuello). Sternum ≈ −0.55 × halfW.
+      // Z holgado (> TORSO_MIN_FWD) — la palma ILY es ancha y si no, entra.
+      self: () => new THREE.Vector3(0, -shoulderHalfW * 0.55, shoulderHalfW * 0.92),
       // 'third' (AYUDALO) NO va aquí: bake = neutral; solo pose.spine/chest.
-      group_self: (i, n) => {
-        const t = n > 1 ? i / (n - 1) : 0.5 // 0..1 a lo largo de la seña
-        // Smoothstep: velocidad más pareja en el centro (sin “traba” percibida
-        // cuando el barrido lineal se sumaba a un empujón natural que frena).
+      group_self: sweepGroupSelf,
+      // Ellos nos ayudan: mismo barrido; la inversión de frames acerca el
+      // final al pecho/grupo + yaw 3º en el pose.
+      third_group_self: sweepGroupSelf,
+      // Ayúdalos/las: semicírculo continuo en UNA zona lateral (no todo el
+      // pecho). Lado fijo ≈ izquierda de pantalla (mundo −X); Fase 3 elegiría
+      // el lado real del referente.
+      group_third: (i, n) => {
+        const t = n > 1 ? i / (n - 1) : 0.5
         const ts = t * t * (3 - 2 * t)
-        const sweepX = (0.5 - ts) * 2 * shoulderHalfW * 0.85 // de +0.85 a -0.85
-        // Z más adelante: el brazo no “entra” al pecho a mitad del barrido.
-        return new THREE.Vector3(sweepX, shoulderHalfW * 0.08, shoulderHalfW * 0.58)
+        const side = -1
+        const arc = Math.sin(ts * Math.PI) // 0 → 1 → 0 (semicírculo)
+        const sweepX = side * shoulderHalfW * (0.4 + 0.55 * ts)
+        const sweepZ = shoulderHalfW * (0.55 + 0.35 * arc)
+        return new THREE.Vector3(sweepX, shoulderHalfW * 0.1, sweepZ)
+      },
+      // Yo los/las ayudo: desde el pecho abriendo en abanico al frente/lado.
+      fan_out: (i, n) => {
+        const t = n > 1 ? i / (n - 1) : 0.5
+        const ts = t * t * (3 - 2 * t)
+        const sweepX = (ts - 0.5) * 2 * shoulderHalfW * 0.9
+        const sweepZ = shoulderHalfW * (0.35 + 0.55 * ts)
+        return new THREE.Vector3(sweepX, shoulderHalfW * 0.1, sweepZ)
       },
     }
     // Asimétrico: entra rápido a la zona, SALE lento — evita el tirón al
@@ -363,7 +406,6 @@ export function createBaker(vrm) {
       if (dx >= dy && dx > shoulderHalfW * 0.18) return
       // PERDON/FAMILIA: ruido de profundidad a veces deja dy≈dx y ESTO
       // inventaba una pila (una mano al cuello, la otra a la cintura).
-      // Solo reforzar pilas YA claras en la toma (ΔY claramente dominante).
       if (dy < dx * 1.2 || dy < shoulderHalfW * 0.12) return
       const sepY = shoulderHalfW * 0.16
       const minFwdLo = shoulderHalfW * 0.58 // clearance pecho para la mano baja
@@ -379,6 +421,25 @@ export function createBaker(vrm) {
       }
       // Que no quede detrás de la mano alta (atraviesa hacia el pecho).
       if (loT.z < hiT.z + stackZ) loT.z = hiT.z + stackZ
+    }
+    // AYUDA (como la referencia LSC): puño derecho ENCIMA de palma izquierda,
+    // centrados al frente. No depende de dx/dy de la toma — si las manos
+    // vienen separadas, stackHands() abortaba y quedaban lado a lado.
+    function stackAyudaHands(tg) {
+      if (!tg.right || !tg.left) return
+      const mid = tg.right.T.clone().add(tg.left.T).multiplyScalar(0.5)
+      // Centro delante del pecho (conserva un poco el avance de la toma).
+      const center = C_avatar.clone().add(new THREE.Vector3(
+        mid.x - C_avatar.x,
+        Math.max(mid.y - C_avatar.y, -shoulderHalfW * 0.35),
+        Math.max(mid.z - C_avatar.z, shoulderHalfW * 0.65),
+      ))
+      // Contacto casi horizontal (puño apoyado en palma), sin atravesarse.
+      const sepY = shoulderHalfW * 0.28
+      const stackZ = shoulderHalfW * 0.08
+      // Como la foto: palma IZQ abajo, puño DER (pulgar ↑) arriba.
+      tg.left.T.set(center.x, center.y - sepY * 0.5, center.z + stackZ)
+      tg.right.T.set(center.x, center.y + sepY * 0.5, center.z)
     }
     // FAMILIA y similares: manos lado a lado a la misma altura. MediaPipe
     // suele dejar ~3–5 cm de sesgo vertical entre muñecas; en el avatar se
@@ -409,9 +470,13 @@ export function createBaker(vrm) {
     // avoidTorso duro (inventaba “una arriba / una abajo” en PERDON).
     const NEAR_FACE_SIGNS = new Set(['HOLA', 'SCOOBA', 'PERDON', 'GRACIAS', 'TENGO_SED'])
     const SIDE_BY_SIDE_SIGNS = new Set(['PERDON', 'FAMILIA', 'BIEN', 'MAL'])
+    const AYUDA_STACK_SIGNS = new Set(['AYUDA'])
     const nearFace = NEAR_FACE_SIGNS.has(bakeToken)
     const sideBySide = SIDE_BY_SIDE_SIGNS.has(bakeToken)
-    const skipStack = nearFace || sideBySide
+    const ayudaStack = AYUDA_STACK_SIGNS.has(bakeToken)
+    const skipStack = nearFace || sideBySide || ayudaStack
+    const skipAttract = nearFace || ayudaStack
+    const skipTorsoPush = nearFace
     // 1) Datos crudos por frame: IK (wristDir, reachFrac, pole) + muñeca + dedos.
     const rawDirs = frames.map((f) => frameToArmDirs(f, arms))
     // Base de la muñeca: 'hand' (frameHandBasis, 21 landmarks) es la fuente por
@@ -501,7 +566,59 @@ export function createBaker(vrm) {
       put(rawWri, side, 'fwd', smoothVecSeq(pick(rawWri, side, 'fwd'), CONFIG.wristSmooth))
       put(rawWri, side, 'normal', smoothVecSeq(pick(rawWri, side, 'normal'), CONFIG.wristSmooth))
     }
+    // AYUDA: palma izq mirando ARRIBA; puño der tipo “pulgar arriba”
+    // (nudillos al frente, palma del puño hacia adentro).
+    if (ayudaStack) {
+      for (let i = 0; i < rawWri.length; i++) {
+        if (rawWri[i].left) {
+          // Dedos al frente (+Z). En este VRM la normal “hacia +Y” dejaba
+          // el dorso arriba — hay que invertir para palma ↑.
+          rawWri[i].left = { fwd: [0, 0, 1], normal: [0, -1, 0] }
+        }
+        if (rawWri[i].right) {
+          // Nudillos al frente (+Z), palma del puño hacia +X → pulgar ↑
+          rawWri[i].right = { fwd: [0, 0, 1], normal: [1, 0, 0] }
+        }
+      }
+    }
     const fingSmooth = smoothPoseSeq(rawFing, CONFIG.dirSmooth)
+    // Forzar formas de mano: palma abierta abajo + puño pulgar-arriba encima.
+    if (ayudaStack) {
+      const ax = CONFIG.fingerAxis || 'z'
+      const tax = CONFIG.thumbAxis || 'y'
+      const M = CONFIG.fingerMax ?? 1.2
+      const fist = 1.05 * M
+      const open = 0.02 * M
+      const eul = (side, val, axis = ax) => {
+        const s = side === 'right' ? 1 : -1
+        return { x: 0, y: 0, z: 0, [axis]: s * val }
+      }
+      const teul = (side, val) => {
+        const s = side === 'right' ? 1 : -1
+        const ts = s * (CONFIG.thumbSign ?? 1)
+        return { x: 0, y: 0, z: 0, [tax]: ts * val }
+      }
+      for (let i = 0; i < fingSmooth.length; i++) {
+        const o = { ...(fingSmooth[i] || {}) }
+        // Palma izq bien abierta (plana)
+        for (const f of ['Index', 'Middle', 'Ring', 'Little']) {
+          o[`left${f}Proximal`] = eul('left', open)
+          o[`left${f}Intermediate`] = eul('left', open)
+          o[`left${f}Distal`] = eul('left', open)
+        }
+        o.leftThumbProximal = teul('left', open)
+        o.leftThumbDistal = teul('left', open)
+        // Puño der cerrado + pulgar extendido (como la foto)
+        for (const f of ['Index', 'Middle', 'Ring', 'Little']) {
+          o[`right${f}Proximal`] = eul('right', fist)
+          o[`right${f}Intermediate`] = eul('right', fist)
+          o[`right${f}Distal`] = eul('right', fist * 0.75)
+        }
+        o.rightThumbProximal = teul('right', 0)
+        o.rightThumbDistal = teul('right', 0)
+        fingSmooth[i] = o
+      }
+    }
 
     // 3a) Pre-pasada: calcular el objetivo de muñeca (con atracción) de TODOS
     // los frames primero, y con eso la fracción de extensión del brazo. La
@@ -525,16 +642,16 @@ export function createBaker(vrm) {
         const S = B.up.getWorldPosition(new THREE.Vector3()) // hombro (fijo, no depende de la pose)
         const scale = (B.L1 + B.L2) / (armLenRef[name] || d.recArmLen)
         let T = C_avatar.clone().addScaledVector(new THREE.Vector3(...d.wristOffset), scale)
-        // Cerca de cara/boca: no empujar con avoidTorso (aplana SCOOBA/HOLA…).
-        if (!nearFace) T = avoidTorso(T)
+        // Cerca de cara / AYUDA cruda: no empujar con avoidTorso (aplana la toma).
+        if (!skipTorsoPush) T = avoidTorso(T)
         const neckW = neckZoneWeight(T, d.wristOffset)
         tg[name] = { B, d, S, T, neckW }
       }
       if (tg.right && tg.left) {
         const gap = tg.right.T.distanceTo(tg.left.T)
         const near = 1.0 * (R.L1 + R.L2)
-        // SCOOBA/cerca de cara: NO atraer manos al centro (rompe boca + barrido).
-        if (!nearFace && gap < near) {
+        // SCOOBA/cerca de cara/AYUDA: NO atraer manos al centro genérico.
+        if (!skipAttract && gap < near) {
           const mid = tg.right.T.clone().add(tg.left.T).multiplyScalar(0.5)
           const pull = CONFIG.handAttract * (1 - gap / near)
           tg.right.T.lerp(mid, pull)
@@ -542,7 +659,9 @@ export function createBaker(vrm) {
           tg.right.T.copy(avoidTorso(tg.right.T))
           tg.left.T.copy(avoidTorso(tg.left.T))
         }
-        if (!skipStack) {
+        if (ayudaStack) {
+          stackAyudaHands(tg)
+        } else if (!skipStack) {
           stackHands(tg)
           levelSideBySideHands(tg)
         }
@@ -631,13 +750,25 @@ export function createBaker(vrm) {
     // pose.spine/chest al final. Al reproducir, los brazos son hijos del
     // tronco y giran con él sin rehacer IK ni rotar T a mano.
 
-    const directionTargetFn = DIRECTION_TARGETS[direction]
+    // TE_AMO self/third_self → target geométrico 'self' (no reverse).
+    const redirectKey =
+      token === 'TE_AMO' && (direction === 'self' || direction === 'third_self')
+        ? 'self'
+        : direction
+    const directionTargetFn = DIRECTION_TARGETS[redirectKey]
     if (directionTargetFn) {
       const pullByDir = {
-        listener: CONFIG.directionalPull ?? 0.6,
+        // TE_AMO: concordancia sutil — proyección más suave que AYUDA.
+        listener: token === 'TE_AMO'
+          ? (CONFIG.teAmoListenerPull ?? 0.32)
+          : (CONFIG.directionalPull ?? 0.6),
+        self: CONFIG.teAmoSelfPull ?? 0.68,
         group_self: 0.55,
+        third_group_self: 0.55,
+        group_third: 0.55,
+        fan_out: 0.55,
       }
-      const pull = pullByDir[direction] ?? (CONFIG.directionalPull ?? 0.4)
+      const pull = pullByDir[redirectKey] ?? (CONFIG.directionalPull ?? 0.4)
       const poleW = pull
       // Centroide PROMEDIO de TODA la seña (una sola vez, no por frame): si
       // el delta se recalculara cuadro a cuadro contra la posición natural
@@ -699,13 +830,31 @@ export function createBaker(vrm) {
             wri.normal = rotArrYaw(wri.normal, qYaw)
           }
         }
-        if (sideBySide) {
+        if (ayudaStack) {
+          stackAyudaHands(tg)
+        } else if (sideBySide) {
           levelSideBySideHands(tg)
         } else if (!nearFace) {
           stackHands(tg)
           levelSideBySideHands(tg)
         }
-        for (const n of active) tg[n].T.copy(avoidTorso(tg[n].T))
+        // TE_AMO al pecho: avoidTorso (0.4) no basta — la palma ILY sigue
+        // enterrándose; forzar Z mínimo delante del sternum.
+        const teAmoChest =
+          token === 'TE_AMO' && redirectKey === 'self'
+        const minFwd = teAmoChest
+          ? shoulderHalfW * (CONFIG.teAmoSelfMinFwd ?? 0.78)
+          : null
+        for (const n of active) {
+          tg[n].T.copy(avoidTorso(tg[n].T))
+          if (minFwd != null) {
+            const off = tg[n].T.clone().sub(C_avatar)
+            if (off.z < minFwd) {
+              off.z = minFwd
+              tg[n].T.copy(C_avatar.clone().add(off))
+            }
+          }
+        }
       }
     }
     const extRaw = { right: [], left: [] }
@@ -799,18 +948,96 @@ export function createBaker(vrm) {
           pose.neck = { x: 0, y: 0, z: 0 }
         }
       }
-      // AYUDALO: solo yaw de tronco en el pose (manos = bake neutral).
-      // El player aplica spine/chest; los brazos siguen al esqueleto.
-      if (direction === 'third') {
+      // Tercera persona en el espacio: yaw de tronco. Manos = bake neutral
+      // (third), invertidas (third_self / third_group_self), o barrido lateral
+      // (group_third ya mueve muñecas; el yaw refuerza el “lado”).
+      if (
+        direction === 'third' ||
+        direction === 'third_self' ||
+        direction === 'third_group_self' ||
+        direction === 'group_third'
+      ) {
         const yawY = CONFIG.thirdTorsoYawY ?? 0.22
-        pose.spine = { x: 0, y: yawY, z: 0 }
-        pose.chest = { x: 0, y: yawY * 0.75, z: 0 }
+        pose.spine = { ...(pose.spine || {}), x: pose.spine?.x || 0, y: yawY, z: 0 }
+        pose.chest = { ...(pose.chest || {}), x: pose.chest?.x || 0, y: yawY * 0.75, z: 0 }
+      }
+      // PERDONAME / pedir perdón: inclinación leve del torso hacia adelante
+      // + súplica facial (referencia LSC: contacto visual / arrepentimiento).
+      if (direction === 'plead') {
+        const lean = CONFIG.pleadTorsoLeanX ?? 0.14
+        pose.spine = { x: lean, y: pose.spine?.y || 0, z: 0 }
+        pose.chest = { x: lean * 0.85, y: pose.chest?.y || 0, z: 0 }
+        // Mirada un poco al interlocutor (cabeza baja; mismo signo que headPitchSign).
+        const headMag = CONFIG.pleadHeadPitchX ?? 0.08
+        const headPitch = headMag * (CONFIG.headPitchSign ?? -1)
+        const curH = pose.head?.x || 0
+        pose.head = {
+          ...(pose.head || {}),
+          x: headPitch < 0 ? Math.min(curH, headPitch) : Math.max(curH, headPitch),
+        }
+      }
+      // TE_AMO — concordancia sutil: mirada + torso hacia el receptor
+      // (la proyección de manos va por DIRECTION_TARGETS / reverse).
+      if (token === 'TE_AMO') {
+        const lean = CONFIG.teAmoTorsoLeanX ?? 0.1
+        const headMag = CONFIG.teAmoHeadPitchX ?? 0.06
+        const headPitch = headMag * (CONFIG.headPitchSign ?? -1)
+        const yawThird = CONFIG.thirdTorsoYawY ?? 0.22
+        const curHx = pose.head?.x || 0
+        const curHy = pose.head?.y || 0
+        if (direction === 'listener' || direction === 'neutral') {
+          pose.spine = { x: lean, y: pose.spine?.y || 0, z: 0 }
+          pose.chest = { x: lean * 0.8, y: pose.chest?.y || 0, z: 0 }
+          pose.head = {
+            ...(pose.head || {}),
+            x: headPitch < 0 ? Math.min(curHx, headPitch) : Math.max(curHx, headPitch),
+            y: curHy,
+          }
+        } else if (direction === 'self' || direction === 'third_self') {
+          // Hacia el pecho: torso un poco recogido + mirada baja.
+          pose.spine = { x: lean * 0.55, y: pose.spine?.y || 0, z: 0 }
+          pose.chest = { x: lean * 0.45, y: pose.chest?.y || 0, z: 0 }
+          const down = headPitch * 1.25
+          pose.head = {
+            ...(pose.head || {}),
+            x: down < 0 ? Math.min(curHx, down) : Math.max(curHx, down),
+            y: direction === 'third_self' ? yawThird * 0.85 : curHy,
+          }
+        } else if (
+          direction === 'third' ||
+          direction === 'group_third' ||
+          direction === 'group_self'
+        ) {
+          pose.spine = {
+            x: lean * 0.55,
+            y: pose.spine?.y || (direction === 'group_self' ? 0 : yawThird),
+            z: 0,
+          }
+          pose.chest = {
+            x: lean * 0.45,
+            y: pose.chest?.y || (direction === 'group_self' ? 0 : yawThird * 0.75),
+            z: 0,
+          }
+          if (direction !== 'group_self') {
+            pose.head = {
+              ...(pose.head || {}),
+              x: headPitch < 0 ? Math.min(curHx, headPitch) : Math.max(curHx, headPitch),
+              y: yawThird * 0.9,
+            }
+          } else {
+            pose.head = {
+              ...(pose.head || {}),
+              x: headPitch < 0 ? Math.min(curHx, headPitch) : Math.max(curHx, headPitch),
+            }
+          }
+        }
       }
       // Forzar angry=0 siempre (caché vieja / heurística mala lo dejaba enojado).
       const expr = { ...(exprSmooth[i] || NEUTRAL_EXPR), angry: 0 }
       // PERDON = disculpa triste, no enojo. Este VRM tiene morph/preset `sad`.
       if (token === 'PERDON') {
-        expr.sad = Math.max(expr.sad || 0, 0.55)
+        const sadFloor = direction === 'plead' ? 0.72 : 0.55
+        expr.sad = Math.max(expr.sad || 0, sadFloor)
         expr.surprised = Math.min(expr.surprised || 0, 0.12)
         expr.angry = 0
       }

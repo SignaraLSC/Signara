@@ -556,13 +556,8 @@ button,
   }
 }
 
-/* Pantalla Traducir: en móvil el avatar va DEBAJO del cuadro de texto/mic y
-   ARRIBA de "Prueba con un clic" (no como bloque aparte antes de todo el
-   panel); en desktop (lg) vuelve a las dos columnas de siempre. Se usa
-   grid-template-areas en vez de simple `order` porque hay que intercalar el
-   avatar ENTRE dos mitades de un mismo componente (TextInputPanel), cuyo
-   <form> raíz usa display:contents para que sus dos mitades cuenten como
-   items directos de esta grilla. */
+/* Traducir: controles a la izquierda, avatar a la derecha (mismo bloque).
+   En móvil el avatar va entre input y ejemplos. TextInputPanel usa display:contents. */
 .translate-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -608,6 +603,9 @@ button,
     column-gap: 2rem;
     row-gap: 1.25rem;
     align-items: start;
+  }
+  .ta-avatar {
+    align-self: start;
   }
 }
 

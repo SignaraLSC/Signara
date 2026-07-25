@@ -122,6 +122,12 @@ const PATHS = {
       <polyline points="5 12 12 5 19 12" />
     </>
   ),
+  'arrow-down': (
+    <>
+      <line x1="12" y1="5" x2="12" y2="19" />
+      <polyline points="19 12 12 19 5 12" />
+    </>
+  ),
   chevron: <polyline points="6 9 12 15 18 9" />,
   globe: (
     <>

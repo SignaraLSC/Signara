@@ -47,9 +47,9 @@ ANIM_DIR       = Path(__file__).parent / "animations"
 UMBRAL_CONFIANZA = float(os.getenv("SIGNARA_UMBRAL", "0.80"))
 MARGEN_TOP2      = float(os.getenv("SIGNARA_MARGEN_TOP2", "0.18"))
 
-# Conjugación geométrica AYUDA→AYUDAME/… OFF por defecto: sin pose/hombros
-# la heurística suele invertir AYUDA ↔ AYUDAME. Activar solo con
-# SIGNARA_CONJUGATE=1 cuando haya tomas calibradas.
+# Fase 2B — conjugación geométrica (AYUDA→AYUDAME/…). OFF por defecto:
+# /predict solo tiene manos (sin hombros). Activar en local con
+# SIGNARA_CONJUGATE=1 tras calibrar (ver CLAUDE.md → Directional verbs).
 ENABLE_CONJUGATE = os.getenv("SIGNARA_CONJUGATE", "0").strip().lower() in (
     "1", "true", "yes", "on",
 )

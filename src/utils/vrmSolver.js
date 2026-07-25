@@ -65,11 +65,22 @@ export const CONFIG = {
   // AYUDAME/TE_AYUDO — el pull competía demasiado con el offset original
   // de la toma. Seguir calibrando viendo señas reales.
   directionalPull: 0.6,
-  // AYUDALO (direction 'third'): giro del tronco en profundidad (eje Y),
-  // no inclinación lateral. Un hombro queda un poco más adelantado (+Z) y
-  // el cuerpo “mira” hacia la derecha de pantalla. ~0.2 rad ≈ 11°.
-  // Si se ve al lado contrario, invertir el signo.
+  // AYUDALO / EL_ME_PERDONO (direction 'third' | 'third_self'): giro del
+  // tronco en profundidad (eje Y), no inclinación lateral. Un hombro queda
+  // un poco más adelantado (+Z) y el cuerpo “mira” hacia la derecha de
+  // pantalla. ~0.2 rad ≈ 11°. Si se ve al lado contrario, invertir el signo.
   thirdTorsoYawY: 0.22,
+  // PERDONAME (direction 'plead'): inclinación adelante del torso + cabeza.
+  pleadTorsoLeanX: 0.14,
+  pleadHeadPitchX: 0.08,
+  // TE_AMO — concordancia sutil (mirada / torso / proyección suave).
+  teAmoTorsoLeanX: 0.1,
+  teAmoHeadPitchX: 0.06,
+  teAmoListenerPull: 0.32,
+  // me amas / me ama: ILY casi estático → pull al pecho (no reverse).
+  teAmoSelfPull: 0.85,
+  // Clearance Z delante del pecho (ILY ancha; avoidTorso genérico no alcanza).
+  teAmoSelfMinFwd: 0.92,
 
   // ── Dedos (Fase 2) ──
   fingerGain: 1.0,   // escala del doblez de dedos (1 = ángulo real)

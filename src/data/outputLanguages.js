@@ -1,7 +1,7 @@
 /**
- * Idiomas de salida (seña → español → este idioma).
- * `code` = BCP-47 / Google Translate target.
- * `speech` = lang para speechSynthesis.
+ * Idiomas de la app (entrada Traducir / salida Interpretar).
+ * `code` = código API de traducción.
+ * `speech` = lang para speechSynthesis / SpeechRecognition.
  */
 export const OUTPUT_LANGUAGES = [
   { code: 'es', speech: 'es-ES', label: 'Español', native: 'Español', flag: 'ES' },
@@ -15,18 +15,32 @@ export const OUTPUT_LANGUAGES = [
 ]
 
 export const DEFAULT_OUTPUT_LANG = 'es'
-const STORAGE_KEY = 'signara:outputLang'
+export const DEFAULT_INPUT_LANG = 'es'
+const OUTPUT_STORAGE_KEY = 'signara:outputLang'
+const INPUT_STORAGE_KEY = 'signara:inputLang'
 
 export function getStoredOutputLang() {
   try {
-    const v = localStorage.getItem(STORAGE_KEY)
+    const v = localStorage.getItem(OUTPUT_STORAGE_KEY)
     if (v && OUTPUT_LANGUAGES.some((l) => l.code === v)) return v
   } catch { /* ignore */ }
   return DEFAULT_OUTPUT_LANG
 }
 
 export function storeOutputLang(code) {
-  try { localStorage.setItem(STORAGE_KEY, code) } catch { /* ignore */ }
+  try { localStorage.setItem(OUTPUT_STORAGE_KEY, code) } catch { /* ignore */ }
+}
+
+export function getStoredInputLang() {
+  try {
+    const v = localStorage.getItem(INPUT_STORAGE_KEY)
+    if (v && OUTPUT_LANGUAGES.some((l) => l.code === v)) return v
+  } catch { /* ignore */ }
+  return DEFAULT_INPUT_LANG
+}
+
+export function storeInputLang(code) {
+  try { localStorage.setItem(INPUT_STORAGE_KEY, code) } catch { /* ignore */ }
 }
 
 export function findOutputLang(code) {

@@ -200,15 +200,27 @@ async def predict(req: PredictRequest):
         prediction = "TE_AMO"
         confidence = max(te_p, ily_score, UMBRAL_CONFIANZA * 0.95)
 
-    # COMO_ESTAS ↔ FAMILIA: geo decide rápido (siempre elige uno si hay manos).
+    # COMO_ESTAS ↔ FAMILIA: geo solo si el GNN ya apunta a ese par (o es top-2).
+    # No forzar con prediction=None genérico + prob residual (inventaba FAMILIA/COMO).
     if "COMO_ESTAS" in _labels and "FAMILIA" in _labels:
         como_i = _labels.index("COMO_ESTAS")
         fam_i = _labels.index("FAMILIA")
         como_p = float(probs[como_i])
         fam_p = float(probs[fam_i])
+        order = np.argsort(probs)[::-1]
+        top2 = (
+            {_labels[int(order[0])], _labels[int(order[1])]}
+            if len(order) > 1
+            else {_labels[int(order[0])]}
+        )
+        pair = {"COMO_ESTAS", "FAMILIA"}
         competing = (
-            prediction in ("COMO_ESTAS", "FAMILIA", None)
-            and max(como_p, fam_p) >= 0.08
+            prediction in ("COMO_ESTAS", "FAMILIA")
+            or (
+                prediction is None
+                and bool(top2 & pair)
+                and max(como_p, fam_p) >= 0.12
+            )
         )
         if competing:
             geo = resolve_como_familia(data)

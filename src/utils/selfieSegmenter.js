@@ -12,7 +12,7 @@ const SELFIE_MODEL_URLS = [
 
 let sharedSegmenter = null
 let sharedPromise = null
-const SEGMENTER_REV = 7
+const SEGMENTER_REV = 8
 let sharedRev = 0
 
 async function createSegmenter(vision, modelAssetPath, delegate) {
@@ -91,6 +91,201 @@ export function fillPersonMaskCanvas(
     data[o + 3] = a
   }
   ctx.putImageData(img, 0, 0)
+  return true
+}
+
+/** Elige la máscara cuyo centro tiene más confianza (evita canal invertido). */
+export function pickPersonConfidenceMask(masks) {
+  if (!masks?.length) return null
+  if (masks.length === 1) return masks[0]
+
+  let best = masks[0]
+  let bestCenter = -1
+  for (const m of masks) {
+    const conf = m.getAsFloat32Array()
+    const w = m.width
+    const h = m.height
+    let sum = 0
+    let n = 0
+    const y0 = Math.floor(h * 0.15)
+    const y1 = Math.floor(h * 0.85)
+    const x0 = Math.floor(w * 0.25)
+    const x1 = Math.floor(w * 0.75)
+    for (let y = y0; y < y1; y++) {
+      for (let x = x0; x < x1; x++) {
+        sum += conf[y * w + x]
+        n++
+      }
+    }
+    const center = n ? sum / n : 0
+    if (center > bestCenter) {
+      bestCenter = center
+      best = m
+    }
+  }
+  return best
+}
+
+function _maskCenterAlpha(maskCanvas) {
+  if (!maskCanvas?.width) return 0
+  const ctx = maskCanvas.getContext('2d', { willReadFrequently: true })
+  if (!ctx) return 0
+  const { width: w, height: h } = maskCanvas
+  const img = ctx.getImageData(0, 0, w, h)
+  const d = img.data
+  let sum = 0
+  let n = 0
+  const y0 = Math.floor(h * 0.2)
+  const y1 = Math.floor(h * 0.8)
+  const x0 = Math.floor(w * 0.3)
+  const x1 = Math.floor(w * 0.7)
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) {
+      sum += d[(y * w + x) * 4 + 3]
+      n++
+    }
+  }
+  return n ? sum / (n * 255) : 0
+}
+
+/** Rellena máscara; invierte si el canal venía al revés. */
+export function fillPersonMaskAuto(maskCanvas, confidenceMask, opts = {}) {
+  if (!fillPersonMaskCanvas(maskCanvas, confidenceMask, opts)) return false
+  if (_maskCenterAlpha(maskCanvas) < 0.28) {
+    return fillPersonMaskCanvas(maskCanvas, confidenceMask, { ...opts, invert: true })
+  }
+  return true
+}
+
+/** Zona central de firma siempre protegida (manos extendidas). */
+export function stampSigningZoneIntoMask(maskCanvas) {
+  if (!maskCanvas?.width) return
+  const ctx = maskCanvas.getContext('2d', { alpha: true })
+  if (!ctx) return
+  const mw = maskCanvas.width
+  const mh = maskCanvas.height
+  ctx.save()
+  ctx.fillStyle = '#ffffff'
+  ctx.globalCompositeOperation = 'source-over'
+  ctx.beginPath()
+  ctx.ellipse(mw * 0.5, mh * 0.46, mw * 0.44, mh * 0.48, 0, 0, Math.PI * 2)
+  ctx.fill()
+  ctx.restore()
+}
+
+/**
+ * Máscara generosa desde selfie_segmenter para HandLandmarker (sin blur visual).
+ */
+export function buildInferenceMaskFromSelfie(workMask, confidenceMask) {
+  if (!workMask || !confidenceMask) return false
+  if (!fillPersonMaskAuto(workMask, confidenceMask, { softLo: 0.20, softHi: 0.50 })) {
+    return false
+  }
+  if (_maskCenterAlpha(workMask) < 0.16) return false
+  dilateMask(workMask, 8)
+  stampSigningZoneIntoMask(workMask)
+  return true
+}
+
+/**
+ * Pinta gris neutro el fondo del canvas de inferencia; protege manos conocidas.
+ */
+export function applyInferenceMaskToDetectCanvas(ctx, w, h, workMask, leftHand, rightHand, scratch) {
+  if (!ctx || !workMask?.width) return
+  const protect = scratch || document.createElement('canvas')
+  if (protect.width !== workMask.width || protect.height !== workMask.height) {
+    protect.width = workMask.width
+    protect.height = workMask.height
+  }
+  const pctx = protect.getContext('2d', { alpha: true })
+  if (!pctx) return
+  pctx.clearRect(0, 0, protect.width, protect.height)
+  pctx.drawImage(workMask, 0, 0)
+  stampHandsIntoMask(protect, leftHand, rightHand, {
+    radiusNorm: 0.075,
+    minRadiusPx: 10,
+    maxRadiusPx: 28,
+  })
+  solidifyBackgroundFromMask(ctx, w, h, protect, [42, 40, 38], { alphaCut: 38 })
+  return protect
+}
+
+/** Fondo virtual Signara (sin blur del cuarto). */
+export function drawSignaraVirtualBackdrop(destCtx, w, h) {
+  if (!destCtx || w < 1 || h < 1) return
+  const g = destCtx.createLinearGradient(0, 0, w * 0.9, h)
+  g.addColorStop(0, '#FAF6EC')
+  g.addColorStop(0.42, '#F0E8F8')
+  g.addColorStop(1, '#DDD0F0')
+  destCtx.fillStyle = g
+  destCtx.fillRect(0, 0, w, h)
+  destCtx.globalAlpha = 0.32
+  const blob = destCtx.createRadialGradient(w * 0.2, h * 0.15, 0, w * 0.2, h * 0.15, w * 0.55)
+  blob.addColorStop(0, '#E8D4FF')
+  blob.addColorStop(1, 'rgba(232, 212, 255, 0)')
+  destCtx.fillStyle = blob
+  destCtx.fillRect(0, 0, w, h)
+  destCtx.globalAlpha = 1
+}
+
+/**
+ * Preview visible: fondo Signara + persona recortada (misma máscara selfie).
+ */
+export function composeSelfiePreviewFrame({
+  destCtx,
+  video,
+  personMask,
+  workMask,
+  featherCanvas,
+  personLayer,
+  leftHand,
+  rightHand,
+  w,
+  h,
+}) {
+  if (!destCtx || !video || !personMask?.width || w < 1 || h < 1) return false
+
+  if (workMask.width !== personMask.width || workMask.height !== personMask.height) {
+    workMask.width = personMask.width
+    workMask.height = personMask.height
+  }
+  const wctx = workMask.getContext('2d', { alpha: true })
+  if (!wctx) return false
+  wctx.setTransform(1, 0, 0, 1, 0, 0)
+  wctx.globalCompositeOperation = 'source-over'
+  wctx.clearRect(0, 0, workMask.width, workMask.height)
+  wctx.drawImage(personMask, 0, 0)
+  stampHandsIntoMask(workMask, leftHand, rightHand, {
+    radiusNorm: 0.075,
+    minRadiusPx: 10,
+    maxRadiusPx: 28,
+  })
+  if (!featherMaskTo(workMask, featherCanvas, w, h, 1)) return false
+
+  destCtx.setTransform(1, 0, 0, 1, 0, 0)
+  destCtx.globalCompositeOperation = 'source-over'
+  destCtx.imageSmoothingEnabled = true
+  destCtx.imageSmoothingQuality = 'high'
+  destCtx.clearRect(0, 0, w, h)
+  drawSignaraVirtualBackdrop(destCtx, w, h)
+
+  if (personLayer.width !== w || personLayer.height !== h) {
+    personLayer.width = w
+    personLayer.height = h
+  }
+  const pctx = personLayer.getContext('2d', { alpha: true })
+  if (!pctx) return false
+  pctx.setTransform(1, 0, 0, 1, 0, 0)
+  pctx.globalCompositeOperation = 'source-over'
+  pctx.imageSmoothingEnabled = true
+  pctx.imageSmoothingQuality = 'high'
+  pctx.clearRect(0, 0, w, h)
+  pctx.drawImage(video, 0, 0, w, h)
+  pctx.globalCompositeOperation = 'destination-in'
+  pctx.drawImage(featherCanvas, 0, 0, w, h)
+  pctx.globalCompositeOperation = 'source-over'
+
+  destCtx.drawImage(personLayer, 0, 0)
   return true
 }
 

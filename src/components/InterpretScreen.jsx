@@ -16,12 +16,12 @@ import { useModeTutorial } from '../hooks/useModeTutorial.js'
 import { ML_API_URL, checkMlApiHealth, getMlApiCache } from '../utils/mlApi.js'
 import { getSharedHandLandmarker } from '../utils/handLandmarker.js'
 import {
+  applyInferenceMaskToDetectCanvas,
   autoExposeCanvas,
-  composeStudioFrame,
-  fillPersonMaskCanvas,
+  buildInferenceMaskFromSelfie,
+  composeSelfiePreviewFrame,
   getSharedSelfieSegmenter,
-  keepPrimaryPersonOnly,
-  solidifyBackgroundFromMask,
+  pickPersonConfidenceMask,
 } from '../utils/selfieSegmenter.js'
 import LanguagePicker from './LanguagePicker.jsx'
 import {
@@ -270,20 +270,24 @@ function frameMovement(prev, curr) {
 
 // ── Componente principal ──────────────────────────────────────────────────────
 
+function readStudioBgPreference() {
+  try { return localStorage.getItem('signara:studioBg') === '1' } catch { return false }
+}
+
 export default function InterpretScreen({ onBack, onHome }) {
   const videoRef     = useRef(null)
   const canvasRef    = useRef(null)
   const handLandmarkerRef = useRef(null)
   const selfieSegmenterRef = useRef(null)
-  const personMaskCanvasRef = useRef(null)
   const personInferMaskRef = useRef(null)
-  const personFeatherCanvasRef = useRef(null)
-  const personLayerCanvasRef = useRef(null)
-  const personWorkMaskRef = useRef(null)
-  const studioBgCanvasRef = useRef(null)
-  const displayFrameCanvasRef = useRef(null)
-  const blurReadyRef = useRef(false)
-  const studioBgRef = useRef(true)
+  const personMaskCacheRef = useRef(null)
+  const maskScratchRef = useRef(null)
+  const previewWorkMaskRef = useRef(null)
+  const previewFeatherRef = useRef(null)
+  const previewPersonLayerRef = useRef(null)
+  const segmentFrameCounterRef = useRef(0)
+  const segmenterReadyRef = useRef(false)
+  const studioBgRef = useRef(readStudioBgPreference())
   const mediaStreamRef    = useRef(null)
   const detectRafRef      = useRef(null)
   const runningRef   = useRef(false)
@@ -340,9 +344,7 @@ export default function InterpretScreen({ onBack, onHome }) {
   const [mlMode,        setMlMode]        = useState(false)
   const [mlConnecting,  setMlConnecting]  = useState(false)
   const [audioOn,       setAudioOn]       = useState(true)
-  const [studioBg,      setStudioBg]      = useState(() => {
-    try { return localStorage.getItem('signara:studioBg') !== '0' } catch { return true }
-  })
+  const [studioBg,      setStudioBg]      = useState(readStudioBgPreference)
   const [handVisible,   setHandVisible]   = useState(false)
   const [bufferLen,     setBufferLen]     = useState(0)
   const [inCooldown,    setInCooldown]    = useState(false)
@@ -420,10 +422,12 @@ export default function InterpretScreen({ onBack, onHome }) {
     }
   }, [])
 
-  // Segmenter solo con «Fondo estudio» activo.
+  // Selfie segmenter — inferencia + preview visible con la misma máscara.
   useEffect(() => {
     if (!studioBg) {
-      blurReadyRef.current = false
+      segmenterReadyRef.current = false
+      personMaskCacheRef.current = null
+      segmentFrameCounterRef.current = 0
       return
     }
     let cancelled = false
@@ -431,14 +435,14 @@ export default function InterpretScreen({ onBack, onHome }) {
       .then((seg) => {
         if (cancelled) return
         selfieSegmenterRef.current = seg
-        blurReadyRef.current = true
+        segmenterReadyRef.current = true
       })
       .catch(() => {
-        if (!cancelled) blurReadyRef.current = false
+        if (!cancelled) segmenterReadyRef.current = false
       })
     return () => {
       cancelled = true
-      blurReadyRef.current = false
+      segmenterReadyRef.current = false
     }
   }, [studioBg])
 
@@ -941,41 +945,29 @@ export default function InterpretScreen({ onBack, onHome }) {
   handleResultsRef.current = handleResults
 
   // ── Detección + dibujo ─────────────────────────────────────────────────────
-  // Detect → paint en el mismo tick (mínima latencia de puntos). Canvas de
-  // inferencia chico + blur de fondo (persona nítida) cuando el segmenter listo.
+  // Selfie segmenter → inferencia enmascarada + preview visible para el usuario.
   useEffect(() => {
     let lastVideoTime = -1
-    let lastPaintedTime = -1
-    let lastPaintedBlur = false
     let overlayCtx = null
-    // Máscara sticky: si un frame falla la segmentación, reutilizamos la anterior
-    // (evitar apagar el blur → parpadeo).
-    let maskReady = false
     if (!detectCanvasRef.current) {
       detectCanvasRef.current = document.createElement('canvas')
       detectCanvasRef.current.width = DETECT_W
       detectCanvasRef.current.height = DETECT_H
     }
-    if (!personMaskCanvasRef.current) {
-      personMaskCanvasRef.current = document.createElement('canvas')
-    }
     if (!personInferMaskRef.current) {
       personInferMaskRef.current = document.createElement('canvas')
     }
-    if (!personFeatherCanvasRef.current) {
-      personFeatherCanvasRef.current = document.createElement('canvas')
+    if (!maskScratchRef.current) {
+      maskScratchRef.current = document.createElement('canvas')
     }
-    if (!personLayerCanvasRef.current) {
-      personLayerCanvasRef.current = document.createElement('canvas')
+    if (!previewWorkMaskRef.current) {
+      previewWorkMaskRef.current = document.createElement('canvas')
     }
-    if (!personWorkMaskRef.current) {
-      personWorkMaskRef.current = document.createElement('canvas')
+    if (!previewFeatherRef.current) {
+      previewFeatherRef.current = document.createElement('canvas')
     }
-    if (!studioBgCanvasRef.current) {
-      studioBgCanvasRef.current = document.createElement('canvas')
-    }
-    if (!displayFrameCanvasRef.current) {
-      displayFrameCanvasRef.current = document.createElement('canvas')
+    if (!previewPersonLayerRef.current) {
+      previewPersonLayerRef.current = document.createElement('canvas')
     }
     const detectCanvas = detectCanvasRef.current
     const detectCtx = detectCanvas.getContext('2d', {
@@ -991,57 +983,63 @@ export default function InterpretScreen({ onBack, onHome }) {
       if (!canvas || !video || video.readyState < 2) return
 
       const hand = handLandmarkerRef.current
-      const wantStudio = studioBgRef.current && blurReadyRef.current
-      const segmenter = wantStudio ? selfieSegmenterRef.current : null
       const t = video.currentTime
       if (hand && t !== lastVideoTime) {
         lastVideoTime = t
         try {
           detectCtx.drawImage(video, 0, 0, DETECT_W, DETECT_H)
-          // Poca luz: subir exposición solo en el canvas de inferencia.
+          const cached = studioBgRef.current ? personMaskCacheRef.current : null
+          if (cached?.width) {
+            applyInferenceMaskToDetectCanvas(
+              detectCtx,
+              DETECT_W,
+              DETECT_H,
+              cached,
+              drawLeftRef.current,
+              drawRightRef.current,
+              maskScratchRef.current,
+            )
+          }
           autoExposeCanvas(detectCtx, DETECT_W, DETECT_H)
-          if (segmenter) {
+          const handResult = hand.detectForVideo(detectCanvas, ts)
+          handleResultsRef.current(adaptHandResult(handResult))
+        } catch (e) {
+          console.warn('detectForVideo:', e)
+        }
+
+        const segmenter = studioBgRef.current && segmenterReadyRef.current
+          ? selfieSegmenterRef.current
+          : null
+        if (segmenter) {
+          segmentFrameCounterRef.current += 1
+          const needCache = !personMaskCacheRef.current?.width
+          if (needCache || segmentFrameCounterRef.current % 4 === 0) {
             try {
               segmenter.segmentForVideo(video, ts, (result) => {
                 const masks = result?.confidenceMasks
-                const mask = masks?.length > 1 ? masks[1] : masks?.[0]
-                if (!mask) return
                 try {
-                  const displayMask = personMaskCanvasRef.current
-                  const inferMask = personInferMaskRef.current
-                  // Preview: silueta completa (no cortar manos alzadas).
-                  if (!fillPersonMaskCanvas(displayMask, mask, {
-                    softLo: 0.28,
-                    softHi: 0.55,
-                  })) return
-                  // Inferencia: solo persona principal (quien firma).
-                  if (
-                    inferMask.width !== displayMask.width ||
-                    inferMask.height !== displayMask.height
-                  ) {
-                    inferMask.width = displayMask.width
-                    inferMask.height = displayMask.height
+                  if (!studioBgRef.current) return
+                  const mask = pickPersonConfidenceMask(masks)
+                  const workMask = personInferMaskRef.current
+                  if (!mask || !buildInferenceMaskFromSelfie(workMask, mask)) return
+                  let cache = personMaskCacheRef.current
+                  if (!cache) {
+                    cache = document.createElement('canvas')
+                    personMaskCacheRef.current = cache
                   }
-                  const ictx = inferMask.getContext('2d', { alpha: true })
-                  ictx.clearRect(0, 0, inferMask.width, inferMask.height)
-                  ictx.drawImage(displayMask, 0, 0)
-                  keepPrimaryPersonOnly(inferMask, { keepSatellites: true })
-                  solidifyBackgroundFromMask(detectCtx, DETECT_W, DETECT_H, inferMask)
-                  maskReady = true
+                  if (cache.width !== workMask.width || cache.height !== workMask.height) {
+                    cache.width = workMask.width
+                    cache.height = workMask.height
+                  }
+                  cache.getContext('2d', { alpha: true })?.drawImage(workMask, 0, 0)
                 } finally {
                   try {
                     for (const m of masks || []) m.close?.()
                   } catch { /* ignore */ }
                 }
               })
-            } catch {
-              // Mantener maskReady.
-            }
+            } catch { /* ignore */ }
           }
-          const handResult = hand.detectForVideo(detectCanvas, ts)
-          handleResultsRef.current(adaptHandResult(handResult))
-        } catch (e) {
-          console.warn('detectForVideo:', e)
         }
       }
 
@@ -1051,55 +1049,33 @@ export default function InterpretScreen({ onBack, onHome }) {
         canvas.width = w
         canvas.height = h
         overlayCtx = null
-        lastPaintedTime = -1
       }
       if (!overlayCtx) {
         overlayCtx = canvas.getContext('2d', { alpha: true, desynchronized: true })
       }
 
-      const useBlur = !!(segmenter && maskReady)
+      const cached = studioBgRef.current ? personMaskCacheRef.current : null
+      const showPreview = !!(studioBgRef.current && cached?.width)
+
       if (video.style) {
-        video.style.opacity = useBlur ? '0' : '1'
+        video.style.opacity = showPreview ? '0' : '1'
       }
 
-      const frameCanvas = displayFrameCanvasRef.current
-      if (frameCanvas.width !== w || frameCanvas.height !== h) {
-        frameCanvas.width = w
-        frameCanvas.height = h
-        lastPaintedTime = -1
-      }
-
-      // Solo recomponer cuando hay frame nuevo (el blur es caro).
-      if (t !== lastPaintedTime || useBlur !== lastPaintedBlur) {
-        lastPaintedTime = t
-        lastPaintedBlur = useBlur
-        const fctx = frameCanvas.getContext('2d', { alpha: false })
-        if (useBlur) {
-          composeStudioFrame({
-            destCtx: fctx,
+      try {
+        overlayCtx.clearRect(0, 0, w, h)
+        if (showPreview) {
+          composeSelfiePreviewFrame({
+            destCtx: overlayCtx,
             video,
-            personMask: personMaskCanvasRef.current,
-            workMask: personWorkMaskRef.current,
-            featherCanvas: personFeatherCanvasRef.current,
-            personLayer: personLayerCanvasRef.current,
-            bgCanvas: studioBgCanvasRef.current,
+            personMask: cached,
+            workMask: previewWorkMaskRef.current,
+            featherCanvas: previewFeatherRef.current,
+            personLayer: previewPersonLayerRef.current,
             leftHand: drawLeftRef.current,
             rightHand: drawRightRef.current,
             w,
             h,
           })
-        } else {
-          fctx.imageSmoothingEnabled = true
-          fctx.drawImage(video, 0, 0, w, h)
-        }
-      }
-
-      try {
-        if (useBlur) {
-          overlayCtx.clearRect(0, 0, w, h)
-          overlayCtx.drawImage(frameCanvas, 0, 0)
-        } else {
-          overlayCtx.clearRect(0, 0, w, h)
         }
         if (drawLeftRef.current) {
           drawHandDots(overlayCtx, drawLeftRef.current, { color: '#60a5fa', radius: 2.5 })
@@ -1320,6 +1296,12 @@ export default function InterpretScreen({ onBack, onHome }) {
                       </div>
                     )}
 
+                    {studioBg && (
+                      <div className="absolute bottom-3 left-3 z-20 rounded-lg border border-white/25 bg-black/55 px-2 py-1 text-[10px] font-bold uppercase tracking-wide text-white/90">
+                        Selfie seg. activo
+                      </div>
+                    )}
+
                     <div className="absolute left-3 top-3 z-20 flex items-center gap-1.5 rounded-xl border-2 border-white/20 bg-black/60 px-2.5 py-1.5 text-xs font-bold text-white">
                       <span className={'h-2 w-2 rounded-full ' + (running ? 'bg-red-400 animate-pulse' : cameraOk ? 'bg-green-400' : 'bg-white/50')} />
                       {running ? 'REC' : cameraOk ? 'Lista' : '…'}
@@ -1374,14 +1356,17 @@ export default function InterpretScreen({ onBack, onHome }) {
                       </button>
                     )}
 
-                    <label className="inline-flex cursor-pointer select-none items-center gap-2 rounded-xl border-2 border-white/60 bg-white/80 px-3 py-2 text-sm font-bold text-pastel-ink">
+                    <label
+                      className="inline-flex cursor-pointer select-none items-center gap-2 rounded-xl border-2 border-white/60 bg-white/80 px-3 py-2 text-sm font-bold text-pastel-ink"
+                      title="MediaPipe selfie_segmenter: recorta tu silueta sobre fondo Signara y mejora la detección de manos."
+                    >
                       <input
                         type="checkbox"
                         checked={studioBg}
                         onChange={(e) => setStudioBg(e.target.checked)}
                         className="h-4 w-4 accent-pastel-grape"
                       />
-                      <Icon name="layers" className="h-4 w-4" strokeWidth={2} /> Fondo estudio
+                      <Icon name="target" className="h-4 w-4" strokeWidth={2} /> Selfie segmentación
                     </label>
 
                     <label className="ml-auto inline-flex cursor-pointer select-none items-center gap-2 rounded-xl border-2 border-white/60 bg-white/80 px-3 py-2 text-sm font-bold text-pastel-ink">

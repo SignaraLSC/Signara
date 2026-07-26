@@ -73,12 +73,12 @@ export function playSolverAnim(vrm, kfs, onDone) {
     let i = 0
     while (i < times.length - 1 && times[i + 1] <= el) i++
     const seg = Math.max(1, times[i + 1] - times[i])
-    // SIEMPRE lineal aquí: la entrada/salida ya traen la aceleración/
-    // desaceleración horneada en cómo se repartieron los pasos del IK
-    // (transition() dentro de bakeSolver). Frenar/acelerar OTRA VEZ aquí
-    // (por-tramo) causaba pausas y saltos de velocidad en cada frontera
-    // entre los varios micro-tramos del IK.
-    const tt = Math.min(1, Math.max(0, (el - times[i]) / seg))
+    // Micro-tramos de entry/exit (~35ms) se dejan lineales: ya traen
+    // smoothstep horneado en bakeSolver.transition(). Tramos largos
+    // (p.ej. blend 280ms entre letras del deletreo) sí llevan ease para
+    // que el cambio de handshape no se vea robótico.
+    let tt = Math.min(1, Math.max(0, (el - times[i]) / seg))
+    if (seg >= 100) tt = tt * tt * (3 - 2 * tt)
     for (const n of names) if (nodes[n]) nodes[n].quaternion.slerpQuaternions(tracks[n][i], tracks[n][i + 1], tt)
     if (exprManager) {
       EXPR_NAMES.forEach((n) => {

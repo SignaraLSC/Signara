@@ -33,17 +33,17 @@
  */
 
 export const DIRECTIONAL_VERBS = {
-  // AYUDA — formas direccionales básicas (referencia LSC). Aprox. en bake:
-  // no hay número fijo en la práctica (ubicación real / uno-por-uno = Fase 3).
-  // · Ayúdame (tú→mí): oyente → pecho → 'self' (toma al revés)
-  // · Ayúdalo/la (tú→3º): oyente → punto lateral → 'third'
-  // · Ayúdanos (tú→nosotros): frente → pecho + semicírculo → 'group_self'
-  // · Ayúdalos/las (tú→ellos): frente → semicírculo lateral → 'group_third'
-  // · Yo los/las ayudo (yo→ellos): pecho → abanico al frente/lado → 'fan_out'
-  // · Yo te ayudo (yo→tú): pecho → oyente → 'listener'
-  // · Él/Ella me ayuda (3º→mí): lateral → pecho → 'third_self'
-  // · Ellos/as nos ayudan (ellos→nosotros): semicírculo lateral → pecho/grupo
-  //   → 'third_group_self'
+  // AYUDA — formas direccionales (calibración 2026-07-25):
+  // · Ayuda (cita): empujón hacia adelante → 'neutral'
+  // · Ayúdame: hacia el pecho → 'self' (toma al revés)
+  // · Ayúdanos: circular o barrido → 'group_self'
+  // · Yo te ayudo: IGUAL que ayuda + señalar antes → hoy 'neutral';
+  //   el índice/deixis va en Fase 3 (no redirigir a 'listener')
+  // · Ayúdalo/la: punto lateral → 'third' (lado fijo hasta Fase 3)
+  // · Ayúdalos/las: semicírculo lateral → 'group_third'
+  // · Yo los/las ayudo: abanico desde pecho → 'fan_out'
+  // · Él/Ella me ayuda: lateral → pecho → 'third_self'
+  // · Ellos/as nos ayudan: barrido lateral → pecho → 'third_group_self'
   AYUDA: {
     citationToken: 'AYUDA',
     forms: {
@@ -51,9 +51,9 @@ export const DIRECTIONAL_VERBS = {
       AYUDAR: 'neutral', // por si alguien escribe el infinitivo
       // Tú → mí
       AYUDAME: 'self',
-      // Yo → tú
-      TE_AYUDO: 'listener',
-      YO_TE_AYUDO: 'listener',
+      // Yo → tú: misma seña que AYUDA; señalar previo = Fase 3
+      TE_AYUDO: 'neutral',
+      YO_TE_AYUDO: 'neutral',
       // Tú → un tercero
       AYUDALO: 'third',
       AYUDALA: 'third',

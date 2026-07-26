@@ -11,10 +11,13 @@ Restricción real (decisión 2026-07-21): /predict solo recibe landmarks de
 MANO (T×126), no pose/hombros. La profundidad se aproxima con el tamaño
 proyectado de la mano; lateral/vertical con x,y de la muñeca.
 
-IMPORTANTE — conjugación (2026-07-24+):
-En api.py la conjugación está OFF por defecto (SIGNARA_CONJUGATE=0).
-`self` = hacia el PECHO (muñeca baja en imagen y/o mano se achica al alejarse
-de la cámara), NO hacia la cara. Sin evidencia fuerte → 'neutral'.
+Calibración AYUDA (2026-07-26):
+  · AYUDA     = empujón adelante (mano crece) → 'listener' / 'neutral'
+  · AYUDAME   = hacia el PECHO (mano baja y/o se achica) → 'self'  [PRIORIDAD]
+  · AYUDANOS  = circular / barrido lateral claro → 'group_self'
+  · TE_AYUDO  = Fase 3 (señalar + misma seña)
+
+Sin evidencia fuerte → 'neutral'. Mejor AYUDA que inventar otras formas.
 """
 
 from __future__ import annotations
@@ -26,22 +29,21 @@ N_HAND_LANDMARKS = 21
 
 EDGE_WINDOW = 4
 
-# Umbrales conservadores: mejor decir AYUDA que inventar AYUDANOS/AYUDAME.
-MIN_NET_MOVEMENT = 0.055
-FORWARD_SPREAD_GROWTH = 0.32   # empuje claro hacia la cámara (TE_AYUDO)
-SELF_SPREAD_SHRINK = 0.22      # mano se achica → hacia el cuerpo/pecho
-LATERAL_X_THRESHOLD = 0.12     # desplazamiento lateral neto (AYUDALO)
+MIN_NET_MOVEMENT = 0.045
+# Empujón claro hacia la cámara = cita AYUDA.
+FORWARD_SPREAD_GROWTH = 0.30
+# Hacia el pecho: achicar la mano (aleja de cámara) — señal principal de AYUDAME.
+SELF_SPREAD_SHRINK = 0.14
 # En coords de imagen, Y crece hacia ABAJO → pecho = muñeca baja (net[1] > 0).
-SELF_DOWN_THRESHOLD = 0.09
-SWEEP_MIN_RANGE = 0.30         # barrido ancho (AYUDANOS)
-SWEEP_MIN_REVERSALS = 2        # ida y vuelta real, no un tembleque
-SWEEP_DOMINANCE = 1.15         # rango X debe dominar al |net| vertical
-# Semicírculo en UNA zona lateral (AYUDALOS): rango X alto, poco reversal.
-GROUP_THIRD_MIN_RANGE = 0.22
+SELF_DOWN_THRESHOLD = 0.06
+LATERAL_X_THRESHOLD = 0.14
+SWEEP_MIN_RANGE = 0.32
+SWEEP_MIN_REVERSALS = 2
+SWEEP_DOMINANCE = 1.25
+CIRCULAR_MIN_XY_RANGE = 0.24
+CIRCULAR_MIN_PATH_RATIO = 2.8
+GROUP_THIRD_MIN_RANGE = 0.24
 GROUP_THIRD_MAX_REVERSALS = 1
-# third_self: lateral claro en la 1ª mitad + baja hacia pecho en la 2ª.
-THIRD_SELF_LATERAL = 0.10
-THIRD_SELF_DOWN = 0.07
 
 
 def _hand_block(frames_compact: np.ndarray, side: str) -> np.ndarray:
@@ -81,14 +83,14 @@ def _pick_active_hand(frames_compact: np.ndarray) -> tuple[str, np.ndarray] | No
     return side, hand[present]
 
 
-def classify_direction(frames_compact: np.ndarray) -> dict:
+def classify_direction(frames_compact: np.ndarray, verb: str | None = None) -> dict:
     """frames_compact: (T, 126) crudo (sin normalizar), tal como llega a /predict.
 
-    Devuelve {"direction": str, "debug": {...}}. "direction" es uno de
-    'neutral' | 'self' | 'listener' | 'third' | 'group_self' | 'group_third'
-    | 'third_self' | 'fan_out' | …
-    Por defecto 'neutral' si no hay señal clara.
+    Devuelve {"direction": str, "debug": {...}}.
+    Prioridad para AYUDA: self (AYUDAME) > group_self (AYUDANOS) > listener/neutral (AYUDA).
+    Para TE_AMO: umbrales más altos — ILY estático no debe inventar ME_AMAS.
     """
+    verb = (verb or "").upper()
     picked = _pick_active_hand(frames_compact)
     if picked is None:
         return {"direction": "neutral", "debug": {"reason": "no_hand"}}
@@ -96,7 +98,7 @@ def classify_direction(frames_compact: np.ndarray) -> dict:
     side, hand = picked
     n = len(hand)
     if n < EDGE_WINDOW * 2:
-        return {"direction": "neutral", "debug": {"reason": "too_short", "side": side}}
+        return {"direction": "neutral", "debug": { "reason": "too_short", "side": side}}
 
     wrist = hand[:, WRIST, :2]  # (n, 2) x,y
     start = wrist[:EDGE_WINDOW].mean(axis=0)
@@ -111,31 +113,95 @@ def classify_direction(frames_compact: np.ndarray) -> dict:
     spread_shrink = (spread_start - spread_end) / max(spread_start, 1e-4)
 
     xs = wrist[:, 0]
+    ys = wrist[:, 1]
     x_range = float(xs.max() - xs.min())
+    y_range = float(ys.max() - ys.min())
+    xy_range = float(np.hypot(x_range, y_range))
     dx = np.diff(xs)
     dx = dx[np.abs(dx) > 1e-4]
     reversals = int(np.sum(np.diff(np.sign(dx)) != 0)) if len(dx) > 1 else 0
 
-    # Mitades para third_self (lateral → pecho).
-    mid = n // 2
-    if mid >= EDGE_WINDOW:
-        first_net = wrist[mid - EDGE_WINDOW:mid].mean(axis=0) - start
-        second_net = end - wrist[mid:mid + EDGE_WINDOW].mean(axis=0)
-    else:
-        first_net = net
-        second_net = net
+    path_len = float(np.sum(np.linalg.norm(np.diff(wrist, axis=0), axis=1))) if n > 1 else 0.0
+    path_ratio = path_len / max(net_mag, 1e-4)
 
     debug = {
         "side": side,
+        "verb": verb or None,
         "net": net.tolist(),
         "net_mag": net_mag,
         "spread_growth": spread_growth,
         "spread_shrink": spread_shrink,
         "x_range": x_range,
+        "y_range": y_range,
+        "xy_range": xy_range,
+        "path_ratio": path_ratio,
         "reversals": reversals,
     }
 
-    # AYUDANOS: barrido lateral amplio con ida-y-vuelta (no tembleque de AYUDA).
+    # ── TE_AMO: ILY quieto → TE_AMO; ME_AMAS si hay gesto claro al pecho ──
+    if verb == "TE_AMO":
+        # Cita estática: poco movimiento y sin achicar → no inventar conjugación.
+        static_ily = net_mag < 0.035 and spread_shrink < 0.10 and y_range < 0.06
+        if static_ily:
+            return {"direction": "listener", "debug": {**debug, "reason": "te_amo_static"}}
+
+        # ME_AMAS: hacia el pecho (achicar y/o bajar). Un poco más estricto que AYUDA.
+        te_shrink = 0.15
+        te_down = 0.07
+        down = float(net[1]) >= te_down
+        down_dom = abs(float(net[1])) >= abs(float(net[0])) * 0.75
+        shrink = spread_shrink >= te_shrink
+        not_forward = spread_growth < FORWARD_SPREAD_GROWTH * 0.85
+        if not_forward and (
+            (shrink and (down or float(net[1]) >= 0.04))
+            or (down and down_dom and net_mag >= 0.05)
+            or (shrink and spread_shrink >= 0.18)
+        ):
+            return {"direction": "self", "debug": {**debug, "reason": "te_amo_chest"}}
+
+        # NOS_AMAMOS: barrido/círculo claro
+        if (
+            x_range >= SWEEP_MIN_RANGE
+            and reversals >= SWEEP_MIN_REVERSALS
+            and x_range >= abs(float(net[1])) * SWEEP_DOMINANCE
+        ):
+            return {"direction": "group_self", "debug": {**debug, "reason": "te_amo_sweep"}}
+        if (
+            xy_range >= CIRCULAR_MIN_XY_RANGE
+            and path_ratio >= CIRCULAR_MIN_PATH_RATIO
+            and x_range >= CIRCULAR_MIN_XY_RANGE * 0.6
+        ):
+            return {"direction": "group_self", "debug": {**debug, "reason": "te_amo_circular"}}
+
+        # LO_AMO: lateral marcado
+        if abs(float(net[0])) >= 0.16 and abs(float(net[0])) >= abs(float(net[1])) * 1.1:
+            return {"direction": "third", "debug": {**debug, "reason": "te_amo_third"}}
+
+        # ME_AMA: lateral + hacia pecho
+        if abs(float(net[0])) >= 0.12 and shrink and float(net[1]) >= 0.05:
+            return {"direction": "third_self", "debug": {**debug, "reason": "te_amo_third_self"}}
+
+        if spread_growth >= FORWARD_SPREAD_GROWTH * 0.7:
+            return {"direction": "listener", "debug": {**debug, "reason": "te_amo_forward"}}
+        return {"direction": "listener", "debug": {**debug, "reason": "te_amo_default"}}
+
+    # ── 1) AYUDAME (pecho) ANTES que adelante ───────────────────────────────
+    # Hacia el cuerpo: la mano se aleja de la cámara (se achica) y/o la muñeca
+    # baja en imagen. No exigir ambas; el shrink solo ya es fuerte en profundidad.
+    down = float(net[1]) >= SELF_DOWN_THRESHOLD
+    down_dom = abs(float(net[1])) >= abs(float(net[0])) * 0.85
+    shrink = spread_shrink >= SELF_SPREAD_SHRINK
+    # No es empujón claro hacia cámara
+    not_forward = spread_growth < FORWARD_SPREAD_GROWTH * 0.85
+
+    if not_forward and (
+        shrink
+        or (down and down_dom)
+        or (shrink and float(net[1]) >= SELF_DOWN_THRESHOLD * 0.35)
+    ):
+        return {"direction": "self", "debug": {**debug, "reason": "toward_chest"}}
+
+    # ── 2) AYUDANOS: barrido / círculo (umbrales altos, evitar tembleque) ───
     if (
         x_range >= SWEEP_MIN_RANGE
         and reversals >= SWEEP_MIN_REVERSALS
@@ -143,50 +209,24 @@ def classify_direction(frames_compact: np.ndarray) -> dict:
     ):
         return {"direction": "group_self", "debug": {**debug, "reason": "sweep"}}
 
-    # AYUDALOS: arco lateral amplio sin ida-y-vuelta (una zona).
     if (
-        x_range >= GROUP_THIRD_MIN_RANGE
-        and reversals <= GROUP_THIRD_MAX_REVERSALS
-        and abs(float(net[0])) >= LATERAL_X_THRESHOLD
-        and abs(float(net[0])) >= abs(float(net[1])) * 0.9
+        xy_range >= CIRCULAR_MIN_XY_RANGE
+        and path_ratio >= CIRCULAR_MIN_PATH_RATIO
+        and x_range >= CIRCULAR_MIN_XY_RANGE * 0.6
+        and not shrink
     ):
-        return {"direction": "group_third", "debug": {**debug, "reason": "lateral_arc"}}
+        return {"direction": "group_self", "debug": {**debug, "reason": "circular"}}
 
-    # TE_AYUDO: la mano crece claramente (se acerca a la cámara).
-    if spread_growth >= FORWARD_SPREAD_GROWTH:
-        return {"direction": "listener", "debug": {**debug, "reason": "forward"}}
+    # ── 3) AYUDA (cita): empujón hacia la cámara ───────────────────────────
+    if spread_growth >= FORWARD_SPREAD_GROWTH and not shrink:
+        return {"direction": "listener", "debug": {**debug, "reason": "forward_citation"}}
 
-    # Él me ayuda: lateral en la 1ª mitad + baja al pecho en la 2ª.
-    if (
-        mid >= EDGE_WINDOW
-        and abs(float(first_net[0])) >= THIRD_SELF_LATERAL
-        and abs(float(first_net[0])) >= abs(float(first_net[1]))
-        and float(second_net[1]) >= THIRD_SELF_DOWN
-    ):
-        return {"direction": "third_self", "debug": {**debug, "reason": "lateral_then_chest"}}
-
-    if net_mag < MIN_NET_MOVEMENT and spread_shrink < SELF_SPREAD_SHRINK:
+    if net_mag < MIN_NET_MOVEMENT and not shrink:
         return {"direction": "neutral", "debug": {**debug, "reason": "little_motion"}}
 
-    # AYUDALO: desplazamiento horizontal neto dominante (sin arco group_third).
+    # Lateral / otras formas: NO inventar AYUDALO etc. → neutral (→ AYUDA).
+    # (Fase 3 / más calibración si se reactivan.)
     if abs(float(net[0])) >= LATERAL_X_THRESHOLD and abs(float(net[0])) >= abs(float(net[1])):
-        return {"direction": "third", "debug": {**debug, "reason": "lateral"}}
+        return {"direction": "neutral", "debug": {**debug, "reason": "lateral_as_neutral"}}
 
-    # AYUDAME / me amas: hacia el PECHO — muñeca baja (Y imagen ↑) y/o spread↓.
-    toward_chest = (
-        float(net[1]) >= SELF_DOWN_THRESHOLD
-        and abs(float(net[1])) >= abs(float(net[0])) * 0.85
-    ) or spread_shrink >= SELF_SPREAD_SHRINK
-    if toward_chest:
-        return {"direction": "self", "debug": {**debug, "reason": "toward_chest"}}
-
-    # Abanico desde pecho hacia afuera (yo los ayudo): baja→sube o abre X + crece.
-    if (
-        float(net[1]) <= -SELF_DOWN_THRESHOLD * 0.7
-        and x_range >= GROUP_THIRD_MIN_RANGE * 0.85
-        and spread_growth >= FORWARD_SPREAD_GROWTH * 0.45
-    ):
-        return {"direction": "fan_out", "debug": {**debug, "reason": "fan_out"}}
-
-    # Sin evidencia fuerte → glosa citación (neutral). Nunca inventar conjugación.
     return {"direction": "neutral", "debug": {**debug, "reason": "default_neutral"}}

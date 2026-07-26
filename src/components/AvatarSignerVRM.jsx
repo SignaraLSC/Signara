@@ -22,10 +22,12 @@ import { setIdlePose } from '../utils/vrmIdlePose.js'
 import { createBaker } from '../utils/vrmBaker.js'
 import { playSolverAnim } from '../utils/vrmPlayer.js'
 import { parsePlayToken } from '../utils/directionalVerbs.js'
+import { isLetterToken } from '../utils/fingerspell.js'
 
 const AVATAR_URL = '/avatar/signara-avatar.vrm'
 // Subir esto invalida el cache en memoria tras cambios del baker (SED/cuello, etc.).
-const BAKE_CACHE_VER = 74 // TE_AMO self: un poco más afuera
+const BAKE_CACHE_VER = 77 // deletreo: un solo clip continuo (sin idle entre letras)
+const SPELL_BLEND_MS = 260
 /** @type {Record<string, unknown>} */
 const sharedBakeCache = {}
 /** @type {Record<string, unknown>} */
@@ -36,6 +38,10 @@ const PREFETCH_TOKENS = [
   'HOLA', 'SI', 'NO', 'GRACIAS', 'POR_FAVOR', 'TENGO_SED', 'BIEN', 'MAL',
   'COMO_ESTAS', 'DE_NADA', 'ADIOS', 'SCOOBA', 'TE_AMO',
 ]
+
+function tokenIsLetter(token) {
+  return isLetterToken(parsePlayToken(token).citationToken)
+}
 
 const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, onFinish }, ref) {
   const canvasRef = useRef(null)
@@ -53,7 +59,7 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
   // /sign/AYUDAR y comparten caché de dataset; solo el HORNEADO difiere.
   const fetchDataset = useCallback(async (citationToken) => {
     if (sharedDatasetCache[citationToken]) return sharedDatasetCache[citationToken]
-    const res = await fetch(`${apiUrl}/sign/${citationToken}`)
+    const res = await fetch(`${apiUrl}/sign/${encodeURIComponent(citationToken)}`)
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const data = await res.json()
     sharedDatasetCache[citationToken] = data
@@ -191,25 +197,73 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
     return () => { cancelled = true }
   }, [avatarReady, fetchDataset])
 
+  const bakeCached = useCallback(async (token, chain) => {
+    const { citationToken, direction } = parsePlayToken(token)
+    const key = `${BAKE_CACHE_VER}:${token}:${chain}`
+    if (sharedBakeCache[key]) return sharedBakeCache[key]
+    const dataset = await fetchDataset(citationToken)
+    const keyframes = bakerRef.current.bakeSolver(dataset, { direction, chain })
+    sharedBakeCache[key] = keyframes
+    return keyframes
+  }, [fetchDataset])
+
+  /**
+   * Deletreo: consume TODA la corrida de letras y la reproduce como UN solo
+   * clip — sube desde idle una vez, morph entre letras (manos arriba), baja
+   * al idle solo al final. Así no se ve el “robot” de bajar/subir entre letras.
+   */
+  const bakeSpellRun = useCallback(async (run) => {
+    if (run.length === 1) return bakeCached(run[0], 'solo')
+
+    const stitched = []
+    // 1ª letra: entrada desde idle + cuerpo (sin bajar)
+    stitched.push(...(await bakeCached(run[0], 'start')))
+
+    for (let i = 1; i < run.length; i++) {
+      const isLast = i === run.length - 1
+      if (isLast) {
+        // Última: morph → cuerpo → salida a idle
+        stitched.push(...(await bakeCached(run[i], 'end')))
+      } else {
+        // Intermedias: morph → cuerpo (manos siguen arriba)
+        const hold = await bakeCached(run[i], 'hold')
+        if (hold.length) {
+          stitched.push({ duration: SPELL_BLEND_MS, pose: { ...hold[0].pose } })
+          if (hold.length > 1) stitched.push(...hold.slice(1))
+        }
+      }
+    }
+    return stitched
+  }, [bakeCached])
+
   const processQueue = useCallback(async () => {
     if (playingRef.current) return
-    if (queueRef.current.length === 0) { onFinish?.(); return }
+    if (queueRef.current.length === 0) {
+      onFinish?.()
+      return
+    }
     if (!vrmRef.current || !bakerRef.current) return
     playingRef.current = true
+
     const token = queueRef.current.shift() // ej. 'AYUDAR' o 'AYUDAR::self'
-    onSign?.(token)
+
     try {
-      // El horneado SÍ depende de la dirección (misma grabación, distinto
-      // resultado) — la caché de bake usa el token COMPUESTO completo.
-      const { citationToken, direction } = parsePlayToken(token)
-      const key = `${BAKE_CACHE_VER}:${token}`
-      let keyframes = sharedBakeCache[key]
-      if (!keyframes) {
-        const dataset = await fetchDataset(citationToken)
-        keyframes = bakerRef.current.bakeSolver(dataset, { direction })
-        sharedBakeCache[key] = keyframes
+      let keyframes
+      if (tokenIsLetter(token)) {
+        // Consumir corrida completa de letras (B,E,B,E → un clip).
+        const run = [token]
+        while (queueRef.current.length && tokenIsLetter(queueRef.current[0])) {
+          run.push(queueRef.current.shift())
+        }
+        onSign?.(run.length > 1 ? run.join('-') : token)
+        keyframes = await bakeSpellRun(run)
+        setIdlePose(vrmRef.current) // solo al empezar el nombre
+      } else {
+        onSign?.(token)
+        keyframes = await bakeCached(token, 'solo')
+        setIdlePose(vrmRef.current)
       }
-      setIdlePose(vrmRef.current)
+
       cancelPlayRef.current = playSolverAnim(vrmRef.current, keyframes, () => {
         playingRef.current = false
         processQueue()
@@ -219,14 +273,20 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
       playingRef.current = false
       processQueue()
     }
-  }, [fetchDataset, onSign, onFinish])
+  }, [bakeCached, bakeSpellRun, onSign, onFinish])
 
   useEffect(() => {
     if (avatarReady && queueRef.current.length && !playingRef.current) processQueue()
   }, [avatarReady, processQueue])
 
   useImperativeHandle(ref, () => ({
-    queue(token) { if (!token) return; queueRef.current.push(token); processQueue() },
+    // Microtask: si encolan varias letras seguidas (deletreo), se acumulan
+    // en la cola ANTES de processQueue — así se cosen en un solo clip.
+    queue(token) {
+      if (!token) return
+      queueRef.current.push(token)
+      queueMicrotask(() => { if (!playingRef.current) processQueue() })
+    },
     replace(tokens) {
       if (cancelPlayRef.current) cancelPlayRef.current()
       playingRef.current = false

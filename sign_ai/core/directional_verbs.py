@@ -13,17 +13,14 @@ agreement)" (Fase 2 / 2B / 3).
 
 DIRECTIONAL_VERBS: dict[str, dict[str, str]] = {
     "AYUDA": {
+        # Solo 3 formas en cámara (2026-07-26): resto → AYUDA (sin inventar).
+        #   adelante / neutro → AYUDA
+        #   pecho (self)     → AYUDAME
+        #   barrido/círculo  → AYUDANOS
         "neutral": "AYUDA",
+        "listener": "AYUDA",
         "self": "AYUDAME",
-        "listener": "TE_AYUDO",
-        # 'third' es un lado fijo, no la persona gramaticalmente correcta
-        # (necesita Fase 3) — mismo trade-off que el lado avatar.
-        "third": "AYUDALO",
         "group_self": "AYUDANOS",
-        "group_third": "AYUDALOS",
-        "third_self": "ME_AYUDA",
-        "third_group_self": "NOS_AYUDAN",
-        "fan_out": "LOS_AYUDO",
     },
     "PERDON": {
         "neutral": "PERDON",
@@ -35,7 +32,8 @@ DIRECTIONAL_VERBS: dict[str, dict[str, str]] = {
         "group_self": "PERDONANOS",
     },
     "TE_AMO": {
-        # Cita / proyección al oyente; seña casi estática → suele quedar aquí.
+        # Cita ILY estática → TE_AMO. Otras formas solo con movimiento claro
+        # (ver classify_direction(..., verb="TE_AMO")).
         "neutral": "TE_AMO",
         "listener": "TE_AMO",
         "self": "ME_AMAS",

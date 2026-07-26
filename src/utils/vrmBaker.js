@@ -163,7 +163,17 @@ export function createBaker(vrm) {
     return S.clone().addScaledVector(n, a).addScaledVector(perp, h)
   }
 
-  function bakeSolver(rawDataset, { direction = 'neutral' } = {}) {
+  /**
+   * @param {object} rawDataset
+   * @param {{ direction?: string, chain?: 'solo'|'start'|'middle'|'end'|'hold' }} [opts]
+   * chain: deletreo — omitir entrada/salida a reposo entre letras seguidas.
+   *   solo   = comportamiento normal (entry + seña + exit)
+   *   start  = entry + seña (sin exit)
+   *   middle = blend→seña (sin entry/exit a idle)
+   *   end    = blend→seña + exit
+   *   hold   = solo cuerpo de la seña (para coser un deletreo continuo)
+   */
+  function bakeSolver(rawDataset, { direction = 'neutral', chain = 'solo' } = {}) {
     // Recorta preparación al inicio Y bajada de vuelta al reposo al final,
     // si quedaron grabadas por error (ambas se sintetizan solas más abajo).
     // IMPORTANTE: trim* a veces devuelve el MISMO objeto (si no recorta).
@@ -1331,21 +1341,42 @@ export function createBaker(vrm) {
     const transSteps = TRANS_STEPS - 1
     const entryStepMs = LEAD_IN_MS / TRANS_STEPS
     const exitStepMs = 480 / TRANS_STEPS
-    const entryKfs = transition(
-      entrySides, restFingers, fingersOf(first), transSteps, entryStepMs,
-      NEUTRAL, first.head, NEUTRAL_EXPR, first.expr, NEUTRAL, first.neck,
-      NEUTRAL, first.spine || NEUTRAL, NEUTRAL, first.chest || NEUTRAL,
-    )
-    // Empalme exacto con frame 0: mismo pose y duración del primer frame de la
-    // seña, sin duplicar keyframe (evita micro-pausa por tramo de delta cero).
-    entryKfs.push({ duration: dur, pose: { ...first } })
-    const signKfsBody = poses.length > 1 ? poses.slice(1).map((p) => ({ duration: dur, pose: p })) : []
-    const exitKfs = transition(
-      exitSides, fingersOf(last), restFingers, transSteps, exitStepMs,
-      last.head, NEUTRAL, last.expr, NEUTRAL_EXPR, last.neck, NEUTRAL,
-      last.spine || NEUTRAL, NEUTRAL, last.chest || NEUTRAL, NEUTRAL,
-    )
-    exitKfs.push({ duration: exitStepMs, pose: buildExactRestPose(activeSides) })
+    const wantEntry = chain === 'solo' || chain === 'start'
+    const wantExit = chain === 'solo' || chain === 'end'
+    // Deletreo: nunca bajar a idle entre letras. 'hold' = solo el gesto.
+    const CHAIN_BLEND_MS = 260
+    const spelling = chain === 'start' || chain === 'middle' || chain === 'end' || chain === 'hold'
+    const spellDur = spelling ? dur * 0.7 : dur
+
+    let entryKfs = []
+    if (wantEntry) {
+      entryKfs = transition(
+        entrySides, restFingers, fingersOf(first), transSteps, entryStepMs,
+        NEUTRAL, first.head, NEUTRAL_EXPR, first.expr, NEUTRAL, first.neck,
+        NEUTRAL, first.spine || NEUTRAL, NEUTRAL, first.chest || NEUTRAL,
+      )
+      // Empalme exacto con frame 0: mismo pose y duración del primer frame de la
+      // seña, sin duplicar keyframe (evita micro-pausa por tramo de delta cero).
+      entryKfs.push({ duration: spellDur, pose: { ...first } })
+    } else if (chain === 'hold') {
+      // Solo cuerpo — el cosido del deletreo añade el morph entre letras.
+      entryKfs = [{ duration: spellDur, pose: { ...first } }]
+    } else {
+      // middle/end sueltos: morph desde pose actual del player → esta letra.
+      entryKfs = [{ duration: CHAIN_BLEND_MS, pose: { ...first } }]
+    }
+    const signKfsBody = poses.length > 1
+      ? poses.slice(1).map((p) => ({ duration: spellDur, pose: p }))
+      : []
+    let exitKfs = []
+    if (wantExit) {
+      exitKfs = transition(
+        exitSides, fingersOf(last), restFingers, transSteps, exitStepMs,
+        last.head, NEUTRAL, last.expr, NEUTRAL_EXPR, last.neck, NEUTRAL,
+        last.spine || NEUTRAL, NEUTRAL, last.chest || NEUTRAL, NEUTRAL,
+      )
+      exitKfs.push({ duration: exitStepMs, pose: buildExactRestPose(activeSides) })
+    }
     const all = [...entryKfs, ...signKfsBody, ...exitKfs]
 
     // Blindaje: brazos que NO participan en la seña quedan congelados en reposo

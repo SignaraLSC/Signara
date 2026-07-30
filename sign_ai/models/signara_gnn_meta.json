@@ -1,6 +1,6 @@
 {
   "normalize_inputs": true,
-  "best_val_acc": 97.47,
+  "best_val_acc": 98.11,
   "classes": [
     "A",
     "ADIOS",
@@ -21,14 +21,31 @@
     "I",
     "IDLE",
     "J",
+    "K",
+    "L",
+    "M",
     "MAL",
+    "N",
     "NO",
+    "O",
     "OJOS",
+    "P",
     "PERDON",
     "POR_FAVOR",
+    "Q",
+    "R",
+    "S",
     "SCOOBA",
     "SI",
+    "T",
     "TENGO_SED",
-    "TE_AMO"
+    "TE_AMO",
+    "U",
+    "V",
+    "W",
+    "X",
+    "Y",
+    "Z",
+    "Ñ"
   ]
 }

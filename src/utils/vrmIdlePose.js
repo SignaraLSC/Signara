@@ -36,6 +36,10 @@ function restFingerPose(side) {
     out[`${side}${f}Intermediate`] = { x: 0, y: 0, z: g * REST_CURL }
     out[`${side}${f}Distal`] = { x: 0, y: 0, z: g * REST_CURL * 0.6 }
   }
+  out[`${side}ThumbMetacarpal`] = { x: 0, y: 0, z: 0 }
+  out[`${side}ThumbProximal`] = { x: 0, y: 0, z: 0 }
+  out[`${side}ThumbIntermediate`] = { x: 0, y: 0, z: 0 }
+  out[`${side}ThumbDistal`] = { x: 0, y: 0, z: 0 }
   return out
 }
 

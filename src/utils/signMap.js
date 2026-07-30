@@ -75,7 +75,9 @@ export function setCurrentAvatar(id) {
 export function normalizeSign(word) {
   return deduplicateChars(String(word))
     .normalize('NFD')
+    .replace(/n\u0303/gi, '\u0001') // preservar ñ/Ñ
     .replace(/[̀-ͯ]/g, '')
+    .replace(/\u0001/g, 'Ñ')
     .toUpperCase()
     .replace(/\s+/g, '_')
     .trim()

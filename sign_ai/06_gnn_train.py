@@ -48,10 +48,20 @@ def load_raw_csvs():
         raise FileNotFoundError("No se encontraron archivos *_raw.csv en data/")
     dfs = []
     for a in archivos:
-        df = pd.read_csv(a)
+        # label como str: evita int/str mezclados (p.ej. filas "1"/"2" en maria).
+        df = pd.read_csv(a, dtype={"label": str}, low_memory=False)
         print(f"  📂 {a}: {len(df)} filas")
         dfs.append(df)
-    return pd.concat(dfs, ignore_index=True)
+    out = pd.concat(dfs, ignore_index=True)
+    out["label"] = out["label"].astype(str).str.strip()
+    # Descartar etiquetas numéricas basura (errores de captura: 1,2,3…).
+    bad = out["label"].str.fullmatch(r"\d+")
+    n_bad = int(bad.sum()) if bad.any() else 0
+    if n_bad:
+        labs = sorted(out.loc[bad, "label"].unique())
+        print(f"  ⚠  Descartando {n_bad} filas con label numérico: {labs}")
+        out = out.loc[~bad].reset_index(drop=True)
+    return out
 
 
 def df_to_tensor(df_sample):

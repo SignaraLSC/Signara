@@ -24,6 +24,9 @@ sign_ai/models/signara_lstm.keras
 sign_ai/models/labels.json
 sign_ai/data/
 
+# Captura con mando Xbox (solo local; no subir a GitHub)
+sign_ai/00_capture_xbox.py
+
 # =========================
 # SISTEMA / OS
 # =========================

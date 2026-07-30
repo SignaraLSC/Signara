@@ -305,6 +305,7 @@ export default function InterpretScreen({ onBack, onHome }) {
   const announcedUpRef    = useRef('')   // ya anunciada con manos arriba (evita doble voz)
   const spellBufRef       = useRef([])   // letras acumuladas (deletreo → nombre)
   const spellTimerRef     = useRef(null)
+  const letterRepeatTimerRef = useRef(null) // libera L+L tras el brinco
   const lastLiveAtRef     = useRef(0)    // len del buffer en la última predicción live
   const apiInFlightRef    = useRef(false)
   const mlAvailableRef    = useRef(false)
@@ -717,6 +718,10 @@ export default function InterpretScreen({ onBack, onHome }) {
       clearTimeout(spellTimerRef.current)
       spellTimerRef.current = null
     }
+    if (letterRepeatTimerRef.current) {
+      clearTimeout(letterRepeatTimerRef.current)
+      letterRepeatTimerRef.current = null
+    }
     spellBufRef.current = []
     if (handBadgeRef.current) handBadgeRef.current.style.display = 'none'
     setHandVisible(false)
@@ -754,6 +759,13 @@ export default function InterpretScreen({ onBack, onHome }) {
       })
       if (spellTimerRef.current) clearTimeout(spellTimerRef.current)
       spellTimerRef.current = setTimeout(() => flushSpellBuffer(), SPELL_FLUSH_MS)
+      // LL / RR: tras el cooldown, liberar la misma letra para el brinco
+      // (sin vaciar lastSign al instante → evitar LLLLL al sostener).
+      if (letterRepeatTimerRef.current) clearTimeout(letterRepeatTimerRef.current)
+      const letter = String(prediction).toUpperCase()
+      letterRepeatTimerRef.current = setTimeout(() => {
+        if (lastSignRef.current === letter) lastSignRef.current = ''
+      }, 420)
       return
     }
 

@@ -16,7 +16,8 @@ export function isLetterToken(token) {
 
 /**
  * Normaliza una palabra a letras mayúsculas deletreables.
- * á→A, ñ→Ñ. Devuelve [] si no es deletreable (dígitos, símbolos, < 2 letras).
+ * á→A, ñ→Ñ. "ll" / "LL" → dos L (en LSC se deletrea con brinco L+L).
+ * Devuelve [] si no es deletreable (dígitos, símbolos, < 2 letras).
  */
 export function wordToLetters(word) {
   const raw = String(word || '')
@@ -28,6 +29,8 @@ export function wordToLetters(word) {
     .toUpperCase()
     .replace(/[^A-ZÑ]/g, '')
   if (raw.length < 2) return []
+  // LL ya son dos caracteres 'L'+'L' tras toUpperCase — el avatar marca
+  // el brinco entre letras iguales en AvatarSignerVRM.bakeSpellRun.
   return raw.split('')
 }
 

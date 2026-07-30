@@ -167,13 +167,29 @@ const TextInputPanel = forwardRef(function TextInputPanel(
       const t = setTimeout(() => { setInputMode('voice'); start() }, 350)
       return () => clearTimeout(t)
     }
-    if (initialMode === 'text' && inputRef.current) inputRef.current.focus()
+    // En móvil no autofocus: abre el teclado y tapa el avatar.
+    if (initialMode === 'text' && inputRef.current) {
+      const coarse = typeof window !== 'undefined'
+        && window.matchMedia('(pointer: coarse)').matches
+      if (!coarse) inputRef.current.focus()
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialMode, supported])
 
   useEffect(() => {
     if (listening) setInputMode('voice')
   }, [listening])
+
+  function revealAvatar() {
+    try { inputRef.current?.blur() } catch (_) { /* ignore */ }
+    if (typeof document === 'undefined') return
+    requestAnimationFrame(() => {
+      document.querySelector('.ta-avatar')?.scrollIntoView({
+        behavior: 'smooth',
+        block: 'nearest',
+      })
+    })
+  }
 
   function submit(e) {
     if (e?.preventDefault) e.preventDefault()
@@ -182,7 +198,8 @@ const TextInputPanel = forwardRef(function TextInputPanel(
     if (listening) stopMicAndNotify()
     if (onSubmit) onSubmit(text, { fromVoice: false })
     clearBar()
-    setTimeout(() => inputRef.current?.focus(), 50)
+    // Cerrar teclado en móvil para que el avatar no quede tapado.
+    revealAvatar()
   }
 
   function pickTextMode() {
@@ -203,7 +220,8 @@ const TextInputPanel = forwardRef(function TextInputPanel(
     setInputMode('text')
     if (onSubmit) onSubmit(text, { fromVoice: false })
     clearBar()
-    setTimeout(() => inputRef.current?.focus(), 50)
+    // En móvil el foco abría el teclado y tapaba el avatar.
+    revealAvatar()
   }
 
   return (

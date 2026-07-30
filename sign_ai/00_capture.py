@@ -169,6 +169,11 @@ def normalize_label(raw):
     """Nombre de seña sin acentos, MAYÚSCULAS y con espacios→'_'
     (así 'por favor' → 'POR_FAVOR', que es como lo empareja el frontend).
 
+    La Ñ se conserva como letra propia (no se aplana a N): 'ñ' / 'Ñ' → 'Ñ'.
+
+    Números: '1' / 'num 1' → 'NUM_1' (no dejar solo dígitos: pandas/train
+    los mezclan con str y se descartaban como basura).
+
     Variantes: si una palabra se puede hacer de varias formas GENUINAMENTE
     distintas (no solo estilo/velocidad de quien graba), usa un sufijo
     '_V<N>' al grabar: 'hola v1' -> HOLA_V1, 'hola v2' -> HOLA_V2. El modelo
@@ -177,9 +182,19 @@ def normalize_label(raw):
     usuario siempre es la palabra canónica (HOLA), nunca la variante.
     Si la variación es solo de estilo, NO uses sufijo: graba todas las tomas
     bajo el mismo label (así el modelo aprende esa variedad de forma natural)."""
-    s = unicodedata.normalize("NFD", raw).encode("ascii", "ignore").decode("ascii")
-    s = re.sub(r"[^A-Za-z0-9]+", "_", s.strip())
-    return s.upper().strip("_")
+    s = unicodedata.normalize("NFD", raw)
+    # Conservar ñ/Ñ antes de tirar marcas diacríticas (NFD: n + combining tilde).
+    s = s.replace("\u0303", "\u0001")  # tilde de ñ
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    s = s.replace("\u0001", "Ñ").replace("ñ", "Ñ").replace("nÑ", "Ñ").replace("NÑ", "Ñ")
+    s = re.sub(r"[^A-Za-z0-9Ññ]+", "_", s.strip())
+    s = s.upper().strip("_")
+    # Dígitos solos o "NUM_7" ya ok; "1" / "01" → NUM_1.
+    if re.fullmatch(r"\d+", s):
+        s = f"NUM_{int(s)}"
+    elif re.fullmatch(r"NUM_0*\d+", s):
+        s = f"NUM_{int(s.split('_', 1)[1])}"
+    return s
 
 
 def next_muestra_id(csv_path, label):
@@ -307,7 +322,10 @@ def draw_overlay(frame, results):
 
 def main():
     persona = input("Persona (quién graba, ej: alanis): ").strip().lower() or "anon"
-    label   = normalize_label(input("Nombre de la seña (ej: HOLA, POR FAVOR, IDLE): "))
+    label   = normalize_label(input("Nombre de la seña (ej: HOLA, 1→NUM_1, IDLE): "))
+    if not label:
+        print("⚠  Nombre vacío."); return
+    print(f"   → etiqueta guardada: {label}")
 
     csv_path = os.path.join(DATA_DIR, f"{persona}_raw.csv")
     muestra  = next_muestra_id(csv_path, label)

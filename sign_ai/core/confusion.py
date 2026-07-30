@@ -28,6 +28,8 @@ CONFUSION_PAIRS: set[frozenset[str]] = {
     frozenset({"MAL", "NECESITO_AYUDA"}),
     frozenset({"BIEN", "NECESITO_AYUDA"}),
     frozenset({"COMO_ESTAS", "GRACIAS"}),
+    # Órbita a dos manos: arranque parecido (círculo), forma/separación distinta.
+    frozenset({"COMO_ESTAS", "FAMILIA"}),
     # One-hand semi-estáticas: el GNN suele preferir NO sobre TE_AMO.
     frozenset({"TE_AMO", "NO"}),
     frozenset({"TE_AMO", "SI"}),

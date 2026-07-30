@@ -153,7 +153,13 @@ origin→destination in space. Signara splits this into phases:
 |-------|------|-----------|--------|
 | **2 (avatar)** | Conjugated Spanish text → redirect one citation take in 3D | `src/utils/directionalVerbs.js`, `vrmBaker.js` | Done for AYUDA, PERDON, TE_AMO |
 | **2B (camera)** | GNN returns citation gloss → geometric trajectory → conjugated word | `sign_ai/core/direction_reader.py`, `directional_verbs.py`, `api.py` | Partial; **OFF by default** |
-| **3** | Real third-person locus / room location memory | — | Not started (fixed side today) |
+| **3** | Deixis (point then sign) + real third-person locus / room memory | — | Not started (fixed side today) |
+
+**AYUDA geometry (camera + avatar, 2026-07-25):**
+- Forward push → citation `AYUDA` (not `TE_AYUDO`)
+- Toward chest → `AYUDAME`
+- Circular / lateral sweep → `AYUDANOS`
+- `TE_AYUDO` = same motion as `AYUDA` + point at listener first → **Phase 3**
 
 **Phase 2B:** `/predict` only gets hand landmarks `(T, 126)` (no shoulders).
 Depth is approximated from projected hand size. Keep conjugation off unless
@@ -165,11 +171,11 @@ set SIGNARA_CONJUGATE=1
 uvicorn api:app --port 8000 --reload
 ```
 
-Smoke checks in Interpretar: neutral AYUDA → `AYUDA`; toward chest → `AYUDAME`;
-clear lateral sweep → `AYUDANOS`; static TE_AMO (ILY) → `TE_AMO` (do not invent
-`ME_AMAS` without a clear chestward signal). Keep direction keys
-(`self` / `listener` / `third` / `group_self` / …) in sync between the JS and
-Python `DIRECTIONAL_VERBS` tables.
+Smoke checks in Interpretar: forward AYUDA → `AYUDA` (never invent `TE_AYUDO`);
+toward chest → `AYUDAME`; clear circular/sweep → `AYUDANOS`; static TE_AMO
+(ILY) → `TE_AMO` (do not invent `ME_AMAS` without a clear chestward signal).
+Keep direction keys (`self` / `listener` / `third` / `group_self` / …) in sync
+between the JS and Python `DIRECTIONAL_VERBS` tables.
 
 ### Words with multiple valid signs (variants)
 Some words have more than one genuinely different way of signing them (e.g. a

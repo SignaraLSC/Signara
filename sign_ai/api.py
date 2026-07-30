@@ -33,7 +33,7 @@ from core.gnn_model import GCN_LSTM, SEQ_LEN
 from core.confusion import evaluate_prediction
 from core.direction_reader import classify_direction
 from core.directional_verbs import DIRECTIONAL_VERBS, conjugate
-from core.handshape_hints import looks_like_ily
+from core.handshape_hints import looks_like_ily, resolve_como_familia
 from core.preprocess import sequence_compact_to_gnn
 
 # ─── Rutas ────────────────────────────────────────────────────────────────────
@@ -47,10 +47,10 @@ ANIM_DIR       = Path(__file__).parent / "animations"
 UMBRAL_CONFIANZA = float(os.getenv("SIGNARA_UMBRAL", "0.80"))
 MARGEN_TOP2      = float(os.getenv("SIGNARA_MARGEN_TOP2", "0.18"))
 
-# Fase 2B — conjugación geométrica (AYUDA→AYUDAME/…). OFF por defecto:
-# /predict solo tiene manos (sin hombros). Activar en local con
-# SIGNARA_CONJUGATE=1 tras calibrar (ver CLAUDE.md → Directional verbs).
-ENABLE_CONJUGATE = os.getenv("SIGNARA_CONJUGATE", "0").strip().lower() in (
+# Fase 2B — conjugación geométrica (AYUDA→AYUDAME/…). ON por defecto
+# tras calibración 2026-07 (adelante=AYUDA, pecho=AYUDAME, barrido=AYUDANOS).
+# Desactivar: SIGNARA_CONJUGATE=0
+ENABLE_CONJUGATE = os.getenv("SIGNARA_CONJUGATE", "1").strip().lower() in (
     "1", "true", "yes", "on",
 )
 
@@ -190,13 +190,68 @@ async def predict(req: PredictRequest):
         min_margin=MARGEN_TOP2,
     )
 
-    # TE_AMO (forma ILY) el GNN lo confunde mucho con NO/SI en cámara real.
+    # TE_AMO (forma ILY): el GNN lo confunde con NO/SI/IDLE (y a veces otras).
+    # Si la geometría dice ILY, forzar TE_AMO — la forma es lo bastante distintiva.
     ily = looks_like_ily(data)
-    if ily.get("ily") and "TE_AMO" in _labels:
-        te_p = float(probs[_labels.index("TE_AMO")])
-        if prediction in ("NO", "SI", None, "IDLE"):
-            prediction = "TE_AMO"
-            confidence = max(te_p, float(ily.get("score") or 0), UMBRAL_CONFIANZA)
+    if ily.get("ily") and "TE_AMO" in _labels and prediction != "TE_AMO":
+        te_idx = _labels.index("TE_AMO")
+        te_p = float(probs[te_idx])
+        ily_score = float(ily.get("score") or 0)
+        prediction = "TE_AMO"
+        confidence = max(te_p, ily_score, UMBRAL_CONFIANZA * 0.95)
+
+    # COMO_ESTAS ↔ FAMILIA: geo solo si el GNN ya apunta a ese par (o es top-2).
+    # No forzar con prediction=None genérico + prob residual (inventaba FAMILIA/COMO).
+    if "COMO_ESTAS" in _labels and "FAMILIA" in _labels:
+        como_i = _labels.index("COMO_ESTAS")
+        fam_i = _labels.index("FAMILIA")
+        como_p = float(probs[como_i])
+        fam_p = float(probs[fam_i])
+        order = np.argsort(probs)[::-1]
+        top2 = (
+            {_labels[int(order[0])], _labels[int(order[1])]}
+            if len(order) > 1
+            else {_labels[int(order[0])]}
+        )
+        pair = {"COMO_ESTAS", "FAMILIA"}
+        competing = (
+            prediction in ("COMO_ESTAS", "FAMILIA")
+            or (
+                prediction is None
+                and bool(top2 & pair)
+                and max(como_p, fam_p) >= 0.12
+            )
+        )
+        if competing:
+            geo = resolve_como_familia(data)
+            pref = geo.get("preferred")
+            if pref in ("COMO_ESTAS", "FAMILIA"):
+                # GNN dijo FAMILIA → respetar salvo geo COMO muy clara.
+                if prediction == "FAMILIA" and pref == "COMO_ESTAS":
+                    if float(geo.get("f_shape") or 0) >= 0.35 or float(geo.get("wrist_dist") or 1) <= 0.34:
+                        pref = "FAMILIA"
+                # GNN dijo COMO → corregir a FAMILIA si hay forma F / manos juntas.
+                if prediction == "COMO_ESTAS" and (
+                    float(geo.get("f_shape") or 0) >= 0.40
+                    or float(geo.get("wrist_dist") or 1) <= 0.30
+                ):
+                    pref = "FAMILIA"
+                # Si el GNN ya eligió con margen claro y la geo no contradice fuerte, respetarlo.
+                gnn_top = "COMO_ESTAS" if como_p >= fam_p else "FAMILIA"
+                gnn_margin = abs(como_p - fam_p)
+                geo_contra = (
+                    (gnn_top == "COMO_ESTAS" and float(geo.get("familia") or 0) >= float(geo.get("como") or 0) + 0.18)
+                    or (gnn_top == "FAMILIA" and float(geo.get("como") or 0) >= float(geo.get("familia") or 0) + 0.25
+                        and float(geo.get("f_shape") or 0) < 0.35)
+                )
+                if prediction in ("COMO_ESTAS", "FAMILIA") and gnn_margin >= 0.22 and not geo_contra:
+                    pref = prediction
+                prediction = pref
+                confidence = max(
+                    float(probs[_labels.index(pref)]),
+                    float(geo.get("familia" if pref == "FAMILIA" else "como") or 0),
+                    UMBRAL_CONFIANZA,
+                )
 
     # "IDLE" es una clase real de entrenamiento (mano en reposo), no lo mismo
     # que is_idle=True (que evaluate_prediction devuelve cuando no hay
@@ -205,11 +260,11 @@ async def predict(req: PredictRequest):
     if prediction is None or prediction == "IDLE":
         return PredictResponse(prediction="", confidence=confidence, is_idle=True)
 
-    # Fase 2B (opcional): conjugación geométrica. Por defecto OFF —
-    # sin calibrar invertía AYUDA ↔ AYUDAME en uso real.
+    # Fase 2B: conjugación geométrica (AYUDA→AYUDAME/…, TE_AMO→ME_AMAS/…).
+    # TE_AMO usa umbrales propios (ILY estático → cita, no inventar ME_AMAS).
     direction = None
     if ENABLE_CONJUGATE and prediction in DIRECTIONAL_VERBS:
-        direction = classify_direction(data)["direction"]
+        direction = classify_direction(data, verb=prediction)["direction"]
         prediction = conjugate(prediction, direction)
 
     return PredictResponse(

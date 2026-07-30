@@ -29,7 +29,11 @@ import {
   getStoredOutputLang,
 } from '../data/outputLanguages.js'
 import { translateFromSpanish } from '../utils/translateApi.js'
-import { maybeCorrectTeAmo } from '../utils/handshapeHints.js'
+import { maybeCorrectTeAmo, maybeCorrectComoFamilia } from '../utils/handshapeHints.js'
+import { isLetterToken } from '../utils/fingerspell.js'
+
+/** Tras la última letra, esperar este tiempo sin nueva letra → emitir el nombre. */
+const SPELL_FLUSH_MS = 1000
 
 // Migrado de @mediapipe/holistic (legacy) a @mediapipe/tasks-vision:
 // HandLandmarker con GPU, solo manos. FaceLandmarker se pospuso: no se usa
@@ -43,12 +47,12 @@ import { maybeCorrectTeAmo } from '../utils/handshapeHints.js'
 const SEQ_LEN        = 24
 const HAND_COUNT     = 21
 // Más estricto: preferimos esperar un frame más a “adivinar” con 0.75.
-const UMBRAL         = 0.82
-const STABILITY_NEED = 3
+const UMBRAL         = 0.80
+const STABILITY_NEED = 2
 // Solo confirma en 1 shot live si es casi seguro (antes 0.90 disparaba de más).
-const HIGH_CONF_INSTANT = 0.96
+const HIGH_CONF_INSTANT = 0.94
 // Fin de seña (1 sola predicción): umbral aún un poco más alto.
-const FINALIZE_UMBRAL = 0.86
+const FINALIZE_UMBRAL = 0.84
 const NO_HAND_RESET  = 12
 // Tiempo máximo de espera de /predict antes de abortar. Sin esto, si el
 // servidor ML está frío (Render) o la red falla a medias, el fetch podía
@@ -59,7 +63,7 @@ const PREDICT_TIMEOUT_MS = 12000
 const NO_HAND_GRACE  = 8
 const POST_CONFIRM_WAIT = 8
 // Mínimo de frames reales para mandar a /predict.
-const MIN_FRAMES     = 10
+const MIN_FRAMES     = 8
 
 // ── Fin de seña (camino principal, tiempo real) ─────────────────────────────
 const STOP_FRAMES = 4
@@ -70,7 +74,7 @@ const MOVED_MIN   = 0.018
 // Señas casi estáticas (TE_AMO, SI, NO): sostener la forma cuenta como gesto
 // aunque la muñeca casi no se mueva — sin bajar el umbral dinámico de arriba.
 const HELD_MOVED_MIN = 0.003
-const HELD_MIN_FRAMES = 14
+const HELD_MIN_FRAMES = 12
 
 const LIVE_STRIDE = 4
 
@@ -298,6 +302,10 @@ export default function InterpretScreen({ onBack, onHome }) {
   const peakMovementRef   = useRef(0)    // pico de movimiento de la seña en curso (umbral adaptativo)
   const cooldownRef       = useRef(0)    // cooldown frame-based
   const lastSignRef       = useRef('')   // última seña confirmada (evita repetir)
+  const announcedUpRef    = useRef('')   // ya anunciada con manos arriba (evita doble voz)
+  const spellBufRef       = useRef([])   // letras acumuladas (deletreo → nombre)
+  const spellTimerRef     = useRef(null)
+  const letterRepeatTimerRef = useRef(null) // libera L+L tras el brinco
   const lastLiveAtRef     = useRef(0)    // len del buffer en la última predicción live
   const apiInFlightRef    = useRef(false)
   const mlAvailableRef    = useRef(false)
@@ -626,7 +634,9 @@ export default function InterpretScreen({ onBack, onHome }) {
     const lang = outputLangRef.current
     const langMeta = findOutputLang(lang)
     let displayText = textEs
-    if (lang !== 'es') {
+    // Nombres deletreados (MARIA): no pasar por traductor palabra-a-palabra.
+    const isSpelledName = /^[A-ZÑ]{2,}$/u.test(String(sign || '').toUpperCase())
+    if (lang !== 'es' && !isSpelledName) {
       try {
         displayText = await translateFromSpanish(textEs, lang)
       } catch (e) {
@@ -647,6 +657,33 @@ export default function InterpretScreen({ onBack, onHome }) {
     if (sentenceClearRef.current) clearTimeout(sentenceClearRef.current)
     sentenceClearRef.current = setTimeout(() => setSentence([]), 6000)
     speak(displayText, langMeta.speech)
+  }
+
+  function flushSpellBuffer() {
+    if (spellTimerRef.current) {
+      clearTimeout(spellTimerRef.current)
+      spellTimerRef.current = null
+    }
+    const letters = spellBufRef.current
+    spellBufRef.current = []
+    // Letras sueltas no se anuncian: solo nombres (≥2 letras).
+    if (letters.length < 2) {
+      if (letters.length === 1) {
+        setDisplaySign('')
+        setDisplayConf(0)
+        updateCaptureHud(0, { showHud: false, status: 'Listo' })
+      }
+      return
+    }
+    const name = letters.join('')
+    const conf = 1
+    setDisplaySign(name)
+    setDisplayConf(conf)
+    updateCaptureHud(0, {
+      showHud: false,
+      status: `${name} · deletreo`,
+    })
+    triggerRecognition(name, conf)
   }
 
   function updateCaptureHud(_len, { showHud, status }) {
@@ -670,12 +707,22 @@ export default function InterpretScreen({ onBack, onHome }) {
     stillCountRef.current     = 0
     peakMovementRef.current   = 0
     lastSignRef.current       = ''
+    announcedUpRef.current    = ''
     cooldownRef.current       = 0
     apiInFlightRef.current    = false
     lastLiveAtRef.current     = 0
     handVisibleRef.current    = false
     drawLeftRef.current = null
     drawRightRef.current = null
+    if (spellTimerRef.current) {
+      clearTimeout(spellTimerRef.current)
+      spellTimerRef.current = null
+    }
+    if (letterRepeatTimerRef.current) {
+      clearTimeout(letterRepeatTimerRef.current)
+      letterRepeatTimerRef.current = null
+    }
+    spellBufRef.current = []
     if (handBadgeRef.current) handBadgeRef.current.style.display = 'none'
     setHandVisible(false)
     setBufferLen(0)
@@ -696,13 +743,42 @@ export default function InterpretScreen({ onBack, onHome }) {
     peakMovementRef.current   = 0
     lastLiveAtRef.current     = 0
 
-    setDisplaySign(prediction)
-    setDisplayConf(confidence)
     inCooldownRef.current = true
     setBufferLen(0)
     setInCooldown(true)
+
+    // Deletreo: acumular letras y emitir el nombre al cerrar el buffer.
+    if (isLetterToken(prediction)) {
+      spellBufRef.current.push(String(prediction).toUpperCase())
+      const partial = spellBufRef.current.join('')
+      setDisplaySign(partial)
+      setDisplayConf(confidence)
+      updateCaptureHud(0, {
+        showHud: false,
+        status: `${partial} · deletreando…`,
+      })
+      if (spellTimerRef.current) clearTimeout(spellTimerRef.current)
+      spellTimerRef.current = setTimeout(() => flushSpellBuffer(), SPELL_FLUSH_MS)
+      // LL / RR: tras el cooldown, liberar la misma letra para el brinco
+      // (sin vaciar lastSign al instante → evitar LLLLL al sostener).
+      if (letterRepeatTimerRef.current) clearTimeout(letterRepeatTimerRef.current)
+      const letter = String(prediction).toUpperCase()
+      letterRepeatTimerRef.current = setTimeout(() => {
+        if (lastSignRef.current === letter) lastSignRef.current = ''
+      }, 420)
+      return
+    }
+
+    // Seña léxica: cerrar nombre en curso (si había) y luego la seña.
+    if (spellBufRef.current.length) flushSpellBuffer()
+
+    setDisplaySign(prediction)
+    setDisplayConf(confidence)
     updateCaptureHud(0, { showHud: false, status: `${prediction.replace(/_/g, ' ')} · ${Math.round(confidence * 100)}%` })
 
+    // Ya se anunció esta seña con las manos arriba → no repetir al bajarlas.
+    if (announcedUpRef.current === prediction) return
+    announcedUpRef.current = prediction
     triggerRecognition(prediction, confidence)
   }
 
@@ -728,13 +804,15 @@ export default function InterpretScreen({ onBack, onHome }) {
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
 
         const { prediction: rawPred, confidence, is_idle } = await resp.json()
-        // Cinturón en cliente: forma ILY (TE_AMO) gana a NO/SI o a idle.
-        const corrected = maybeCorrectTeAmo(rawPred || 'NO', bufferCopy)
-        const prediction =
-          corrected === 'TE_AMO' && (!rawPred || rawPred === 'NO' || rawPred === 'SI' || is_idle)
-            ? 'TE_AMO'
-            : (rawPred || '')
-        if ((is_idle && prediction !== 'TE_AMO') || !prediction) return
+        // Cinturón en cliente: forma ILY → TE_AMO; F/separación → COMO↔FAMILIA.
+        let prediction = maybeCorrectTeAmo(rawPred || '', bufferCopy)
+        const isTeAmoFamily = ['TE_AMO', 'ME_AMAS', 'ME_AMA', 'LO_AMO', 'LA_AMO', 'NOS_AMAMOS', 'YO_TE_AMO'].includes(
+          String(prediction || '').toUpperCase(),
+        )
+        if (!isTeAmoFamily) {
+          prediction = maybeCorrectComoFamilia(prediction || rawPred || '', bufferCopy) || ''
+        }
+        if ((is_idle && !isTeAmoFamily) || !prediction) return
 
         predHistRef.current.push(prediction)
         if (predHistRef.current.length > STABILITY_NEED) {
@@ -849,8 +927,16 @@ export default function InterpretScreen({ onBack, onHome }) {
         runPrediction(snapshot, { finalize: true })
       }
 
+      // Manos fuera un rato: cerrar deletreo en curso (nombre parcial).
+      if (noHandCountRef.current >= NO_HAND_RESET && spellBufRef.current.length) {
+        flushSpellBuffer()
+      }
+
       if (noHandCountRef.current >= NO_HAND_RESET) {
         predHistRef.current = []
+        // Manos fuera del todo: se puede volver a anunciar la misma seña.
+        lastSignRef.current = ''
+        announcedUpRef.current = ''
       }
       return
     }
@@ -886,12 +972,10 @@ export default function InterpretScreen({ onBack, onHome }) {
         peakMovementRef.current >= MOVED_MIN ||
         (len >= HELD_MIN_FRAMES && peakMovementRef.current >= HELD_MOVED_MIN)
 
-      // Al ARRANCAR una seña nueva (el pico cruza MOVED_MIN tras una parada),
-      // se limpia la guarda de "no repetir la última seña". Así se puede
-      // encadenar la MISMA palabra varias veces en una frase (SI · SI) siempre
-      // que sea un gesto nuevo de verdad — la guarda solo evita el doble
-      // disparo sobre una misma seña sostenida.
-      if (!wasGesture && gestureHappened) lastSignRef.current = ''
+      // Al ARRANCAR una seña nueva NO limpiamos lastSign aquí: si el usuario
+      // baja las manos tras un anuncio en vivo, el finalize no debe volver a
+      // decirla. Se puede repetir la misma seña tras sacar las manos del todo
+      // (announcedUpRef / lastSign se reinician en NO_HAND_RESET).
 
       if (movement < stopThreshold) stillCountRef.current++
       else stillCountRef.current = 0

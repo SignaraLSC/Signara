@@ -24,14 +24,17 @@ export function deduplicateChars(text) {
 
 /**
  * Normalización completa para comparación:
- * minúsculas → sin acentos → sin puntuación → deduplicar → trim
+ * minúsculas → sin acentos → sin puntuación → deduplicar → trim.
+ * La ñ se conserva (letra distinta de n en LSC / deletreo).
  */
 export function normalizeForSearch(text) {
   return deduplicateChars(
     String(text)
       .toLowerCase()
       .normalize('NFD')
+      .replace(/n\u0303/g, '\u0001') // ñ = n + tilde → proteger
       .replace(/[̀-ͯ]/g, '')   // quitar acentos
+      .replace(/\u0001/g, 'ñ')
       .replace(/[¿¡.,!?;:()-]/g, ' ')  // puntuación → espacio
       .replace(/\s+/g, ' ')
       .trim()

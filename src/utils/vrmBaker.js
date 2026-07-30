@@ -22,9 +22,29 @@ import {
   smoothVecSeq,
   trimLeadIn,
   trimTrailOut,
+  letterKFingerBones,
+  letterVFingerBones,
+  letterWFingerBones,
+  letterCFingerBones,
+  letterDFingerBones,
+  letterOFingerBones,
+  letterQFingerBones,
+  letterFFingerBones,
+  letterGFingerBones,
+  letterLFingerBones,
+  letterRFingerBones,
+  letterTFingerBones,
+  hiddenThumbBones,
+  fistLittleBones,
+  fistRingLittleBones,
 } from './vrmSolver.js'
 import { setIdlePose } from './vrmIdlePose.js'
 import { smoothFaceSeq, lerpExpr, NEUTRAL_EXPR } from './vrmFaceSolver.js'
+import { isLetterToken } from './fingerspell.js'
+
+/** Duración fija del gesto de cada letra (ms), independiente de frames/fps
+ *  de la grabación — así A (7f@30) no dura 0.2 s y D (24f@30) 0.8 s. */
+const LETTER_BODY_MS = 800
 
 export function createBaker(vrm) {
   const getBone = (n) => vrm.humanoid.getNormalizedBoneNode(n)
@@ -91,12 +111,45 @@ export function createBaker(vrm) {
     const pq = new THREE.Quaternion()
     B.hd.parent.getWorldQuaternion(pq)
     B.hd.quaternion.copy(pq.clone().invert().multiply(qDelta).multiply(pq))
-    // Ajuste de giro de palma calibrable, alrededor del eje del antebrazo
-    // (hacia el nudillo medio). Signo espejado por lado.
     if (rollRad) {
       const rollAxis = B.mid.position.clone().normalize()
       B.hd.quaternion.multiply(new THREE.Quaternion().setFromAxisAngle(rollAxis, rollRad * sideSign))
     }
+  }
+
+  /**
+   * Solo el exceso de twist (> maxKeep) pasa al antebrazo, en el eje real
+   * antebrazo→mano. Orientación world de la mano intacta; el brazo casi no se nota.
+   */
+  function redistributeWristTwistExcess(B, maxKeep = 0.65) {
+    if (!B?.hd?.parent || !B.lo) return
+    vrm.scene.updateMatrixWorld(true)
+    const worldHandQ = B.hd.getWorldQuaternion(new THREE.Quaternion())
+    const loPos = B.lo.getWorldPosition(new THREE.Vector3())
+    const hdPos = B.hd.getWorldPosition(new THREE.Vector3())
+    const axisW = hdPos.clone().sub(loPos).normalize()
+    if (axisW.lengthSq() < 1e-8) return
+
+    const loWQ = B.lo.getWorldQuaternion(new THREE.Quaternion())
+    const axisLo = axisW.clone().applyQuaternion(loWQ.clone().invert()).normalize()
+    const parentWQ = B.hd.parent.getWorldQuaternion(new THREE.Quaternion())
+    const axisHandParent = axisW.clone().applyQuaternion(parentWQ.clone().invert()).normalize()
+
+    const q = B.hd.quaternion
+    const ra = new THREE.Vector3(q.x, q.y, q.z)
+    const p = axisHandParent.clone().multiplyScalar(ra.dot(axisHandParent))
+    const twist = new THREE.Quaternion(p.x, p.y, p.z, q.w).normalize()
+    const sign = Math.sign(axisHandParent.dot(new THREE.Vector3(twist.x, twist.y, twist.z)) || 1)
+    let ang = 2 * Math.acos(Math.min(1, Math.max(-1, twist.w))) * sign
+    if (ang > Math.PI) ang -= 2 * Math.PI
+    if (ang < -Math.PI) ang += 2 * Math.PI
+    if (Math.abs(ang) <= maxKeep) return
+    const move = ang - Math.sign(ang) * maxKeep
+
+    B.lo.quaternion.multiply(new THREE.Quaternion().setFromAxisAngle(axisLo, move))
+    vrm.scene.updateMatrixWorld(true)
+    const parentWQ2 = B.hd.parent.getWorldQuaternion(new THREE.Quaternion())
+    B.hd.quaternion.copy(parentWQ2.clone().invert().multiply(worldHandQ))
   }
 
   // EMA sobre una secuencia de escalares (p.ej. fracción de extensión del
@@ -163,7 +216,23 @@ export function createBaker(vrm) {
     return S.clone().addScaledVector(n, a).addScaledVector(perp, h)
   }
 
-  function bakeSolver(rawDataset, { direction = 'neutral' } = {}) {
+  /**
+   * @param {object} rawDataset
+   * @param {{ direction?: string, chain?: 'solo'|'start'|'middle'|'end'|'hold' }} [opts]
+   * chain: deletreo — omitir entrada/salida a reposo entre letras seguidas.
+   *   solo   = comportamiento normal (entry + seña + exit)
+   *   start  = entry + seña (sin exit)
+   *   middle = blend→seña (sin entry/exit a idle)
+   *   end    = blend→seña + exit
+   *   hold   = solo cuerpo de la seña (para coser un deletreo continuo)
+   */
+  function bakeSolver(rawDataset, {
+    direction = 'neutral',
+    chain = 'solo',
+    token: tokenOverride,
+    /** Dataset opcional: solo forma de mano (Ñ usa movimiento propio + mano de N). */
+    handShapeDataset = null,
+  } = {}) {
     // Recorta preparación al inicio Y bajada de vuelta al reposo al final,
     // si quedaron grabadas por error (ambas se sintetizan solas más abajo).
     // IMPORTANTE: trim* a veces devuelve el MISMO objeto (si no recorta).
@@ -204,6 +273,28 @@ export function createBaker(vrm) {
       SCOOBA: (55 * Math.PI) / 180,
       // AYUDA: sin roll global — el +45° volcaba la palma y el puño.
       AYUDA: 0,
+      // P: roll 0 — la orientación ya va forzada (dedos abajo).
+      P: 0,
+      // C: roll 0 — la palma lateral ya va forzada (silueta de C).
+      C: 0,
+      // D: roll 0 — índice arriba + círculo forzado.
+      D: 0,
+      // O: roll 0 — misma muñeca que D/C.
+      O: 0,
+      // Q: roll 0 — nudillos al frente / palma atrás (el +45° la dejaba al revés).
+      Q: 0,
+      // F: roll 0 — palma de frente como la captura.
+      F: 0,
+      // G: roll 0 — el círculo lo trae la captura; no sumar +45°.
+      G: 0,
+      // R: roll 0 — índice×corazón; palma a cámara.
+      R: 0,
+      // V: roll 0 — índice/corazón separados; palma a cámara.
+      V: 0,
+      // W: roll 0 — tres dedos separados; palma a cámara.
+      W: 0,
+      // T: roll 0 — pulgar↑ + índice perpendicular.
+      T: 0,
     }
     // Overrides calibrados contra la fuente 'pose' — no aplican si se está
     // probando 'hand' (esa fuente tiene su propio giro base, wristRollHand).
@@ -465,7 +556,7 @@ export function createBaker(vrm) {
       return handOk(f.lh) || handOk(f.rh)
     })
     if (!frames.length) return []
-    const bakeToken = (dataset.token || '').toUpperCase()
+    const bakeToken = String(tokenOverride || dataset.token || '').toUpperCase().normalize('NFC')
     // Señales con mano en cara/boca O manos lado a lado: no apilar ni
     // avoidTorso duro (inventaba “una arriba / una abajo” en PERDON).
     const NEAR_FACE_SIGNS = new Set(['HOLA', 'SCOOBA', 'PERDON', 'GRACIAS', 'TENGO_SED'])
@@ -502,7 +593,9 @@ export function createBaker(vrm) {
       const cleaned = lockWristHemisphereSeq(despikeWristSeq(seq))
       cleaned.forEach((v, i) => { if (v) rawWri[i][side] = v })
     }
-    const rawFing = frames.map((f) => frameFingers(f, arms))
+    const rawFing = frames.map((f) => frameFingers(f, arms, {
+      skipLetterK: bakeToken === 'P' || bakeToken === 'V' || bakeToken === 'W',
+    }))
     // Cabeza (Fase 3): nariz/orejas de pose_world → yaw/pitch. Huecos (mano
     // tapando la cara, detección floja) heredan el último valor válido, igual
     // que el blindaje de bordes de los brazos — nunca deja el canal "vacío".
@@ -581,6 +674,129 @@ export function createBaker(vrm) {
         }
       }
     }
+    // K: SOLO esta seña — perfil lámina, dedos HORIZONTALES al otro lado
+    // (fwd +X en derecha), dorso a cámara; yema en letterKFingerBones.
+    if (bakeToken === 'K') {
+      const letterSide = arms.right ? 'right' : (arms.left ? 'left' : 'right')
+      for (let i = 0; i < rawWri.length; i++) {
+        if (!rawWri[i]) rawWri[i] = {}
+        if (letterSide === 'right') {
+          rawWri[i].right = { fwd: [0.88, 0.22, 0.4], normal: [0.08, 0.12, -0.98] }
+        } else {
+          rawWri[i].left = { fwd: [-0.88, 0.22, 0.4], normal: [-0.08, 0.12, 0.98] }
+        }
+      }
+    }
+    // C: misma palma (C intacta) pero fwd casi vertical → muñeca recta
+    // (el fwd con X/Z altos inclinaba la mano hacia la cabeza).
+    if (bakeToken === 'C') {
+      for (let i = 0; i < rawWri.length; i++) {
+        if (!rawWri[i]) rawWri[i] = {}
+        if (rawWri[i].right || arms.right) {
+          rawWri[i].right = { fwd: [0.06, 0.98, 0.15], normal: [-0.9, 0.05, 0.35] }
+        }
+        if (rawWri[i].left || arms.left) {
+          rawWri[i].left = { fwd: [-0.06, 0.98, 0.15], normal: [0.9, 0.05, 0.35] }
+        }
+      }
+    }
+    // D / O: misma muñeca que la C (de lado) — el círculo se lee; una sola mano.
+    if (bakeToken === 'D' || bakeToken === 'O') {
+      const letterSide = arms.right ? 'right' : (arms.left ? 'left' : 'right')
+      for (let i = 0; i < rawWri.length; i++) {
+        if (!rawWri[i]) rawWri[i] = {}
+        if (letterSide === 'right') {
+          rawWri[i].right = { fwd: [0.06, 0.98, 0.15], normal: [-0.9, 0.05, 0.35] }
+        } else {
+          rawWri[i].left = { fwd: [-0.06, 0.98, 0.15], normal: [0.9, 0.05, 0.35] }
+        }
+      }
+    }
+    // Q: palma ACOSTADA HACIA ARRIBA (normal +Y); nudillos al frente (+Z).
+    // Ref. LSM: yemas juntas arriba, dorso visible, hueco del pico hacia arriba.
+    if (bakeToken === 'Q') {
+      const letterSide = arms.right ? 'right' : (arms.left ? 'left' : 'right')
+      for (let i = 0; i < rawWri.length; i++) {
+        if (!rawWri[i]) rawWri[i] = {}
+        if (letterSide === 'right') {
+          rawWri[i].right = { fwd: [0.12, 0.4, 0.9], normal: [0.05, 0.96, -0.25] }
+        } else {
+          rawWri[i].left = { fwd: [-0.12, 0.4, 0.9], normal: [-0.05, 0.96, -0.25] }
+        }
+      }
+    }
+    // F: palma a cámara (como la foto de captura).
+    if (bakeToken === 'F') {
+      const letterSide = arms.right ? 'right' : (arms.left ? 'left' : 'right')
+      for (let i = 0; i < rawWri.length; i++) {
+        if (!rawWri[i]) rawWri[i] = {}
+        if (letterSide === 'right') {
+          rawWri[i].right = { fwd: [0.05, 0.92, 0.35], normal: [0.05, 0.05, 0.99] }
+        } else {
+          rawWri[i].left = { fwd: [-0.05, 0.92, 0.35], normal: [-0.05, 0.05, 0.99] }
+        }
+      }
+    }
+    // L: índice arriba, PALMA hacia el frente (a cámara).
+    if (bakeToken === 'L') {
+      const letterSide = arms.right ? 'right' : (arms.left ? 'left' : 'right')
+      for (let i = 0; i < rawWri.length; i++) {
+        if (!rawWri[i]) rawWri[i] = {}
+        if (letterSide === 'right') {
+          rawWri[i].right = { fwd: [0.06, 0.88, 0.45], normal: [0.08, 0.05, 0.99] }
+        } else {
+          rawWri[i].left = { fwd: [-0.06, 0.88, 0.45], normal: [-0.08, 0.05, 0.99] }
+        }
+      }
+    }
+    // R: índice×corazón arriba — misma palma a cámara que L/F.
+    if (bakeToken === 'R') {
+      const letterSide = arms.right ? 'right' : (arms.left ? 'left' : 'right')
+      for (let i = 0; i < rawWri.length; i++) {
+        if (!rawWri[i]) rawWri[i] = {}
+        if (letterSide === 'right') {
+          rawWri[i].right = { fwd: [0.05, 0.92, 0.35], normal: [0.05, 0.05, 0.99] }
+        } else {
+          rawWri[i].left = { fwd: [-0.05, 0.92, 0.35], normal: [-0.05, 0.05, 0.99] }
+        }
+      }
+    }
+    // T: palma de lado mirando al otro lado (normal invertida vs C).
+    if (bakeToken === 'T') {
+      const letterSide = arms.right ? 'right' : (arms.left ? 'left' : 'right')
+      for (let i = 0; i < rawWri.length; i++) {
+        if (!rawWri[i]) rawWri[i] = {}
+        if (letterSide === 'right') {
+          rawWri[i].right = { fwd: [0.06, 0.98, 0.15], normal: [0.9, 0.05, 0.35] }
+        } else {
+          rawWri[i].left = { fwd: [-0.06, 0.98, 0.15], normal: [-0.9, 0.05, 0.35] }
+        }
+      }
+    }
+    // V: índice/corazón separados — palma a cámara.
+    if (bakeToken === 'V') {
+      const letterSide = arms.right ? 'right' : (arms.left ? 'left' : 'right')
+      for (let i = 0; i < rawWri.length; i++) {
+        if (!rawWri[i]) rawWri[i] = {}
+        if (letterSide === 'right') {
+          rawWri[i].right = { fwd: [0.05, 0.92, 0.35], normal: [0.05, 0.05, 0.99] }
+        } else {
+          rawWri[i].left = { fwd: [-0.05, 0.92, 0.35], normal: [-0.05, 0.05, 0.99] }
+        }
+      }
+    }
+    // W: tres dedos arriba separados — palma a cámara.
+    if (bakeToken === 'W') {
+      const letterSide = arms.right ? 'right' : (arms.left ? 'left' : 'right')
+      for (let i = 0; i < rawWri.length; i++) {
+        if (!rawWri[i]) rawWri[i] = {}
+        if (letterSide === 'right') {
+          rawWri[i].right = { fwd: [0.05, 0.92, 0.35], normal: [0.05, 0.05, 0.99] }
+        } else {
+          rawWri[i].left = { fwd: [-0.05, 0.92, 0.35], normal: [-0.05, 0.05, 0.99] }
+        }
+      }
+    }
     const fingSmooth = smoothPoseSeq(rawFing, CONFIG.dirSmooth)
     // Forzar formas de mano: palma abierta abajo + puño pulgar-arriba encima.
     if (ayudaStack) {
@@ -617,6 +833,154 @@ export function createBaker(vrm) {
         o.rightThumbProximal = teul('right', 0)
         o.rightThumbDistal = teul('right', 0)
         fingSmooth[i] = o
+      }
+    }
+    // Letra K / C / D / O / Q / F / G / L / R: forzar handshape. Letras = UNA sola mano.
+    // P: grabación cruda (P.json) — sin force; skipLetterK evita convertirla en K.
+    // G: no override de muñeca — el movimiento circular viene de G.json.
+    if (bakeToken === 'K' || bakeToken === 'C' || bakeToken === 'D' || bakeToken === 'O' || bakeToken === 'Q' || bakeToken === 'F' || bakeToken === 'G' || bakeToken === 'L' || bakeToken === 'R' || bakeToken === 'T' || bakeToken === 'V' || bakeToken === 'W') {
+      const forceFingers =
+        bakeToken === 'C' ? letterCFingerBones
+          : bakeToken === 'D' ? letterDFingerBones
+            : bakeToken === 'O' ? letterOFingerBones
+              : bakeToken === 'Q' ? letterQFingerBones
+                : bakeToken === 'F' ? letterFFingerBones
+                  : bakeToken === 'G' ? letterGFingerBones
+                    : bakeToken === 'L' ? letterLFingerBones
+                      : bakeToken === 'R' ? letterRFingerBones
+                        : bakeToken === 'T' ? letterTFingerBones
+                          : bakeToken === 'V' ? letterVFingerBones
+                            : bakeToken === 'W' ? letterWFingerBones
+                              : letterKFingerBones
+      const letterSide = arms.right ? 'right' : (arms.left ? 'left' : 'right')
+      for (let i = 0; i < fingSmooth.length; i++) {
+        const o = { ...(fingSmooth[i] || {}) }
+        Object.assign(o, forceFingers(letterSide))
+        fingSmooth[i] = o
+      }
+    }
+    // Mano forzada a re-aplicar al final.
+    let forcedHandBones = null
+    // P: toma cruda; índice bien separado del corazón pero con curl para
+    // que la yema del índice toque el corazón (curva de la P legible).
+    // Pulgar: NO en el hueco índice–corazón (el cierre Y puro lo mete ahí).
+    // CMC invertido vs hiddenThumb (ese apuntaba ↑) + falanges cortas → queda
+    // pegado sobre anular/meñique, por debajo del hueco.
+    if (bakeToken === 'P') {
+      const letterSide = arms.right ? 'right' : (arms.left ? 'left' : 'right')
+      const s = letterSide === 'right' ? 1 : -1
+      const thumbBelowGap = {
+        [`${letterSide}ThumbMetacarpal`]: { x: s * -0.55, y: s * -0.75, z: s * 0.3 },
+        [`${letterSide}ThumbProximal`]: { x: s * -0.2, y: s * -0.7, z: s * 0.15 },
+        [`${letterSide}ThumbIntermediate`]: { x: 0, y: s * -0.4, z: 0 },
+        [`${letterSide}ThumbDistal`]: { x: 0, y: s * -0.25, z: 0 },
+      }
+      const indexP = {
+        [`${letterSide}IndexProximal`]: { x: 0, y: s * 0.95, z: s * 0.55 },
+        [`${letterSide}IndexIntermediate`]: { x: 0, y: 0, z: s * 1.2 },
+        [`${letterSide}IndexDistal`]: { x: 0, y: 0, z: s * 1.1 },
+        ...fistRingLittleBones(letterSide),
+        ...thumbBelowGap,
+      }
+      forcedHandBones = { ...indexP }
+      for (let i = 0; i < fingSmooth.length; i++) {
+        const o = { ...(fingSmooth[i] || {}), ...indexP }
+        const mid = o[`${letterSide}MiddleProximal`] || { x: 0, y: 0, z: 0 }
+        o[`${letterSide}MiddleProximal`] = { x: mid.x || 0, y: s * -0.65, z: mid.z || 0 }
+        fingSmooth[i] = o
+      }
+    }
+    // Helper: frame medio de handShapeDataset → huesos (lado de la toma N).
+    const handFromShapeDataset = () => {
+      if (!handShapeDataset) return null
+      const hsTrim = trimTrailOut(trimLeadIn(handShapeDataset))
+      const hsFrames = (hsTrim.frames || []).filter((f) => {
+        const handOk = (h) =>
+          Array.isArray(h) && h.some((p) => p && Math.abs(p[0]) + Math.abs(p[1]) + Math.abs(p[2] || 0) > 1e-6)
+        return handOk(f.lh) || handOk(f.rh)
+      })
+      const hsArms = activeArms(hsTrim)
+      const shapeSide = hsArms.right ? 'right' : (hsArms.left ? 'left' : 'right')
+      const hsFing = hsFrames.map((f) => frameFingers(f, hsArms))
+      const mid = hsFing[Math.floor(hsFing.length / 2)] || hsFing[0] || {}
+      const hand = {}
+      for (const [k, v] of Object.entries(mid)) {
+        if (k.startsWith(shapeSide) && /(Proximal|Intermediate|Distal|Thumb|Metacarpal)/.test(k)) {
+          hand[k] = v
+        }
+      }
+      return { hand, shapeSide }
+    }
+    // N: crudo + pulgar metido + anular/meñique en puño (forma N clara).
+    if (bakeToken === 'N') {
+      const letterSide = arms.right ? 'right' : (arms.left ? 'left' : 'right')
+      forcedHandBones = {
+        ...fistRingLittleBones(letterSide),
+        ...hiddenThumbBones(letterSide),
+      }
+      for (let i = 0; i < fingSmooth.length; i++) {
+        fingSmooth[i] = { ...(fingSmooth[i] || {}), ...forcedHandBones }
+      }
+    }
+    // X: pulgar visible junto a meñique/anular/corazón (lado afuera x−/z+,
+    // no oculto detrás).
+    if (bakeToken === 'X') {
+      const letterSide = arms.right ? 'right' : (arms.left ? 'left' : 'right')
+      const s = letterSide === 'right' ? 1 : -1
+      forcedHandBones = {
+        [`${letterSide}ThumbMetacarpal`]: { x: s * -0.35, y: s * -0.65, z: s * 0.22 },
+        [`${letterSide}ThumbProximal`]: { x: s * -0.2, y: s * -1.05, z: s * 0.12 },
+        [`${letterSide}ThumbIntermediate`]: { x: 0, y: s * -0.7, z: 0 },
+        [`${letterSide}ThumbDistal`]: { x: 0, y: s * -0.45, z: 0 },
+      }
+      for (let i = 0; i < fingSmooth.length; i++) {
+        fingSmooth[i] = { ...(fingSmooth[i] || {}), ...forcedHandBones }
+      }
+    }
+    // Y: toma original; solo estirar la punta del pulgar (IP/DIP en 0).
+    if (bakeToken === 'Y') {
+      const letterSide = arms.right ? 'right' : (arms.left ? 'left' : 'right')
+      forcedHandBones = {
+        [`${letterSide}ThumbIntermediate`]: { x: 0, y: 0, z: 0 },
+        [`${letterSide}ThumbDistal`]: { x: 0, y: 0, z: 0 },
+      }
+      for (let i = 0; i < fingSmooth.length; i++) {
+        fingSmooth[i] = { ...(fingSmooth[i] || {}), ...forcedHandBones }
+      }
+    }
+    // Ñ: movimiento Ñ.json; mano = N (índice/corazón de N + anular/meñique
+    // cerrados + pulgar metido). Sin forzar el puño, quedaban los dedos de Ñ.json.
+    if (bakeToken === 'Ñ') {
+      const packed = handFromShapeDataset()
+      const letterSide = packed?.shapeSide
+        || (arms.right ? 'right' : (arms.left ? 'left' : 'right'))
+      const hand = { ...(packed?.hand || {}) }
+      Object.assign(
+        hand,
+        fistRingLittleBones(letterSide),
+        hiddenThumbBones(letterSide),
+      )
+      forcedHandBones = hand
+      for (let i = 0; i < fingSmooth.length; i++) {
+        fingSmooth[i] = { ...(fingSmooth[i] || {}), ...hand }
+      }
+    }
+    // M: misma muestra que N; mano = N + anular igual al corazón (3 dedos).
+    if (bakeToken === 'M') {
+      const packed = handFromShapeDataset()
+      const letterSide = packed?.shapeSide
+        || (arms.right ? 'right' : (arms.left ? 'left' : 'right'))
+      const hand = { ...(packed?.hand || {}) }
+      const midP = hand[`${letterSide}MiddleProximal`]
+      const midI = hand[`${letterSide}MiddleIntermediate`]
+      const midD = hand[`${letterSide}MiddleDistal`]
+      if (midP) hand[`${letterSide}RingProximal`] = { ...midP }
+      if (midI) hand[`${letterSide}RingIntermediate`] = { ...midI }
+      if (midD) hand[`${letterSide}RingDistal`] = { ...midD }
+      Object.assign(hand, fistLittleBones(letterSide), hiddenThumbBones(letterSide))
+      forcedHandBones = hand
+      for (let i = 0; i < fingSmooth.length; i++) {
+        fingSmooth[i] = { ...(fingSmooth[i] || {}), ...hand }
       }
     }
 
@@ -900,62 +1264,76 @@ export function createBaker(vrm) {
         vrm.scene.updateMatrixWorld(true) // el antebrazo usa el brazo ya girado
         aimBone(B.lo, B.hd, T.clone().sub(E).normalize())
         pose[name + 'UpperArm'] = eulerOf(B.up)
-        pose[name + 'LowerArm'] = eulerOf(B.lo)
         const wrist = name === 'right' ? wrists.right : wrists.left
         if (wrist) {
           vrm.scene.updateMatrixWorld(true)
           aimHandFull(B, wrist.fwd, wrist.normal, name === 'right' ? 1 : -1, bakeWristRoll)
+          // Q: solo el exceso de twist (>~37°) al antebrazo (eje real),
+          // para quitar el chicle de la muñeca sin aplastar el brazo.
+          if (bakeToken === 'Q') redistributeWristTwistExcess(B, 0.65)
           pose[name + 'Hand'] = eulerOf(B.hd)
         }
+        pose[name + 'LowerArm'] = eulerOf(B.lo)
       }
       Object.assign(pose, fingSmooth[i]) // dedos ya suavizados
-      pose.head = headEuler(headSmooth[i]) // cabeza (asentir/girar), independiente de brazos
-      // Asistencia de cuello SOLO en tokens whitelist (p.ej. TENGO_SED).
-      // En HOLA la mano toca la sien → un assist genérico movía la cabeza mal.
-      {
-        const allowList = CONFIG.headNeckAssistTokens
-        const tok = (dataset.token || '').toUpperCase()
-        const allowAssist = !allowList || allowList.length === 0
-          ? false
-          : allowList.some((t) => tok === String(t).toUpperCase() || tok.includes(String(t).toUpperCase()))
-        if (allowAssist) {
-          const axis = CONFIG.headPitchAxis || 'x'
-          const maxAssist = CONFIG.headNeckAssist ?? 0.75
-          let w = 0
-          for (const side of ['right', 'left']) {
-            const t = tg[side]
-            if (!t) continue
-            w = Math.max(w, t.neckW || neckZoneWeight(t.T, t.d?.wristOffset))
-          }
-          if (w > 0.05) {
-            const sign = CONFIG.headPitchSign ?? -1
-            // Piso bajo (0.25): con 0.55 el assist arrancaba fuerte aunque w
-            // fuera pequeño → tirón brusco de cabeza. Neck solo 0.25× para
-            // no sumar otro alza encima del pitch de la cabeza.
-            const assist = maxAssist * (0.25 + 0.75 * w)
-            const cur = pose.head[axis] || 0
-            const target = assist * sign
-            pose.head[axis] = sign >= 0 ? Math.max(cur, target) : Math.min(cur, target)
-            pose.neck = {
-              x: axis === 'x' ? assist * 0.25 * sign : 0,
-              y: axis === 'y' ? assist * 0.25 * sign : 0,
-              z: 0,
+      // Letras: cabeza/cuello/tronco fijos (solo letras; el resto igual que antes).
+      if (isLetterToken(bakeToken)) {
+        pose.head = { x: 0, y: 0, z: 0 }
+        pose.neck = { x: 0, y: 0, z: 0 }
+        pose.spine = { x: 0, y: 0, z: 0 }
+        pose.chest = { x: 0, y: 0, z: 0 }
+      } else {
+        pose.head = headEuler(headSmooth[i]) // cabeza (asentir/girar), independiente de brazos
+        // Asistencia de cuello SOLO en tokens whitelist (p.ej. TENGO_SED).
+        // En HOLA la mano toca la sien → un assist genérico movía la cabeza mal.
+        {
+          const allowList = CONFIG.headNeckAssistTokens
+          const tok = (dataset.token || '').toUpperCase()
+          const allowAssist = !allowList || allowList.length === 0
+            ? false
+            : allowList.some((t) => tok === String(t).toUpperCase() || tok.includes(String(t).toUpperCase()))
+          if (allowAssist) {
+            const axis = CONFIG.headPitchAxis || 'x'
+            const maxAssist = CONFIG.headNeckAssist ?? 0.75
+            let w = 0
+            for (const side of ['right', 'left']) {
+              const t = tg[side]
+              if (!t) continue
+              w = Math.max(w, t.neckW || neckZoneWeight(t.T, t.d?.wristOffset))
+            }
+            if (w > 0.05) {
+              const sign = CONFIG.headPitchSign ?? -1
+              // Piso bajo (0.25): con 0.55 el assist arrancaba fuerte aunque w
+              // fuera pequeño → tirón brusco de cabeza. Neck solo 0.25× para
+              // no sumar otro alza encima del pitch de la cabeza.
+              const assist = maxAssist * (0.25 + 0.75 * w)
+              const cur = pose.head[axis] || 0
+              const target = assist * sign
+              pose.head[axis] = sign >= 0 ? Math.max(cur, target) : Math.min(cur, target)
+              pose.neck = {
+                x: axis === 'x' ? assist * 0.25 * sign : 0,
+                y: axis === 'y' ? assist * 0.25 * sign : 0,
+                z: 0,
+              }
+            } else {
+              pose.neck = { x: 0, y: 0, z: 0 }
             }
           } else {
             pose.neck = { x: 0, y: 0, z: 0 }
           }
-        } else {
-          pose.neck = { x: 0, y: 0, z: 0 }
         }
       }
       // Tercera persona en el espacio: yaw de tronco. Manos = bake neutral
       // (third), invertidas (third_self / third_group_self), o barrido lateral
       // (group_third ya mueve muñecas; el yaw refuerza el “lado”).
+      // Letras: no aplicar yaw de tronco.
       if (
-        direction === 'third' ||
-        direction === 'third_self' ||
-        direction === 'third_group_self' ||
-        direction === 'group_third'
+        !isLetterToken(bakeToken) && (
+          direction === 'third' ||
+          direction === 'third_self' ||
+          direction === 'third_group_self' ||
+          direction === 'group_third'
+        )
       ) {
         const yawY = CONFIG.thirdTorsoYawY ?? 0.22
         pose.spine = { ...(pose.spine || {}), x: pose.spine?.x || 0, y: yawY, z: 0 }
@@ -1073,7 +1451,12 @@ export function createBaker(vrm) {
     }
 
     const fps = dataset.fps > 0 && dataset.fps < 240 ? dataset.fps : 30 // valor sano
-    const dur = Math.round((1000 / fps) * SIGN_SLOWDOWN) // más lento = natural
+    let dur = Math.round((1000 / fps) * SIGN_SLOWDOWN) // más lento = natural
+    // Letras: misma duración de gesto para todas (A era ~0.2 s por fps alto
+    // y pocos frames; B/C ~1 s por fps bajo).
+    if (isLetterToken(token) && poses.length > 0) {
+      dur = Math.max(16, Math.round(LETTER_BODY_MS / poses.length))
+    }
     if (!poses.length) return []
     // NOTA: se intentó comprimir automáticamente señas "quietas" (ej. BIEN)
     // para que no demoren sosteniendo una pose fija — primero por rango total
@@ -1126,7 +1509,9 @@ export function createBaker(vrm) {
         o[`${side}${f}Intermediate`] = { x: 0, y: 0, z: g * REST_CURL }
         o[`${side}${f}Distal`] = { x: 0, y: 0, z: g * REST_CURL * 0.6 }
       }
+      o[side + 'ThumbMetacarpal'] = NEUTRAL
       o[side + 'ThumbProximal'] = NEUTRAL
+      o[side + 'ThumbIntermediate'] = NEUTRAL
       o[side + 'ThumbDistal'] = NEUTRAL
       return o
     }
@@ -1140,6 +1525,10 @@ export function createBaker(vrm) {
         restFingers[`${side}${f}Intermediate`] = { x: 0, y: 0, z: g * REST_CURL }
         restFingers[`${side}${f}Distal`] = { x: 0, y: 0, z: g * REST_CURL * 0.6 }
       }
+      restFingers[`${side}ThumbMetacarpal`] = NEUTRAL
+      restFingers[`${side}ThumbProximal`] = NEUTRAL
+      restFingers[`${side}ThumbIntermediate`] = NEUTRAL
+      restFingers[`${side}ThumbDistal`] = NEUTRAL
     }
 
     // ── Transición SIN IK (entrada y salida) ───────────────────────────────
@@ -1331,21 +1720,44 @@ export function createBaker(vrm) {
     const transSteps = TRANS_STEPS - 1
     const entryStepMs = LEAD_IN_MS / TRANS_STEPS
     const exitStepMs = 480 / TRANS_STEPS
-    const entryKfs = transition(
-      entrySides, restFingers, fingersOf(first), transSteps, entryStepMs,
-      NEUTRAL, first.head, NEUTRAL_EXPR, first.expr, NEUTRAL, first.neck,
-      NEUTRAL, first.spine || NEUTRAL, NEUTRAL, first.chest || NEUTRAL,
-    )
-    // Empalme exacto con frame 0: mismo pose y duración del primer frame de la
-    // seña, sin duplicar keyframe (evita micro-pausa por tramo de delta cero).
-    entryKfs.push({ duration: dur, pose: { ...first } })
-    const signKfsBody = poses.length > 1 ? poses.slice(1).map((p) => ({ duration: dur, pose: p })) : []
-    const exitKfs = transition(
-      exitSides, fingersOf(last), restFingers, transSteps, exitStepMs,
-      last.head, NEUTRAL, last.expr, NEUTRAL_EXPR, last.neck, NEUTRAL,
-      last.spine || NEUTRAL, NEUTRAL, last.chest || NEUTRAL, NEUTRAL,
-    )
-    exitKfs.push({ duration: exitStepMs, pose: buildExactRestPose(activeSides) })
+    const wantEntry = chain === 'solo' || chain === 'start'
+    const wantExit = chain === 'solo' || chain === 'end'
+    // Deletreo: nunca bajar a idle entre letras. 'hold' = solo el gesto.
+    const CHAIN_BLEND_MS = 260
+    const spelling = chain === 'start' || chain === 'middle' || chain === 'end' || chain === 'hold'
+    const spellDur = spelling ? dur * 0.7 : dur
+
+    const letterStill = isLetterToken(bakeToken)
+    let entryKfs = []
+    if (wantEntry) {
+      entryKfs = transition(
+        entrySides, restFingers, fingersOf(first), transSteps, entryStepMs,
+        NEUTRAL, letterStill ? NEUTRAL : first.head, NEUTRAL_EXPR, first.expr, NEUTRAL, letterStill ? NEUTRAL : first.neck,
+        NEUTRAL, first.spine || NEUTRAL, NEUTRAL, first.chest || NEUTRAL,
+      )
+      // Empalme exacto con frame 0: mismo pose y duración del primer frame de la
+      // seña, sin duplicar keyframe (evita micro-pausa por tramo de delta cero).
+      entryKfs.push({ duration: spellDur, pose: { ...first } })
+    } else if (chain === 'hold') {
+      // Solo cuerpo — el cosido del deletreo añade el morph entre letras.
+      entryKfs = [{ duration: spellDur, pose: { ...first } }]
+    } else {
+      // middle/end sueltos: morph desde pose actual del player → esta letra.
+      entryKfs = [{ duration: CHAIN_BLEND_MS, pose: { ...first } }]
+    }
+    const signKfsBody = poses.length > 1
+      ? poses.slice(1).map((p) => ({ duration: spellDur, pose: p }))
+      : []
+    let exitKfs = []
+    if (wantExit) {
+      exitKfs = transition(
+        exitSides, fingersOf(last), restFingers, transSteps, exitStepMs,
+        letterStill ? NEUTRAL : last.head, NEUTRAL, last.expr, NEUTRAL_EXPR,
+        letterStill ? NEUTRAL : last.neck, NEUTRAL,
+        last.spine || NEUTRAL, NEUTRAL, last.chest || NEUTRAL, NEUTRAL,
+      )
+      exitKfs.push({ duration: exitStepMs, pose: buildExactRestPose(activeSides) })
+    }
     const all = [...entryKfs, ...signKfsBody, ...exitKfs]
 
     // Blindaje: brazos que NO participan en la seña quedan congelados en reposo
@@ -1355,6 +1767,57 @@ export function createBaker(vrm) {
       const rest = frozenFingerRest(side)
       all.forEach((k) => Object.assign(k.pose, rest))
     }
+
+    // Letras con handshape forzada: re-aplicar solo en UNA mano (la de la toma).
+    if (bakeToken === 'D' || bakeToken === 'O' || bakeToken === 'Q' || bakeToken === 'C' || bakeToken === 'K' || bakeToken === 'F' || bakeToken === 'G' || bakeToken === 'L' || bakeToken === 'R' || bakeToken === 'T' || bakeToken === 'V' || bakeToken === 'W') {
+      const forceFingers =
+        bakeToken === 'C' ? letterCFingerBones
+          : bakeToken === 'D' ? letterDFingerBones
+            : bakeToken === 'O' ? letterOFingerBones
+              : bakeToken === 'Q' ? letterQFingerBones
+                : bakeToken === 'F' ? letterFFingerBones
+                  : bakeToken === 'G' ? letterGFingerBones
+                    : bakeToken === 'L' ? letterLFingerBones
+                      : bakeToken === 'R' ? letterRFingerBones
+                        : bakeToken === 'T' ? letterTFingerBones
+                          : bakeToken === 'V' ? letterVFingerBones
+                            : bakeToken === 'W' ? letterWFingerBones
+                              : letterKFingerBones
+      const letterSide = arms.right ? 'right' : (arms.left ? 'left' : 'right')
+      const from = wantEntry ? Math.max(0, entryKfs.length - 1) : 0
+      const to = wantExit ? all.length - exitKfs.length : all.length
+      const still = { x: 0, y: 0, z: 0 }
+      for (let i = from; i < to; i++) {
+        Object.assign(all[i].pose, forceFingers(letterSide))
+        if (isLetterToken(bakeToken)) {
+          all[i].pose.head = still
+          all[i].pose.neck = still
+          all[i].pose.spine = still
+          all[i].pose.chest = still
+        }
+      }
+    }
+    // M / N / Ñ: re-aplicar mano forzada en el cuerpo de la seña.
+    if (forcedHandBones) {
+      const from = wantEntry ? Math.max(0, entryKfs.length - 1) : 0
+      const to = wantExit ? all.length - exitKfs.length : all.length
+      for (let i = from; i < to; i++) Object.assign(all[i].pose, forcedHandBones)
+    }
+
+    // Letras: asegurar cabeza/tronco quietos en TODOS los keyframes del gesto
+    // (también A/B/E/… sin force de dedos).
+    if (isLetterToken(bakeToken)) {
+      const still = { x: 0, y: 0, z: 0 }
+      const from = wantEntry ? Math.max(0, entryKfs.length - 1) : 0
+      const to = wantExit ? all.length - exitKfs.length : all.length
+      for (let i = from; i < to; i++) {
+        all[i].pose.head = still
+        all[i].pose.neck = still
+        all[i].pose.spine = still
+        all[i].pose.chest = still
+      }
+    }
+
     return all
   }
 

@@ -1,0 +1,11 @@
+# Deps locales de captura (Windows). NO usar en Render.
+# La API usa requirements_api.txt.
+#
+#   pip install -r requirements_capture.txt
+#
+# Importante: numpy 1.26 + mediapipe 0.10.14 + opencv 4.x
+# (torch 2.3 no soporta NumPy 2; mediapipe >=0.10.30 pierde mp.solutions)
+opencv-python==4.10.0.84
+opencv-contrib-python==4.10.0.84
+mediapipe==0.10.14
+numpy==1.26.4

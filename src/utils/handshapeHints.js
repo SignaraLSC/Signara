@@ -107,8 +107,15 @@ export function looksLikeIly(framesCompact) {
     pinkyE > ringE * 1.0 &&
     contrast >= 0.05
 
+  const soft =
+    score >= 0.68 &&
+    pinkyE >= 0.60 &&
+    indexE >= 0.80 &&
+    middleE < indexE * 1.05 &&
+    contrast >= -0.02
+
   return {
-    ily: ily || (score >= 0.72 && pinkyE >= 0.65 && indexE >= 0.85 && middleE < indexE),
+    ily: ily || soft,
     score,
     indexE,
     middleE,
@@ -117,11 +124,138 @@ export function looksLikeIly(framesCompact) {
   }
 }
 
-/** Si el modelo dijo NO/SI pero la mano es ILY → TE_AMO. */
+/** Formas conjugadas de TE_AMO (no pisar con el rescate ILY). */
+const TE_AMO_FORMS = new Set([
+  'TE_AMO',
+  'YO_TE_AMO',
+  'ME_AMAS',
+  'TU_ME_AMAS',
+  'LO_AMO',
+  'LA_AMO',
+  'ME_AMA',
+  'EL_ME_AMA',
+  'ELLA_ME_AMA',
+  'NOS_AMAMOS',
+])
+
+/** Si el modelo se equivocó pero la mano es ILY → TE_AMO (cita). */
 export function maybeCorrectTeAmo(prediction, framesCompact) {
   const pred = String(prediction || '').toUpperCase()
-  if (pred !== 'NO' && pred !== 'SI') return prediction
+  if (TE_AMO_FORMS.has(pred)) return prediction
   const hint = looksLikeIly(framesCompact)
   if (hint.ily) return 'TE_AMO'
   return prediction
+}
+
+function meanHandBlock(frames, side) {
+  const kept = []
+  for (const fr of frames) {
+    const h = handFromCompact(fr, side)
+    if (handPresent(h)) kept.push(h)
+  }
+  if (kept.length < 4) return null
+  return meanHand(kept.slice(-Math.min(10, kept.length)))
+}
+
+function fShapeScore(hand) {
+  const bone =
+    Math.hypot(hand[INDEX_MCP].x - hand[0].x, hand[INDEX_MCP].y - hand[0].y) || 1e-4
+  const indexE = fingerExt(hand, INDEX_MCP, INDEX_TIP)
+  const it =
+    Math.hypot(hand[INDEX_TIP].x - hand[4].x, hand[INDEX_TIP].y - hand[4].y) / bone
+  const close = it <= 0.25 ? 1 : Math.max(0, 1 - (it - 0.25) / 0.55)
+  const curled = indexE <= 0.55 ? 1 : Math.max(0, 1 - (indexE - 0.55) / 0.7)
+  return 0.55 * close + 0.45 * curled
+}
+
+function wristTraj(frames, side) {
+  const pts = []
+  for (const fr of frames) {
+    const h = handFromCompact(fr, side)
+    if (handPresent(h)) pts.push({ x: h[0].x, y: h[0].y })
+  }
+  return pts.length >= 4 ? pts : null
+}
+
+/** Espejo de resolve_como_familia (API): forma F / separación — decide siempre. */
+export function resolveComoFamilia(framesCompact) {
+  if (!framesCompact?.length) return { preferred: null, familia: 0, como: 0 }
+  const fScores = []
+  const indexEs = []
+  for (const side of ['lh', 'rh']) {
+    const mh = meanHandBlock(framesCompact, side)
+    if (!mh) continue
+    fScores.push(fShapeScore(mh))
+    indexEs.push(fingerExt(mh, INDEX_MCP, INDEX_TIP))
+  }
+  if (!fScores.length) return { preferred: null, familia: 0, como: 0 }
+
+  const fShape = fScores.reduce((a, b) => a + b, 0) / fScores.length
+  const indexOpen = indexEs.reduce((a, b) => a + b, 0) / indexEs.length
+
+  const lh = wristTraj(framesCompact, 'lh')
+  const rh = wristTraj(framesCompact, 'rh')
+  let wristDist = 0.35
+  let orbitRad = 0.08
+  if (lh && rh) {
+    const n = Math.min(lh.length, rh.length)
+    const L = lh.slice(-n)
+    const R = rh.slice(-n)
+    let distSum = 0
+    const rel = []
+    for (let i = 0; i < n; i++) {
+      const dx = L[i].x - R[i].x
+      const dy = L[i].y - R[i].y
+      distSum += Math.hypot(dx, dy)
+      rel.push({ x: dx, y: dy })
+    }
+    wristDist = distSum / n
+    const mx = rel.reduce((s, p) => s + p.x, 0) / n
+    const my = rel.reduce((s, p) => s + p.y, 0) / n
+    orbitRad = rel.reduce((s, p) => s + Math.hypot(p.x - mx, p.y - my), 0) / n
+  }
+
+  const closeWrists = wristDist <= 0.28 ? 1 : Math.max(0, 1 - (wristDist - 0.28) / 0.22)
+  const tightOrbit = orbitRad <= 0.04 ? 1 : Math.max(0, 1 - (orbitRad - 0.04) / 0.1)
+  const familia = 0.5 * fShape + 0.3 * closeWrists + 0.2 * tightOrbit
+
+  const openIdx = indexOpen >= 0.95 ? 1 : indexOpen / 0.95
+  const farWrists = wristDist >= 0.36 ? 1 : Math.max(0, wristDist / 0.36)
+  const wideOrbit = orbitRad >= 0.07 ? 1 : orbitRad / 0.07
+  const como = 0.4 * openIdx + 0.4 * farWrists + 0.2 * wideOrbit
+
+  let preferred
+  const looksF = fShape >= 0.42 || (wristDist <= 0.3 && fShape >= 0.28)
+  const clearComo =
+    wristDist >= 0.38 &&
+    indexOpen >= 0.95 &&
+    fShape < 0.4 &&
+    como >= familia + 0.12
+  if (looksF && !clearComo) preferred = 'FAMILIA'
+  else if (clearComo) preferred = 'COMO_ESTAS'
+  else if (familia >= como) preferred = 'FAMILIA'
+  else preferred = como < familia + 0.2 ? 'FAMILIA' : 'COMO_ESTAS'
+
+  return { preferred, familia, como, wristDist, fShape }
+}
+
+/** Si el modelo cruzó COMO_ESTAS ↔ FAMILIA, corregir (sesgo anti-falso COMO). */
+export function maybeCorrectComoFamilia(prediction, framesCompact) {
+  const pred = String(prediction || '').toUpperCase()
+  if (pred !== 'COMO_ESTAS' && pred !== 'FAMILIA') return prediction
+  const geo = resolveComoFamilia(framesCompact)
+  if (pred === 'FAMILIA') {
+    // Solo pisar FAMILIA si la geo es COMO muy clara.
+    if (
+      geo.preferred === 'COMO_ESTAS' &&
+      (geo.fShape ?? 0) < 0.35 &&
+      (geo.wristDist ?? 0) >= 0.38
+    ) {
+      return 'COMO_ESTAS'
+    }
+    return 'FAMILIA'
+  }
+  // pred === COMO_ESTAS
+  if ((geo.fShape ?? 0) >= 0.4 || (geo.wristDist ?? 1) <= 0.3) return 'FAMILIA'
+  return geo.preferred || prediction
 }

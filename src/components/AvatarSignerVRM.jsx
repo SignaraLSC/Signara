@@ -22,10 +22,51 @@ import { setIdlePose } from '../utils/vrmIdlePose.js'
 import { createBaker } from '../utils/vrmBaker.js'
 import { playSolverAnim } from '../utils/vrmPlayer.js'
 import { parsePlayToken } from '../utils/directionalVerbs.js'
+import { isLetterToken } from '../utils/fingerspell.js'
 
 const AVATAR_URL = '/avatar/signara-avatar.vrm'
 // Subir esto invalida el cache en memoria tras cambios del baker (SED/cuello, etc.).
-const BAKE_CACHE_VER = 74 // TE_AMO self: un poco más afuera
+const BAKE_CACHE_VER = 308 // X: pulgar visible al lado de los dedos
+const SPELL_BLEND_MS = 260
+/** LL / RR: misma forma, rebote al FRENTE en UNA sola mano (se leen 2 letras). */
+const SPELL_BOUNCE_FWD_MS = 140
+const SPELL_BOUNCE_BACK_MS = 120
+const SPELL_BOUNCE_AMOUNT = 0.32
+
+/** Mano que lleva la letra (la otra no se toca). */
+function spellActiveSide(pose) {
+  if (!pose) return 'right'
+  if (pose.rightIndexProximal || pose.rightMiddleProximal || pose.rightThumbProximal) return 'right'
+  if (pose.leftIndexProximal || pose.leftMiddleProximal || pose.leftThumbProximal) return 'left'
+  if (pose.rightHand || pose.rightUpperArm) return 'right'
+  if (pose.leftHand || pose.leftUpperArm) return 'left'
+  return 'right'
+}
+
+/** Rebote al frente (misma L) y vuelta — solo la mano activa. */
+function bounceLetterPose(pose, amount = SPELL_BOUNCE_AMOUNT) {
+  if (!pose) return pose
+  const side = spellActiveSide(pose)
+  const out = { ...pose }
+  const u = pose[`${side}UpperArm`]
+  const l = pose[`${side}LowerArm`]
+  const signY = side === 'right' ? -1 : 1
+  if (u) {
+    out[`${side}UpperArm`] = {
+      x: (u.x || 0) - amount * 0.28,
+      y: (u.y || 0) + signY * amount * 0.1,
+      z: (u.z || 0) + amount * 0.45,
+    }
+  }
+  if (l) {
+    out[`${side}LowerArm`] = {
+      x: (l.x || 0) - amount * 0.18,
+      y: l.y || 0,
+      z: (l.z || 0) + amount * 0.28,
+    }
+  }
+  return out
+}
 /** @type {Record<string, unknown>} */
 const sharedBakeCache = {}
 /** @type {Record<string, unknown>} */
@@ -36,6 +77,10 @@ const PREFETCH_TOKENS = [
   'HOLA', 'SI', 'NO', 'GRACIAS', 'POR_FAVOR', 'TENGO_SED', 'BIEN', 'MAL',
   'COMO_ESTAS', 'DE_NADA', 'ADIOS', 'SCOOBA', 'TE_AMO',
 ]
+
+function tokenIsLetter(token) {
+  return isLetterToken(parsePlayToken(token).citationToken)
+}
 
 const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, onFinish }, ref) {
   const canvasRef = useRef(null)
@@ -52,11 +97,12 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
   // sin importar la dirección) — 'AYUDAR::self' y 'AYUDAR' piden el MISMO
   // /sign/AYUDAR y comparten caché de dataset; solo el HORNEADO difiere.
   const fetchDataset = useCallback(async (citationToken) => {
-    if (sharedDatasetCache[citationToken]) return sharedDatasetCache[citationToken]
-    const res = await fetch(`${apiUrl}/sign/${citationToken}`)
+    const dkey = `${BAKE_CACHE_VER}:${citationToken}`
+    if (sharedDatasetCache[dkey]) return sharedDatasetCache[dkey]
+    const res = await fetch(`${apiUrl}/sign/${encodeURIComponent(citationToken)}`)
     if (!res.ok) throw new Error(`HTTP ${res.status}`)
     const data = await res.json()
-    sharedDatasetCache[citationToken] = data
+    sharedDatasetCache[dkey] = data
     return data
   }, [apiUrl])
 
@@ -191,25 +237,95 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
     return () => { cancelled = true }
   }, [avatarReady, fetchDataset])
 
+  const bakeCached = useCallback(async (token, chain) => {
+    const { citationToken, direction } = parsePlayToken(token)
+    const key = `${BAKE_CACHE_VER}:${token}:${chain}`
+    if (sharedBakeCache[key]) return sharedBakeCache[key]
+    // Ñ: movimiento Ñ.json + mano de N.
+    // M: movimiento de N.json + mano N con 3 dedos (anular = corazón).
+    // O: círculo de D.json + mano O (como D sin dedo alzado).
+    const cite = String(citationToken || '').toUpperCase().normalize('NFC')
+    const motionToken = cite === 'M' ? 'N' : cite === 'O' ? 'D' : citationToken
+    const dataset = await fetchDataset(motionToken)
+    const handShapeDataset = (cite === 'Ñ' || cite === 'M') ? await fetchDataset('N') : null
+    const bakeTok = (cite === 'Ñ' || cite === 'M' || cite === 'O') ? cite : citationToken
+    const keyframes = bakerRef.current.bakeSolver(dataset, {
+      direction,
+      chain,
+      token: bakeTok,
+      handShapeDataset,
+    })
+    sharedBakeCache[key] = keyframes
+    return keyframes
+  }, [fetchDataset])
+
+  /**
+   * Deletreo: consume TODA la corrida de letras y la reproduce como UN solo
+   * clip — sube desde idle una vez, morph entre letras (manos arriba), baja
+   * al idle solo al final. Letras repetidas (LL, RR…) hacen un rebote en
+   * la misma mano (como hacer la seña 2 veces) para leerse como dos letras.
+   */
+  const bakeSpellRun = useCallback(async (run) => {
+    if (run.length === 1) return bakeCached(run[0], 'solo')
+
+    const stitched = []
+    stitched.push(...(await bakeCached(run[0], 'start')))
+
+    for (let i = 1; i < run.length; i++) {
+      const isLast = i === run.length - 1
+      const sameAsPrev = String(run[i]).toUpperCase() === String(run[i - 1]).toUpperCase()
+      const chain = isLast ? 'end' : 'hold'
+      const kfs = await bakeCached(run[i], chain)
+      if (!kfs?.length) continue
+
+      if (sameAsPrev) {
+        const pose = kfs[0].pose
+        // Rebote al frente → vuelta (2ª L), solo la mano de la letra.
+        stitched.push({ duration: SPELL_BOUNCE_FWD_MS, pose: bounceLetterPose(pose) })
+        stitched.push({ duration: SPELL_BOUNCE_BACK_MS, pose: { ...pose } })
+        if (kfs.length > 1) stitched.push(...kfs.slice(1))
+        else stitched.push({ duration: kfs[0].duration, pose: { ...pose } })
+        continue
+      }
+
+      if (isLast) {
+        stitched.push(...kfs)
+      } else {
+        stitched.push({ duration: SPELL_BLEND_MS, pose: { ...kfs[0].pose } })
+        if (kfs.length > 1) stitched.push(...kfs.slice(1))
+      }
+    }
+    return stitched
+  }, [bakeCached])
+
   const processQueue = useCallback(async () => {
     if (playingRef.current) return
-    if (queueRef.current.length === 0) { onFinish?.(); return }
+    if (queueRef.current.length === 0) {
+      onFinish?.()
+      return
+    }
     if (!vrmRef.current || !bakerRef.current) return
     playingRef.current = true
+
     const token = queueRef.current.shift() // ej. 'AYUDAR' o 'AYUDAR::self'
-    onSign?.(token)
+
     try {
-      // El horneado SÍ depende de la dirección (misma grabación, distinto
-      // resultado) — la caché de bake usa el token COMPUESTO completo.
-      const { citationToken, direction } = parsePlayToken(token)
-      const key = `${BAKE_CACHE_VER}:${token}`
-      let keyframes = sharedBakeCache[key]
-      if (!keyframes) {
-        const dataset = await fetchDataset(citationToken)
-        keyframes = bakerRef.current.bakeSolver(dataset, { direction })
-        sharedBakeCache[key] = keyframes
+      let keyframes
+      if (tokenIsLetter(token)) {
+        // Consumir corrida completa de letras (B,E,B,E → un clip).
+        const run = [token]
+        while (queueRef.current.length && tokenIsLetter(queueRef.current[0])) {
+          run.push(queueRef.current.shift())
+        }
+        onSign?.(run.length > 1 ? run.join('-') : token)
+        keyframes = await bakeSpellRun(run)
+        setIdlePose(vrmRef.current) // solo al empezar el nombre
+      } else {
+        onSign?.(token)
+        keyframes = await bakeCached(token, 'solo')
+        setIdlePose(vrmRef.current)
       }
-      setIdlePose(vrmRef.current)
+
       cancelPlayRef.current = playSolverAnim(vrmRef.current, keyframes, () => {
         playingRef.current = false
         processQueue()
@@ -219,14 +335,20 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
       playingRef.current = false
       processQueue()
     }
-  }, [fetchDataset, onSign, onFinish])
+  }, [bakeCached, bakeSpellRun, onSign, onFinish])
 
   useEffect(() => {
     if (avatarReady && queueRef.current.length && !playingRef.current) processQueue()
   }, [avatarReady, processQueue])
 
   useImperativeHandle(ref, () => ({
-    queue(token) { if (!token) return; queueRef.current.push(token); processQueue() },
+    // Microtask: si encolan varias letras seguidas (deletreo), se acumulan
+    // en la cola ANTES de processQueue — así se cosen en un solo clip.
+    queue(token) {
+      if (!token) return
+      queueRef.current.push(token)
+      queueMicrotask(() => { if (!playingRef.current) processQueue() })
+    },
     replace(tokens) {
       if (cancelPlayRef.current) cancelPlayRef.current()
       playingRef.current = false

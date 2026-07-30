@@ -22,6 +22,7 @@ import { translateText } from '../utils/translateText.js'
 import { tokenize, normalizeForSearch } from '../utils/textNormalizer.js'
 import { SIGNED_LANG_LABEL } from '../utils/signLanguage.js'
 import { resolveDirectionalForm } from '../utils/directionalVerbs.js'
+import { tryFingerspellSuffix } from '../utils/fingerspell.js'
 import { translateToSpanish } from '../utils/translateApi.js'
 import LanguagePicker from './LanguagePicker.jsx'
 import {
@@ -43,15 +44,24 @@ function matchSignTokens(words, available) {
   const result = []
   let i = 0
   while (i < words.length) {
-    let hit = null, len = 0
+    let hit = null
+    let len = 0
     for (let n = Math.min(3, words.length - i); n >= 1; n--) {
       const cand = words.slice(i, i + n)
       const directional = resolveDirectionalForm(cand, available)
-      if (directional) { hit = directional; len = n; break }
+      if (directional) { hit = [directional]; len = n; break }
       const literal = cand.join('_')
-      if (available.includes(literal)) { hit = literal; len = n; break }
+      if (available.includes(literal)) { hit = [literal]; len = n; break }
     }
-    if (hit) { result.push(hit); i += len } else { i += 1 }
+    if (hit) {
+      result.push(...hit)
+      i += len
+      continue
+    }
+    // Nombre / OOV: deletrear letra a letra si hay animaciones A–Z.
+    const fs = tryFingerspellSuffix(words.slice(i, i + 1), available)
+    if (fs) result.push(...fs.tokens)
+    i += 1
   }
   return result
 }
@@ -61,16 +71,23 @@ function matchSignTokens(words, available) {
  * largo primero) pero mirando hacia ATRÁS desde el final de `words` — para el
  * reconocimiento EN VIVO, donde las palabras llegan una por una y hay que
  * decidir con lo que ya se tiene, sin saber la frase completa todavía.
- * Devuelve { token, consumed } o null si ninguna combinación que termine en
- * la última palabra coincide.
+ * Devuelve { tokens, token, consumed } o null.
  */
 function tryMatchSuffix(words, available) {
   for (let n = Math.min(3, words.length); n >= 1; n--) {
     const slice = words.slice(words.length - n)
     const directional = resolveDirectionalForm(slice, available)
-    if (directional) return { token: directional, consumed: n }
+    if (directional) {
+      return { tokens: [directional], token: directional, consumed: n }
+    }
     const cand = slice.join('_')
-    if (available.includes(cand)) return { token: cand, consumed: n }
+    if (available.includes(cand)) {
+      return { tokens: [cand], token: cand, consumed: n }
+    }
+  }
+  const fs = tryFingerspellSuffix(words, available)
+  if (fs) {
+    return { tokens: fs.tokens, token: fs.tokens[0], consumed: fs.consumed }
   }
   return null
 }
@@ -262,22 +279,25 @@ export default function TranslationScreen({
   // solo actualizaba el texto en pantalla; el avatar recién arrancaba al
   // final (handleVoiceFinal → handleSubmit), por eso se sentía "todo junto
   // al final" en vez de en tiempo real.
-  const queueLiveToken = useCallback((token) => {
-    if (!token) return
+  const queueLiveTokens = useCallback((tokens) => {
+    const list = (Array.isArray(tokens) ? tokens : [tokens]).filter(Boolean)
+    if (!list.length) return
     // Evita doble seña cuando el mic reenvía la misma 1ª palabra
     // (típico al cambiar de interim→final o reiniciar transcript).
+    const dedupeKey = list.join('|')
     const now = Date.now()
     const last = lastLiveQueueRef.current
-    if (last.token === token && now - last.t < 1500) return
-    lastLiveQueueRef.current = { token, t: now }
+    if (last.token === dedupeKey && now - last.t < 1500) return
+    lastLiveQueueRef.current = { token: dedupeKey, t: now }
 
     setMissedWord('')
     liveMatchedRef.current = true
     setTranslateSource('signer3d')
+    // No setSignerTokens aquí: el useEffect haría replace() y reiniciaría la cola.
     if (useSignerRef.current) {
-      signerRef.current?.queue(token)
+      for (const t of list) signerRef.current?.queue(t)
     } else {
-      liveQueueBufferRef.current.push(token)
+      liveQueueBufferRef.current.push(...list)
       useSignerRef.current = true
       setUseSigner(true)
     }
@@ -300,7 +320,7 @@ export default function TranslationScreen({
         const esWords = tokenize(es).map((w) => w.toUpperCase())
         const hit = tryMatchSuffix(esWords, availableTokensRef.current)
         if (hit) {
-          queueLiveToken(hit.token)
+          queueLiveTokens(hit.tokens)
           pendingWordsRef.current = []
         }
       } catch (e) {
@@ -313,7 +333,7 @@ export default function TranslationScreen({
         }
       }
     })()
-  }, [queueLiveToken])
+  }, [queueLiveTokens])
 
   const handleLiveWord = useCallback((rawWord) => {
     const cleaned = String(rawWord || '').trim()
@@ -332,7 +352,7 @@ export default function TranslationScreen({
       const candidate = [...pendingWordsRef.current, normalized.toUpperCase()]
       const hit = tryMatchSuffix(candidate, availableTokensRef.current)
       if (hit) {
-        queueLiveToken(hit.token)
+        queueLiveTokens(hit.tokens)
         pendingWordsRef.current = candidate.slice(0, candidate.length - hit.consumed)
         return
       }
@@ -351,7 +371,7 @@ export default function TranslationScreen({
       setMissedWord(dropped)
     }
     flushLiveTranslate()
-  }, [queueLiveToken, flushLiveTranslate])
+  }, [queueLiveTokens, flushLiveTranslate])
 
   const handleVoiceFinal = useCallback((text) => {
     pendingWordRef.current = ''
@@ -398,9 +418,12 @@ export default function TranslationScreen({
     handleSubmit(text)
   }, [handleVoiceFinal, handleSubmit])
 
-  const wordChips = (spanishText || originalText)
-    ? tokenize(spanishText || originalText).map((w) => w.toUpperCase())
-    : []
+  // Con deletreo, mostrar letras (M A R I A) en vez de la palabra cruda.
+  const wordChips = signerTokens.length > 0
+    ? signerTokens.map((t) => String(t).split('::')[0])
+    : (spanishText || originalText)
+      ? tokenize(spanishText || originalText).map((w) => w.toUpperCase())
+      : []
   const hasPose3d = translateSource === 'pose3d' && !!poseSrc
   const inputSpeechLang = findOutputLang(inputLang).speech
 

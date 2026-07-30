@@ -312,13 +312,441 @@ function fingerCurls(hand) {
   // tamaño de la mano: medido en datos reales, un pulgar extendido (BIEN)
   // da ~1.3-1.5×, uno cerrado (SI) baja a ~0.4-0.9× — señal clara e
   // independiente del doblez propio.
+  // EXCEPCIÓN letra K: el pulgar VA entre índice y medio (cerca del nudillo
+  // medio a propósito). No aplicar proximityCurl o el avatar lo “cierra”
+  // por fuera en vez de meterlo en la V.
   const tip = V(4), palmRef = V(9), wristPt = V(0);
   const handSpan = len(sub(palmRef, wristPt)) || 1e-6;
   const ratio = len(sub(tip, palmRef)) / handSpan;
-  const proximityCurl = Math.max(0, 1 - ratio) * 2.2;
-  tp = Math.max(tp, proximityCurl);
+  if (!thumbInIndexMiddleGap(hand)) {
+    const proximityCurl = Math.max(0, 1 - ratio) * 2.2;
+    tp = Math.max(tp, proximityCurl);
+  }
   out.Thumb = [tp, ti];  // MCP, IP
   return out;
+}
+
+/** Pulgar entre índice y medio (forma K LSC/ASL), no “fuera” del puño. */
+function thumbInIndexMiddleGap(hand) {
+  if (!handPresent(hand)) return false;
+  const V = (i) => ({ x: hand[i][0], y: hand[i][1], z: hand[i][2] ?? 0 });
+  const tip = V(4);
+  const iTip = V(8);
+  const mTip = V(12);
+  const ab = sub(mTip, iTip);
+  const abLen2 = dot(ab, ab) || 1e-9;
+  const t = Math.max(0, Math.min(1, dot(sub(tip, iTip), ab) / abLen2));
+  const closest = {
+    x: iTip.x + ab.x * t,
+    y: iTip.y + ab.y * t,
+    z: iTip.z + ab.z * t,
+  };
+  const dist = len(sub(tip, closest));
+  const gap = Math.sqrt(abLen2) || 1e-6;
+  return t > 0.18 && t < 0.82 && dist < gap * 0.9;
+}
+
+function fingerExt(hand, mcp, tip) {
+  const V = (i) => ({ x: hand[i][0], y: hand[i][1], z: hand[i][2] ?? 0 });
+  const wrist = V(0);
+  const bone = len(sub(V(mcp), wrist)) || 1e-6;
+  return len(sub(V(tip), V(mcp))) / bone;
+}
+
+/** Forma K: índice+medio abiertos, anular/meñique cerrados, pulgar en la V. */
+function isLetterKHand(hand) {
+  if (!handPresent(hand)) return false;
+  const iE = fingerExt(hand, 5, 8);
+  const mE = fingerExt(hand, 9, 12);
+  const rE = fingerExt(hand, 13, 16);
+  const pE = fingerExt(hand, 17, 20);
+  return (
+    iE >= 0.75 &&
+    mE >= 0.75 &&
+    rE < iE * 0.75 &&
+    pE < iE * 0.75 &&
+    thumbInIndexMiddleGap(hand)
+  );
+}
+
+/**
+ * Letra K: V abierta. Largo máximo (falanges en 0, como 184) + orientación
+ * de cuando “faltaba un poco para verse” (detrás / hueco, ~176–177).
+ */
+export function letterKFingerBones(side) {
+  const s = side === 'right' ? 1 : -1;
+  const curl = (z) => ({ x: 0, y: 0, z: s * z });
+  const bones = {};
+  bones[`${side}IndexProximal`] = { x: 0, y: s * 0.5, z: 0 };
+  bones[`${side}IndexIntermediate`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}IndexDistal`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}MiddleProximal`] = { x: 0, y: s * -0.4, z: 0 };
+  bones[`${side}MiddleIntermediate`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}MiddleDistal`] = { x: 0, y: 0, z: 0 };
+  for (const f of ['Ring', 'Little']) {
+    bones[`${side}${f}Proximal`] = curl(1.4);
+    bones[`${side}${f}Intermediate`] = curl(1.35);
+    bones[`${side}${f}Distal`] = curl(0.7);
+  }
+  // Largo max (falanges 0). CMC más hacia la V → yema ENTRE índice y corazón.
+  bones[`${side}ThumbMetacarpal`] = { x: s * -0.85, y: s * -0.55, z: s * -0.3 };
+  bones[`${side}ThumbProximal`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}ThumbIntermediate`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}ThumbDistal`] = { x: 0, y: 0, z: 0 };
+  return bones;
+}
+
+/**
+ * Letra V (LSC): índice + corazón ARRIBA y SEPARADOS (Y). Anular/meñique
+ * en puño; pulgar metido. Sin esto, frameFingers solo pone curl Z
+ * y los dos dedos quedan pegados.
+ */
+export function letterVFingerBones(side) {
+  const s = side === 'right' ? 1 : -1;
+  const curl = (z) => ({ x: 0, y: 0, z: s * z });
+  const bones = {};
+  bones[`${side}IndexProximal`] = { x: 0, y: s * 0.22, z: 0 };
+  bones[`${side}IndexIntermediate`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}IndexDistal`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}MiddleProximal`] = { x: 0, y: s * -0.22, z: 0 };
+  bones[`${side}MiddleIntermediate`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}MiddleDistal`] = { x: 0, y: 0, z: 0 };
+  for (const f of ['Ring', 'Little']) {
+    bones[`${side}${f}Proximal`] = curl(1.45);
+    bones[`${side}${f}Intermediate`] = curl(1.4);
+    bones[`${side}${f}Distal`] = curl(0.85);
+  }
+  // Pulgar pegado a anular/meñique (lado invertido vs hiddenThumbBones).
+  bones[`${side}ThumbMetacarpal`] = { x: s * -0.45, y: s * -0.55, z: s * 0.35 };
+  bones[`${side}ThumbProximal`] = { x: s * -0.3, y: s * -1.15, z: s * 0.2 };
+  bones[`${side}ThumbIntermediate`] = { x: 0, y: s * -0.75, z: 0 };
+  bones[`${side}ThumbDistal`] = { x: 0, y: s * -0.5, z: 0 };
+  return bones;
+}
+
+/**
+ * Letra W (LSC): índice + corazón + anular ARRIBA con apertura leve (Y).
+ * Meñique en puño; pulgar pegado. Mismo problema que V sin spread Y.
+ */
+export function letterWFingerBones(side) {
+  const s = side === 'right' ? 1 : -1;
+  const curl = (z) => ({ x: 0, y: 0, z: s * z });
+  const bones = {};
+  bones[`${side}IndexProximal`] = { x: 0, y: s * 0.2, z: 0 };
+  bones[`${side}IndexIntermediate`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}IndexDistal`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}MiddleProximal`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}MiddleIntermediate`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}MiddleDistal`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}RingProximal`] = { x: 0, y: s * -0.2, z: 0 };
+  bones[`${side}RingIntermediate`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}RingDistal`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}LittleProximal`] = curl(1.5);
+  bones[`${side}LittleIntermediate`] = curl(1.45);
+  bones[`${side}LittleDistal`] = curl(0.9);
+  bones[`${side}ThumbMetacarpal`] = { x: s * -0.45, y: s * -0.55, z: s * 0.35 };
+  bones[`${side}ThumbProximal`] = { x: s * -0.3, y: s * -1.15, z: s * 0.2 };
+  bones[`${side}ThumbIntermediate`] = { x: 0, y: s * -0.75, z: 0 };
+  bones[`${side}ThumbDistal`] = { x: 0, y: s * -0.5, z: 0 };
+  return bones;
+}
+
+/**
+ * Letra P (lámina LSC): NO es una K invertida.
+ * - Índice recto ↓ = trazo de la P
+ * - Corazón curvado + pulgar (yemas se tocan) = panza
+ * - Anular/meñique en puño
+ */
+export function letterPFingerBones(side) {
+  const s = side === 'right' ? 1 : -1;
+  const curl = (z) => ({ x: 0, y: 0, z: s * z });
+  const bones = {};
+  // Trazo vertical (sigue el fwd ↓ de la muñeca).
+  bones[`${side}IndexProximal`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}IndexIntermediate`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}IndexDistal`] = { x: 0, y: 0, z: 0 };
+  // Panza: corazón se curva hacia el pulgar (no abierto en V).
+  bones[`${side}MiddleProximal`] = { x: 0, y: s * 0.22, z: s * 0.55 };
+  bones[`${side}MiddleIntermediate`] = { x: 0, y: 0, z: s * 1.05 };
+  bones[`${side}MiddleDistal`] = { x: 0, y: 0, z: s * 0.75 };
+  for (const f of ['Ring', 'Little']) {
+    bones[`${side}${f}Proximal`] = curl(1.45);
+    bones[`${side}${f}Intermediate`] = curl(1.4);
+    bones[`${side}${f}Distal`] = curl(0.75);
+  }
+  // Pulgar hacia la yema del corazón (cierra la panza).
+  bones[`${side}ThumbMetacarpal`] = { x: s * -0.15, y: s * 0.12, z: 0 };
+  bones[`${side}ThumbProximal`] = {
+    x: s * -0.5,
+    y: s * 0.52,
+    z: s * -0.92,
+  };
+  bones[`${side}ThumbIntermediate`] = { x: 0, y: s * 0.32, z: s * -0.7 };
+  bones[`${side}ThumbDistal`] = { x: 0, y: s * 0.28, z: s * -0.75 };
+  return bones;
+}
+
+/**
+ * Letra L: índice arriba + pulgar al costado (90°), proporción natural.
+ * Apertura moderada solo en CMC; falanges rectas (sin quiebre ni “brazo” largo).
+ */
+export function letterLFingerBones(side) {
+  const s = side === 'right' ? 1 : -1;
+  const curl = (z) => ({ x: 0, y: 0, z: s * z });
+  const bones = {};
+  bones[`${side}IndexProximal`] = { x: 0, y: s * 0.06, z: 0 };
+  bones[`${side}IndexIntermediate`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}IndexDistal`] = { x: 0, y: 0, z: 0 };
+  for (const f of ['Middle', 'Ring', 'Little']) {
+    bones[`${side}${f}Proximal`] = curl(1.35);
+    bones[`${side}${f}Intermediate`] = curl(1.3);
+    bones[`${side}${f}Distal`] = curl(0.65);
+  }
+  // Apertura corta en la base — suave, sin estirar el mesh.
+  bones[`${side}ThumbMetacarpal`] = { x: 0, y: s * 0.32, z: 0 };
+  bones[`${side}ThumbProximal`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}ThumbIntermediate`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}ThumbDistal`] = { x: 0, y: 0, z: 0 };
+  return bones;
+}
+
+/**
+ * Letra T (LSC): índice acostado (horizontal); corazón+anular+meñique ARRIBA;
+ * pulgar como la F (metido en Y). Palma hacia adelante.
+ */
+export function letterTFingerBones(side) {
+  const s = side === 'right' ? 1 : -1;
+  const bones = {};
+  // Índice horizontal ⊥ al pulgar, señalando al avatar (curl Z ≈ 90°).
+  // Con esta muñeca el eje X no acuesta el dedo; Z sí (hacia la palma).
+  bones[`${side}IndexProximal`] = { x: 0, y: 0, z: s * 1.55 };
+  bones[`${side}IndexIntermediate`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}IndexDistal`] = { x: 0, y: 0, z: 0 };
+  // Corazón, anular y meñique arriba.
+  for (const f of ['Middle', 'Ring', 'Little']) {
+    const ySpread = f === 'Middle' ? 0.02 : f === 'Ring' ? -0.02 : -0.06;
+    bones[`${side}${f}Proximal`] = { x: 0, y: s * ySpread, z: 0 };
+    bones[`${side}${f}Intermediate`] = { x: 0, y: 0, z: 0 };
+    bones[`${side}${f}Distal`] = { x: 0, y: 0, z: 0 };
+  }
+  // Pulgar igual que F (cierre en Y).
+  bones[`${side}ThumbMetacarpal`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}ThumbProximal`] = { x: 0, y: s * -0.9, z: 0 };
+  bones[`${side}ThumbIntermediate`] = { x: 0, y: s * -0.5, z: 0 };
+  bones[`${side}ThumbDistal`] = { x: 0, y: s * -0.35, z: 0 };
+  return bones;
+}
+
+/**
+ * Letra R (LSC/LSM): índice y corazón RECTOS (sin curvar), cruzados —
+ * se cruzan hacia arriba; índice DELANTE del corazón. Anular/meñique en
+ * puño; pulgar pegado (lado invertido vs hiddenThumbBones).
+ */
+export function letterRFingerBones(side) {
+  const s = side === 'right' ? 1 : -1;
+  const curl = (z) => ({ x: 0, y: 0, z: s * z });
+  const bones = {};
+  // Rectos (z=0 en falanges) + Y en MCP para cruzar en línea; X = profundidad.
+  bones[`${side}IndexProximal`] = { x: s * -0.32, y: s * -0.28, z: 0 };
+  bones[`${side}IndexIntermediate`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}IndexDistal`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}MiddleProximal`] = { x: s * 0.28, y: s * 0.32, z: 0 };
+  bones[`${side}MiddleIntermediate`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}MiddleDistal`] = { x: 0, y: 0, z: 0 };
+  for (const f of ['Ring', 'Little']) {
+    bones[`${side}${f}Proximal`] = curl(1.5);
+    bones[`${side}${f}Intermediate`] = curl(1.45);
+    bones[`${side}${f}Distal`] = curl(0.9);
+  }
+  bones[`${side}ThumbMetacarpal`] = { x: s * -0.45, y: s * -0.55, z: s * 0.35 };
+  bones[`${side}ThumbProximal`] = { x: s * -0.3, y: s * -1.15, z: s * 0.2 };
+  bones[`${side}ThumbIntermediate`] = { x: 0, y: s * -0.75, z: 0 };
+  bones[`${side}ThumbDistal`] = { x: 0, y: s * -0.5, z: 0 };
+  return bones;
+}
+
+/**
+ * Pulgar DETRÁS de los dedos (M / N). En este VRM y− cierra al puño;
+ * x+/z− meten el pulgar bajo los dedos (x−/z+ lo abrían hacia afuera).
+ */
+export function hiddenThumbBones(side) {
+  const s = side === 'right' ? 1 : -1;
+  return {
+    [`${side}ThumbMetacarpal`]: { x: s * 0.45, y: s * -0.55, z: s * -0.35 },
+    [`${side}ThumbProximal`]: { x: s * 0.3, y: s * -1.15, z: s * -0.2 },
+    [`${side}ThumbIntermediate`]: { x: 0, y: s * -0.75, z: 0 },
+    [`${side}ThumbDistal`]: { x: 0, y: s * -0.5, z: 0 },
+  };
+}
+
+/** Meñique cerrado (puño) — para armar M a partir de la mano N. */
+export function fistLittleBones(side) {
+  const s = side === 'right' ? 1 : -1;
+  const curl = (z) => ({ x: 0, y: 0, z: s * z });
+  return {
+    [`${side}LittleProximal`]: curl(1.5),
+    [`${side}LittleIntermediate`]: curl(1.5),
+    [`${side}LittleDistal`]: curl(1.0),
+  };
+}
+
+/** Anular + meñique en puño (N / Ñ: solo índice y corazón “activos”). */
+export function fistRingLittleBones(side) {
+  const s = side === 'right' ? 1 : -1;
+  const curl = (z) => ({ x: 0, y: 0, z: s * z });
+  const bones = {};
+  for (const f of ['Ring', 'Little']) {
+    bones[`${side}${f}Proximal`] = curl(1.5);
+    bones[`${side}${f}Intermediate`] = curl(1.5);
+    bones[`${side}${f}Distal`] = curl(1.0);
+  }
+  return bones;
+}
+
+/**
+ * Letra F (LSC): puño cerrado + SOLO índice arriba (foto de captura).
+ *
+ * Por qué siempre salía L: en ESTE VRM el pulgar se cierra en el eje Y
+ * (CONFIG.thumbAxis='y', thumbSign=-1 → y negativo en derecha). Forzar
+ * y positivo / jugar con z/x abre el pulgar al costado (= L). Aquí el
+ * cierre va solo en Y, como handToFingerBones.
+ */
+export function letterFFingerBones(side) {
+  const s = side === 'right' ? 1 : -1;
+  const curl = (z) => ({ x: 0, y: 0, z: s * z });
+  const bones = {};
+  // Índice arriba.
+  bones[`${side}IndexProximal`] = { x: 0, y: s * 0.08, z: 0 };
+  bones[`${side}IndexIntermediate`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}IndexDistal`] = { x: 0, y: 0, z: 0 };
+  // Medio / anular / meñique en puño.
+  for (const f of ['Middle', 'Ring', 'Little']) {
+    bones[`${side}${f}Proximal`] = curl(1.4);
+    bones[`${side}${f}Intermediate`] = curl(1.4);
+    bones[`${side}${f}Distal`] = curl(0.7);
+  }
+  // Pulgar METIDO (cierre real = Y con signo del solver; sin y+ = sin L).
+  bones[`${side}ThumbMetacarpal`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}ThumbProximal`] = { x: 0, y: s * -0.9, z: 0 };
+  bones[`${side}ThumbIntermediate`] = { x: 0, y: s * -0.5, z: 0 };
+  bones[`${side}ThumbDistal`] = { x: 0, y: s * -0.35, z: 0 };
+  return bones;
+}
+
+/**
+ * Letra G (LSC): puño cerrado + índice en GANCHO (PIP/DIP curvados);
+ * el movimiento circular de “enganchar” lo aporta la captura (G.json).
+ * Pulgar metido en Y (mismo criterio que F — evita L).
+ */
+export function letterGFingerBones(side) {
+  const s = side === 'right' ? 1 : -1;
+  const curl = (z) => ({ x: 0, y: 0, z: s * z });
+  const bones = {};
+  // Índice: gancho — MCP leve, PIP/DIP fuertes (como enganchar).
+  bones[`${side}IndexProximal`] = { x: 0, y: s * 0.06, z: s * 0.4 };
+  bones[`${side}IndexIntermediate`] = { x: 0, y: 0, z: s * 1.15 };
+  bones[`${side}IndexDistal`] = { x: 0, y: 0, z: s * 1.05 };
+  // Resto en puño.
+  for (const f of ['Middle', 'Ring', 'Little']) {
+    bones[`${side}${f}Proximal`] = curl(1.4);
+    bones[`${side}${f}Intermediate`] = curl(1.4);
+    bones[`${side}${f}Distal`] = curl(0.7);
+  }
+  // Pulgar cerrado (eje Y del VRM).
+  bones[`${side}ThumbMetacarpal`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}ThumbProximal`] = { x: 0, y: s * -0.9, z: 0 };
+  bones[`${side}ThumbIntermediate`] = { x: 0, y: s * -0.5, z: 0 };
+  bones[`${side}ThumbDistal`] = { x: 0, y: s * -0.35, z: 0 };
+  return bones;
+}
+
+/**
+ * Letra D (LSC): índice arriba + círculo.
+ * Pulgar = el de la C (curva hacia las yemas, sin z extremo ni y alta tipo L).
+ * Los 3 dedos se cierran MÁS para tocar ese pulgar → círculo.
+ */
+export function letterDFingerBones(side) {
+  const s = side === 'right' ? 1 : -1;
+  const bones = letterCFingerBones(side);
+  bones[`${side}IndexProximal`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}IndexIntermediate`] = { x: 0, y: 0, z: 0 };
+  bones[`${side}IndexDistal`] = { x: 0, y: 0, z: 0 };
+  // Más curl → yemas bajan hasta el pulgar de la C.
+  for (const f of ['Middle', 'Ring', 'Little']) {
+    bones[`${side}${f}Proximal`] = { x: 0, y: 0, z: s * -1.15 };
+    bones[`${side}${f}Intermediate`] = { x: 0, y: 0, z: s * -1.4 };
+    bones[`${side}${f}Distal`] = { x: 0, y: 0, z: s * -1.0 };
+  }
+  // Pulgar idéntico a la C (ya apunta a las yemas) + un poco más de cierre.
+  bones[`${side}ThumbProximal`] = {
+    x: s * -0.5,
+    y: s * 0.48,
+    z: s * -0.78,
+  };
+  bones[`${side}ThumbIntermediate`] = { x: 0, y: s * 0.28, z: s * -0.55 };
+  bones[`${side}ThumbDistal`] = { x: 0, y: s * 0.22, z: s * -0.6 };
+  return bones;
+}
+
+/**
+ * Letra O (LSC): mismo círculo que la D, sin dedo alzado — los 4 dedos
+ * cierran el óvalo con el pulgar (forma D con índice también metido).
+ */
+export function letterOFingerBones(side) {
+  const s = side === 'right' ? 1 : -1;
+  const bones = letterDFingerBones(side);
+  bones[`${side}IndexProximal`] = { x: 0, y: 0, z: s * -1.15 };
+  bones[`${side}IndexIntermediate`] = { x: 0, y: 0, z: s * -1.4 };
+  bones[`${side}IndexDistal`] = { x: 0, y: 0, z: s * -1.0 };
+  return bones;
+}
+
+/**
+ * Letra Q (LSM): palma acostada hacia ARRIBA; las 5 yemas se juntan arriba
+ * (pico / capullo, no óvalo O). MCP casi recto → puntas visibles;
+ * pulgar tipo C/O (y+) a la punta — y− lo escondía detrás de los dedos.
+ */
+export function letterQFingerBones(side) {
+  const s = side === 'right' ? 1 : -1;
+  const bones = {};
+  const ySqueeze = { Index: -0.12, Middle: -0.03, Ring: 0.08, Little: 0.16 };
+  for (const f of ['Index', 'Middle', 'Ring', 'Little']) {
+    bones[`${side}${f}Proximal`] = { x: 0, y: s * ySqueeze[f], z: s * 0.12 };
+    bones[`${side}${f}Intermediate`] = { x: 0, y: 0, z: s * 0.85 };
+    bones[`${side}${f}Distal`] = { x: 0, y: 0, z: s * 0.7 };
+  }
+  // Pulgar escondido al otro lado (hiddenThumbBones iba al contrario en Q).
+  bones[`${side}ThumbMetacarpal`] = { x: s * -0.45, y: s * -0.55, z: s * 0.35 };
+  bones[`${side}ThumbProximal`] = { x: s * -0.3, y: s * -1.15, z: s * 0.2 };
+  bones[`${side}ThumbIntermediate`] = { x: 0, y: s * -0.75, z: 0 };
+  bones[`${side}ThumbDistal`] = { x: 0, y: s * -0.5, z: 0 };
+  return bones;
+}
+
+/**
+ * Letra C (LSM/ASL): arco redondo tipo “C”.
+ * - 4 dedos con el MISMO curl → yemas alineadas en el arco
+ * - curl fuerte → curva de C (no garra plana)
+ * - pulgar curvado hacia las yemas (cierra la mandíbula inferior)
+ */
+export function letterCFingerBones(side) {
+  const s = side === 'right' ? 1 : -1;
+  const bones = {};
+  // Mismo ángulo en los 4 → puntas alineadas; PIP alto = C redonda.
+  for (const f of ['Index', 'Middle', 'Ring', 'Little']) {
+    bones[`${side}${f}Proximal`] = { x: 0, y: 0, z: s * -0.62 };
+    bones[`${side}${f}Intermediate`] = { x: 0, y: 0, z: s * -1.05 };
+    bones[`${side}${f}Distal`] = { x: 0, y: 0, z: s * -0.55 };
+  }
+  // Pulgar se curva HACIA las yemas (no recto horizontal).
+  bones[`${side}ThumbProximal`] = {
+    x: s * -0.45,
+    y: s * 0.4,
+    z: s * -0.7,
+  };
+  bones[`${side}ThumbIntermediate`] = { x: 0, y: s * 0.22, z: s * -0.5 };
+  bones[`${side}ThumbDistal`] = { x: 0, y: s * 0.18, z: s * -0.55 };
+  return bones;
 }
 
 function handPresent(h) {
@@ -327,7 +755,11 @@ function handPresent(h) {
 }
 
 // Huesos de dedos de UN lado a partir de su mano. side: 'right' | 'left'.
-function handToFingerBones(hand, side) {
+function handToFingerBones(hand, side, { skipLetterK = false } = {}) {
+  // Letra K: forzar pulgar entre índice/medio (el curl genérico lo saca afuera).
+  // skipLetterK: la P grabada parece K geométricamente — no sustituir por K.
+  if (!skipLetterK && isLetterKHand(hand)) return letterKFingerBones(side);
+
   const sign = side === 'right' ? 1 : -1;   // curl: derecha +, izquierda −
   const ax = CONFIG.fingerAxis;
   const G = CONFIG.fingerGain, M = CONFIG.fingerMax;
@@ -347,7 +779,12 @@ function handToFingerBones(hand, side) {
   // El pulgar tiene otra orientación de reposo en este VRM: medido moviendo
   // punta-pulgar↔palma en el modelo, el eje que de verdad lo cierra es 'y'
   // (con 'z', el mismo de los otros 4 dedos, casi no se movía). thumbAxis.
+  // Metacarpal/Intermediate siempre a 0: letterL (y otras) pueden dejar Y
+  // en CMC y, como applyPose solo toca claves presentes, se “pegaba” a
+  // todas las señas siguientes.
+  bones[`${side}ThumbMetacarpal`] = { x: 0, y: 0, z: 0 };
   put(`${side}ThumbProximal`, tsign * tp * TG, CONFIG.thumbAxis);
+  bones[`${side}ThumbIntermediate`] = { x: 0, y: 0, z: 0 };
   put(`${side}ThumbDistal`,   tsign * ti * TG, CONFIG.thumbAxis);
   return bones;
 }
@@ -569,10 +1006,10 @@ export function despikeVec3Seq(seq, threshold) {
 }
 
 // API: huesos de dedos de la seña, según brazos activos.
-export function frameFingers(frame, arms = { right: true, left: true }) {
+export function frameFingers(frame, arms = { right: true, left: true }, opts = {}) {
   let out = {};
-  if (arms.right && handPresent(frame.lh)) out = { ...out, ...handToFingerBones(frame.lh, 'right') };
-  if (arms.left && handPresent(frame.rh)) out = { ...out, ...handToFingerBones(frame.rh, 'left') };
+  if (arms.right && handPresent(frame.lh)) out = { ...out, ...handToFingerBones(frame.lh, 'right', opts) };
+  if (arms.left && handPresent(frame.rh)) out = { ...out, ...handToFingerBones(frame.rh, 'left', opts) };
   return out;
 }
 

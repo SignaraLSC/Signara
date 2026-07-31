@@ -211,3 +211,96 @@ def resolve_como_familia(frames_compact: np.ndarray) -> dict:
         "orbit_rad": float(orbit_rad),
         "reason": preferred or "ambiguous",
     }
+
+
+def _mean_hand(hand_seq: np.ndarray) -> np.ndarray:
+    return hand_seq.mean(axis=0)
+
+
+def _has_enye_sweep(hand_seq: np.ndarray) -> bool:
+    """Barrido deliberado de Ñ: meñique vs muñeca, dirección sostenida."""
+    if hand_seq is None or len(hand_seq) < 6:
+        return False
+
+    rel_pinky = hand_seq[:, PINKY_TIP, :2] - hand_seq[:, WRIST, :2]
+    rel_index = hand_seq[:, INDEX_TIP, :2] - hand_seq[:, WRIST, :2]
+    rel_middle = hand_seq[:, MIDDLE_TIP, :2] - hand_seq[:, WRIST, :2]
+
+    idx_steps = np.linalg.norm(np.diff(rel_index, axis=0), axis=1)
+    mid_steps = np.linalg.norm(np.diff(rel_middle, axis=0), axis=1)
+    if len(idx_steps) and max(float(idx_steps.max()), float(mid_steps.max())) > 0.028:
+        return False
+
+    net = float(np.linalg.norm(rel_pinky[-1] - rel_pinky[0]))
+    steps = np.diff(rel_pinky, axis=0)
+    step_lens = np.linalg.norm(steps, axis=1)
+
+    best_run = 0.0
+    run = 0.0
+    prev_dx = 0.0
+    prev_dy = 0.0
+    for i, (dx, dy) in enumerate(steps):
+        slen = float(step_lens[i])
+        if slen < 0.007:
+            run = 0.0
+            continue
+        same_dir = i == 0 or (dx * prev_dx + dy * prev_dy) > 0
+        run = (run + slen) if same_dir else slen
+        best_run = max(best_run, run)
+        prev_dx = float(dx)
+        prev_dy = float(dy)
+
+    return net >= 0.048 and best_run >= 0.038
+
+
+def _looks_like_n(hand: np.ndarray) -> bool:
+    ie = _finger_extension(hand, INDEX_MCP, INDEX_TIP)
+    me = _finger_extension(hand, MIDDLE_MCP, MIDDLE_TIP)
+    re = _finger_extension(hand, RING_MCP, RING_TIP)
+    pe = _finger_extension(hand, PINKY_MCP, PINKY_TIP)
+    if ie < 0.55 or me < 0.50 or me < ie * 0.72:
+        return False
+    two = min(ie, me)
+    return re <= 1.05 and two - re >= 0.015 and pe <= 1.18
+
+
+def _is_index_middle_n_shape(hand: np.ndarray) -> bool:
+    ie = _finger_extension(hand, INDEX_MCP, INDEX_TIP)
+    me = _finger_extension(hand, MIDDLE_MCP, MIDDLE_TIP)
+    return ie >= 0.50 and me >= ie * 0.68
+
+
+def _looks_like_p(hand: np.ndarray) -> bool:
+    ie = _finger_extension(hand, INDEX_MCP, INDEX_TIP)
+    me = _finger_extension(hand, MIDDLE_MCP, MIDDLE_TIP)
+    re = _finger_extension(hand, RING_MCP, RING_TIP)
+    pe = _finger_extension(hand, PINKY_MCP, PINKY_TIP)
+    if ie < 0.48 or me >= ie * 0.72:
+        return False
+    return me <= 0.68 and re <= 1.12 and pe <= 1.12
+
+
+def correct_spelling_letter(prediction: str, frames: np.ndarray) -> str:
+    """Correcciones mínimas N/Ñ/P en deletreo (letters_only)."""
+    pred = (prediction or "").upper()
+    if pred not in {"P", "N", "Ñ", "M", "SI"}:
+        return prediction
+    seq = _pick_active_hand(frames)
+    if seq is None:
+        return prediction
+    hand = _mean_hand(seq[-min(8, len(seq)):])
+    enye_sweep = _has_enye_sweep(seq)
+    ie = _finger_extension(hand, INDEX_MCP, INDEX_TIP)
+    me = _finger_extension(hand, MIDDLE_MCP, MIDDLE_TIP)
+    # Checkpoint L3477: medio ≥ 68 % del índice → N (aunque el GNN diga P).
+    if _is_index_middle_n_shape(hand):
+        return "Ñ" if enye_sweep else "N"
+    if _looks_like_n(hand):
+        return "Ñ" if enye_sweep else "N"
+    if pred == "Ñ" and not enye_sweep:
+        return "N"
+    if pred == "P" and me >= ie * 0.68 and ie >= 0.50:
+        return "Ñ" if enye_sweep else "N"
+    if _looks_like_p(hand):
+        return "P"
+    return prediction

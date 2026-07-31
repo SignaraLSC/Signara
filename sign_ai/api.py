@@ -33,7 +33,7 @@ from core.gnn_model import GCN_LSTM, SEQ_LEN
 from core.confusion import evaluate_prediction
 from core.direction_reader import classify_direction
 from core.directional_verbs import DIRECTIONAL_VERBS, conjugate
-from core.handshape_hints import looks_like_ily, resolve_como_familia
+from core.handshape_hints import correct_spelling_letter, looks_like_ily, resolve_como_familia
 from core.preprocess import sequence_compact_to_gnn
 
 # ─── Rutas ────────────────────────────────────────────────────────────────────
@@ -131,6 +131,7 @@ async def load_model():
 class PredictRequest(BaseModel):
     # 30 frames × 126 valores (lh 63 + rh 63)
     frames: list[list[float]]
+    letters_only: bool = False
 
 
 class PredictResponse(BaseModel):
@@ -183,26 +184,41 @@ async def predict(req: PredictRequest):
         logits = _model(x)
         probs = torch.softmax(logits, dim=1)[0].cpu().numpy()
 
+    letters_only = bool(req.letters_only)
+    min_conf = 0.70 if letters_only else UMBRAL_CONFIANZA
+    min_margin = 0.12 if letters_only else MARGEN_TOP2
+
+    if letters_only:
+        masked = np.zeros_like(probs)
+        for i, lab in enumerate(_labels):
+            if (len(lab) == 1 and lab.replace("Ñ", "N").isalpha()) or lab == "IDLE":
+                masked[i] = probs[i]
+        total = float(masked.sum())
+        if total <= 1e-8:
+            return PredictResponse(prediction="", confidence=0.0, is_idle=True)
+        probs = masked / total
+
     prediction, confidence, margin = evaluate_prediction(
         _labels,
         probs,
-        min_conf=UMBRAL_CONFIANZA,
-        min_margin=MARGEN_TOP2,
+        min_conf=min_conf,
+        min_margin=min_margin,
     )
 
     # TE_AMO (forma ILY): el GNN lo confunde con NO/SI/IDLE (y a veces otras).
     # Si la geometría dice ILY, forzar TE_AMO — la forma es lo bastante distintiva.
-    ily = looks_like_ily(data)
-    if ily.get("ily") and "TE_AMO" in _labels and prediction != "TE_AMO":
-        te_idx = _labels.index("TE_AMO")
-        te_p = float(probs[te_idx])
-        ily_score = float(ily.get("score") or 0)
-        prediction = "TE_AMO"
-        confidence = max(te_p, ily_score, UMBRAL_CONFIANZA * 0.95)
+    if not letters_only:
+        ily = looks_like_ily(data)
+        if ily.get("ily") and "TE_AMO" in _labels and prediction != "TE_AMO":
+            te_idx = _labels.index("TE_AMO")
+            te_p = float(probs[te_idx])
+            ily_score = float(ily.get("score") or 0)
+            prediction = "TE_AMO"
+            confidence = max(te_p, ily_score, UMBRAL_CONFIANZA * 0.95)
 
     # COMO_ESTAS ↔ FAMILIA: geo solo si el GNN ya apunta a ese par (o es top-2).
     # No forzar con prediction=None genérico + prob residual (inventaba FAMILIA/COMO).
-    if "COMO_ESTAS" in _labels and "FAMILIA" in _labels:
+    if not letters_only and "COMO_ESTAS" in _labels and "FAMILIA" in _labels:
         como_i = _labels.index("COMO_ESTAS")
         fam_i = _labels.index("FAMILIA")
         como_p = float(probs[como_i])
@@ -259,6 +275,9 @@ async def predict(req: PredictRequest):
     # quieta se reconoce y se muestra/dice como si fuera una seña más.
     if prediction is None or prediction == "IDLE":
         return PredictResponse(prediction="", confidence=confidence, is_idle=True)
+
+    if letters_only and prediction:
+        prediction = correct_spelling_letter(prediction, data)
 
     # Fase 2B: conjugación geométrica (AYUDA→AYUDAME/…, TE_AMO→ME_AMAS/…).
     # TE_AMO usa umbrales propios (ILY estático → cita, no inventar ME_AMAS).

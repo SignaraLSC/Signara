@@ -29,11 +29,8 @@ import {
   getStoredOutputLang,
 } from '../data/outputLanguages.js'
 import { translateFromSpanish } from '../utils/translateApi.js'
-import { maybeCorrectTeAmo, maybeCorrectComoFamilia } from '../utils/handshapeHints.js'
+import { maybeCorrectTeAmo, maybeCorrectComoFamilia, maybeCorrectSpellingGNMNÑ } from '../utils/handshapeHints.js'
 import { isLetterToken } from '../utils/fingerspell.js'
-
-/** Tras la última letra, esperar este tiempo sin nueva letra → emitir el nombre. */
-const SPELL_FLUSH_MS = 1000
 
 // Migrado de @mediapipe/holistic (legacy) a @mediapipe/tasks-vision:
 // HandLandmarker con GPU, solo manos. FaceLandmarker se pospuso: no se usa
@@ -61,10 +58,8 @@ const NO_HAND_RESET  = 12
 const PREDICT_TIMEOUT_MS = 12000
 // Buffer: tolera parpadeos de tracking sin vaciar la seña.
 const NO_HAND_GRACE  = 8
-const POST_CONFIRM_WAIT = 8
 // Mínimo de frames reales para mandar a /predict.
 const MIN_FRAMES     = 8
-
 // ── Fin de seña (camino principal, tiempo real) ─────────────────────────────
 const STOP_FRAMES = 4
 const STOP_FRAC   = 0.4
@@ -76,7 +71,45 @@ const MOVED_MIN   = 0.018
 const HELD_MOVED_MIN = 0.003
 const HELD_MIN_FRAMES = 12
 
-const LIVE_STRIDE = 4
+/** Tras emitir letra/seña: no /predict hasta cambio real de pose. */
+const POSE_UNLOCK_MIN = 0.014
+/** Desbloqueo entre letras: cambio de extensión de dedos (invariante a posición en cámara). */
+const FINGER_PROFILE_UNLOCK = 0.038
+const FINGER_PROFILE_SAME = 0.028
+const SHAPE_UNLOCK_FRAMES = 3
+/** Deletreo: forma completa (palabras léxicas). */
+const SHAPE_UNLOCK_MIN = 0.026
+/** Fase A: dedos cambiando entre frames. */
+const FINGER_MOTION_MIN = 0.020
+const CONFIRM_BLOCK_FINGER = 0.026
+const CONFIRM_BLOCK_MOVEMENT = MOVED_MIN * 0.55
+
+/** Deletreo / 1ª letra: mano estática, umbrales más ágiles. */
+const SPELL_MIN_FRAMES = 5
+const SPELL_HELD_MIN = 4
+const SPELL_STOP_FRAMES = 3
+const SPELL_UMBRAL = 0.80
+const SPELL_STABILITY = 2
+
+function isLetterMode(len, stillPeak, stillCount, spellBufLen, gesturePeak) {
+  if (len < SPELL_HELD_MIN || stillCount < SPELL_STOP_FRAMES) return false
+  if (spellBufLen > 0) {
+    // Deletreo activo: tolerar micro-movimiento al cambiar dedos entre letras.
+    if (stillPeak >= MOVED_MIN * 1.35) return false
+    return true
+  }
+  if (stillPeak >= MOVED_MIN) return false
+  return gesturePeak < MOVED_MIN * 1.8
+}
+
+function wantsLettersOnly(spellBufLen, letterMode) {
+  return spellBufLen > 0 || letterMode
+}
+
+
+// Segmentador / HUD: no en cada frame del camino crítico de landmarks.
+const SEGMENT_EVERY_N = 6
+const HUD_UPDATE_EVERY_N = 12
 
 // Inferencia: equilibrio velocidad / tracking (izq. sufría a 160×120).
 const DETECT_W = 192
@@ -272,6 +305,92 @@ function frameMovement(prev, curr) {
   return n > 0 ? sum / n : 0
 }
 
+/** Bloque activo (lh o rh) del frame compacto 126. */
+function activeHandBlock(frame) {
+  if (!frame?.length) return null
+  const lh = frame.slice(0, 63)
+  const rh = frame.slice(63, 126)
+  const lhSum = lh.reduce((s, v) => s + Math.abs(v), 0)
+  const rhSum = rh.reduce((s, v) => s + Math.abs(v), 0)
+  if (lhSum < 1e-6 && rhSum < 1e-6) return null
+  return lhSum >= rhSum ? lh : rh
+}
+
+/** Distancia media entre poses (dedos), invariante a traslación de muñeca. */
+function handShapeDistance(a, b) {
+  const ha = activeHandBlock(a)
+  const hb = activeHandBlock(b)
+  if (!ha || !hb) return 0
+  const wx = ha[0], wy = ha[1]
+  const wx2 = hb[0], wy2 = hb[1]
+  const scale =
+    Math.hypot(ha[9] - wx, ha[10] - wy) ||
+    Math.hypot(hb[9] - wx2, hb[10] - wy2) ||
+    1e-4
+  let sum = 0
+  let n = 0
+  for (let i = 0; i < 21; i++) {
+    const o = i * 3
+    const dx = (ha[o] - wx) - (hb[o] - wx2)
+    const dy = (ha[o + 1] - wy) - (hb[o + 1] - wy2)
+    sum += Math.hypot(dx, dy) / scale
+    n++
+  }
+  return n ? sum / n : 0
+}
+
+/** Cambio de configuración de dedos (puntas + nudillos + pulgar), invariante a muñeca. */
+function fingerConfigDistance(a, b) {
+  const ha = activeHandBlock(a)
+  const hb = activeHandBlock(b)
+  if (!ha || !hb) return 0
+  const wx = ha[0], wy = ha[1]
+  const wx2 = hb[0], wy2 = hb[1]
+  const scale =
+    Math.hypot(ha[9] - wx, ha[10] - wy) ||
+    Math.hypot(hb[9] - wx2, hb[10] - wy2) ||
+    1e-4
+  const landmarks = [4, 5, 8, 9, 12, 13, 16, 17, 20]
+  let sum = 0
+  for (const li of landmarks) {
+    const o = li * 3
+    const dx = (ha[o] - wx) - (hb[o] - wx2)
+    const dy = (ha[o + 1] - wy) - (hb[o + 1] - wy2)
+    sum += Math.hypot(dx, dy) / scale
+  }
+  return sum / landmarks.length
+}
+
+/** Extensión tip↔MCP relativa a muñeca — estable al mover la mano en el espacio. */
+function fingerExtFromBlock(block, mcp, tip) {
+  const wx = block[0]
+  const wy = block[1]
+  const bone = Math.hypot(block[mcp * 3] - wx, block[mcp * 3 + 1] - wy) || 1e-4
+  const tipLen = Math.hypot(
+    block[tip * 3] - block[mcp * 3],
+    block[tip * 3 + 1] - block[mcp * 3 + 1],
+  )
+  return tipLen / bone
+}
+
+/** Distancia entre perfiles de extensión (índice/medio/anular/meñique). */
+function fingerProfileDistance(a, b) {
+  const ha = activeHandBlock(a)
+  const hb = activeHandBlock(b)
+  if (!ha || !hb) return 0
+  const pairs = [[5, 8], [9, 12], [13, 16], [17, 20]]
+  let sum = 0
+  for (const [mcp, tip] of pairs) {
+    sum += Math.abs(fingerExtFromBlock(ha, mcp, tip) - fingerExtFromBlock(hb, mcp, tip))
+  }
+  return sum / pairs.length
+}
+
+/** Mayor sensibilidad al cambiar letra sin mover la mano en el espacio. */
+function spellingShapeDelta(a, b) {
+  return Math.max(handShapeDistance(a, b), fingerProfileDistance(a, b))
+}
+
 // ── Componente principal ──────────────────────────────────────────────────────
 
 export default function InterpretScreen({ onBack, onHome }) {
@@ -299,21 +418,31 @@ export default function InterpretScreen({ onBack, onHome }) {
   const prevFrameRef      = useRef(null) // frame anterior para calcular movimiento
   const noHandCountRef    = useRef(0)    // frames consecutivos sin manos
   const stillCountRef     = useRef(0)    // frames consecutivos "detenido" (mano visible)
-  const peakMovementRef   = useRef(0)    // pico de movimiento de la seña en curso (umbral adaptativo)
-  const cooldownRef       = useRef(0)    // cooldown frame-based
-  const lastSignRef       = useRef('')   // última seña confirmada (evita repetir)
-  const announcedUpRef    = useRef('')   // ya anunciada con manos arriba (evita doble voz)
-  const spellBufRef       = useRef([])   // letras acumuladas (deletreo → nombre)
-  const spellTimerRef     = useRef(null)
-  const letterRepeatTimerRef = useRef(null) // libera L+L tras el brinco
-  const lastLiveAtRef     = useRef(0)    // len del buffer en la última predicción live
+  const stillPeakRef      = useRef(0)    // movimiento max durante la pausa actual
+  const gesturePeakRef    = useRef(0)    // movimiento max antes de la pausa (señas dinámicas)
+  const pauseFiredRef     = useRef(false) // evita repetir /predict en la misma pausa
+  const peakMovementRef   = useRef(0)
+  const inferenceLockedRef = useRef(false) // ya emitió: no /predict hasta cambio de pose
+  const movementSinceEmitRef = useRef(0)
+  const lastSignRef       = useRef('')
+  const announcedUpRef    = useRef('')
+  const spellBufRef       = useRef([])
   const apiInFlightRef    = useRef(false)
   const mlAvailableRef    = useRef(false)
   const sentenceClearRef  = useRef(null)
   const handleResultsRef  = useRef(() => {})
+  const lockedPoseRef     = useRef(null)
+  const lastPredictFrameRef = useRef(null)
+  const shapeUnlockStreakRef = useRef(0)
+  const spellUnlockGenRef = useRef(0)
+  const lastLetterUnlockGenRef = useRef(0)
+  const motionSincePredictRef = useRef(false)
+  const handStillRef = useRef(true)
+  const deliberateMotionRef = useRef(false)
+  const hudTickRef        = useRef(0)
+  const lastHudStatusRef  = useRef('')
   const handWasVisibleRef = useRef(false)
   const handVisibleRef      = useRef(false)
-  const inCooldownRef       = useRef(false)
   const bufferHudRef        = useRef(null)
   const statusTextRef       = useRef(null)
   const handBadgeRef        = useRef(null)
@@ -349,13 +478,13 @@ export default function InterpretScreen({ onBack, onHome }) {
   const [mlConnecting,  setMlConnecting]  = useState(false)
   const [audioOn,       setAudioOn]       = useState(true)
   const [studioBg,      setStudioBg]      = useState(() => {
-    try { return localStorage.getItem('signara:studioBg') !== '0' } catch { return true }
+    try { return localStorage.getItem('signara:studioBg') === '1' } catch { return false }
   })
   const [handVisible,   setHandVisible]   = useState(false)
   const [bufferLen,     setBufferLen]     = useState(0)
-  const [inCooldown,    setInCooldown]    = useState(false)
   const [displaySign,   setDisplaySign]   = useState('')
   const [displayConf,   setDisplayConf]   = useState(0)
+  const [spellPreview,  setSpellPreview]  = useState('') // "A B C" mientras deletrea
   const [latest,        setLatest]        = useState(null)
   const [history,       setHistory]       = useState([])
   const [sentence,      setSentence]      = useState([])
@@ -428,9 +557,9 @@ export default function InterpretScreen({ onBack, onHome }) {
     }
   }, [])
 
-  // Segmenter solo con «Fondo estudio» activo.
+  // Segmenter solo con «Fondo estudio» activo Y mientras se interpreta (no en preview).
   useEffect(() => {
-    if (!studioBg) {
+    if (!studioBg || !running) {
       blurReadyRef.current = false
       return
     }
@@ -448,7 +577,7 @@ export default function InterpretScreen({ onBack, onHome }) {
       cancelled = true
       blurReadyRef.current = false
     }
-  }, [studioBg])
+  }, [studioBg, running])
 
   // ── Cámara (solo tras consentimiento del usuario) ──────────────────────────
   // Ya no depende de @mediapipe/camera_utils (esa librería CDN tampoco se
@@ -660,14 +789,24 @@ export default function InterpretScreen({ onBack, onHome }) {
   }
 
   function flushSpellBuffer() {
-    if (spellTimerRef.current) {
-      clearTimeout(spellTimerRef.current)
-      spellTimerRef.current = null
-    }
     const letters = spellBufRef.current
     spellBufRef.current = []
+    setSpellPreview('')
+
+    const resetSpellingInference = () => {
+      inferenceLockedRef.current = false
+      movementSinceEmitRef.current = 0
+      lastSignRef.current = ''
+      predHistRef.current = []
+      announcedUpRef.current = ''
+      lockedPoseRef.current = null
+      shapeUnlockStreakRef.current = 0
+      pauseFiredRef.current = false
+    }
+
     // Letras sueltas no se anuncian: solo nombres (≥2 letras).
     if (letters.length < 2) {
+      resetSpellingInference()
       if (letters.length === 1) {
         setDisplaySign('')
         setDisplayConf(0)
@@ -684,11 +823,13 @@ export default function InterpretScreen({ onBack, onHome }) {
       status: `${name} · deletreo`,
     })
     triggerRecognition(name, conf)
+    resetSpellingInference()
   }
 
   function updateCaptureHud(_len, { showHud, status }) {
-    if (statusTextRef.current && status) {
-      statusTextRef.current.textContent = status
+    if (status && status !== lastHudStatusRef.current) {
+      lastHudStatusRef.current = status
+      if (statusTextRef.current) statusTextRef.current.textContent = status
     }
     // Solo opacidad: el hueco del HUD está siempre reservado → la card de
     // cámara no baja ni salta entre seña y seña.
@@ -705,89 +846,118 @@ export default function InterpretScreen({ onBack, onHome }) {
     predHistRef.current       = []
     prevFrameRef.current      = null
     stillCountRef.current     = 0
+    stillPeakRef.current      = 0
+    gesturePeakRef.current    = 0
+    pauseFiredRef.current     = false
     peakMovementRef.current   = 0
     lastSignRef.current       = ''
     announcedUpRef.current    = ''
-    cooldownRef.current       = 0
+    inferenceLockedRef.current = false
+    movementSinceEmitRef.current = 0
+    lockedPoseRef.current     = null
+    lastPredictFrameRef.current = null
+    shapeUnlockStreakRef.current = 0
+    spellUnlockGenRef.current = 0
+    lastLetterUnlockGenRef.current = 0
+    motionSincePredictRef.current = false
+    handStillRef.current = true
+    deliberateMotionRef.current = false
     apiInFlightRef.current    = false
-    lastLiveAtRef.current     = 0
     handVisibleRef.current    = false
     drawLeftRef.current = null
     drawRightRef.current = null
-    if (spellTimerRef.current) {
-      clearTimeout(spellTimerRef.current)
-      spellTimerRef.current = null
-    }
-    if (letterRepeatTimerRef.current) {
-      clearTimeout(letterRepeatTimerRef.current)
-      letterRepeatTimerRef.current = null
-    }
     spellBufRef.current = []
+    setSpellPreview('')
+    lastHudStatusRef.current = ''
     if (handBadgeRef.current) handBadgeRef.current.style.display = 'none'
     setHandVisible(false)
     setBufferLen(0)
-    setInCooldown(false)
-    inCooldownRef.current   = false
     updateCaptureHud(0, { showHud: false, status: 'Listo' })
     setDisplaySign('')
     setDisplayConf(0)
   }, [])
 
   function confirmSign(prediction, confidence) {
-    lastSignRef.current       = prediction
-    cooldownRef.current       = POST_CONFIRM_WAIT
+    if (motionSincePredictRef.current) return
+
+    const predUp = String(prediction).toUpperCase()
+
+    // Deletreo activo: ignorar palabras léxicas (HOLA, SI, NO…).
+    if (spellBufRef.current.length > 0 && !isLetterToken(predUp)) return
+
+    if (isLetterToken(predUp)) {
+      if (spellBufRef.current.at(-1) === predUp) return
+      if (
+        lockedPoseRef.current &&
+        lastPredictFrameRef.current &&
+        fingerProfileDistance(lastPredictFrameRef.current, lockedPoseRef.current) <
+          FINGER_PROFILE_SAME
+      ) {
+        return
+      }
+
+      lastLetterUnlockGenRef.current = spellUnlockGenRef.current
+      lockedPoseRef.current = lastPredictFrameRef.current
+      spellBufRef.current.push(predUp)
+      const spaced = spellBufRef.current.join(' ')
+      setSpellPreview(spaced)
+      setDisplaySign('')
+      setDisplayConf(confidence)
+      updateCaptureHud(0, { showHud: false, status: `Deletreando: ${spaced}` })
+
+      lastSignRef.current = predUp
+      inferenceLockedRef.current = true
+      movementSinceEmitRef.current = 0
+      landmarkBufferRef.current = []
+      predHistRef.current       = []
+      prevFrameRef.current      = null
+      stillCountRef.current     = 0
+      stillPeakRef.current      = 0
+      pauseFiredRef.current     = true
+      peakMovementRef.current   = 0
+      gesturePeakRef.current    = 0
+      shapeUnlockStreakRef.current = 0
+      setBufferLen(0)
+      return
+    }
+
+    lastSignRef.current = predUp
+    inferenceLockedRef.current = true
+    movementSinceEmitRef.current = 0
+    lockedPoseRef.current = lastPredictFrameRef.current
     landmarkBufferRef.current = []
     predHistRef.current       = []
     prevFrameRef.current      = null
     stillCountRef.current     = 0
+    stillPeakRef.current      = 0
+    pauseFiredRef.current     = true
     peakMovementRef.current   = 0
-    lastLiveAtRef.current     = 0
+    gesturePeakRef.current    = 0
+    shapeUnlockStreakRef.current = 0
 
-    inCooldownRef.current = true
     setBufferLen(0)
-    setInCooldown(true)
 
-    // Deletreo: acumular letras y emitir el nombre al cerrar el buffer.
-    if (isLetterToken(prediction)) {
-      spellBufRef.current.push(String(prediction).toUpperCase())
-      const partial = spellBufRef.current.join('')
-      setDisplaySign(partial)
-      setDisplayConf(confidence)
-      updateCaptureHud(0, {
-        showHud: false,
-        status: `${partial} · deletreando…`,
-      })
-      if (spellTimerRef.current) clearTimeout(spellTimerRef.current)
-      spellTimerRef.current = setTimeout(() => flushSpellBuffer(), SPELL_FLUSH_MS)
-      // LL / RR: tras el cooldown, liberar la misma letra para el brinco
-      // (sin vaciar lastSign al instante → evitar LLLLL al sostener).
-      if (letterRepeatTimerRef.current) clearTimeout(letterRepeatTimerRef.current)
-      const letter = String(prediction).toUpperCase()
-      letterRepeatTimerRef.current = setTimeout(() => {
-        if (lastSignRef.current === letter) lastSignRef.current = ''
-      }, 420)
-      return
-    }
-
-    // Seña léxica: cerrar nombre en curso (si había) y luego la seña.
     if (spellBufRef.current.length) flushSpellBuffer()
 
-    setDisplaySign(prediction)
+    setDisplaySign(predUp)
     setDisplayConf(confidence)
-    updateCaptureHud(0, { showHud: false, status: `${prediction.replace(/_/g, ' ')} · ${Math.round(confidence * 100)}%` })
+    updateCaptureHud(0, { showHud: false, status: `${predUp.replace(/_/g, ' ')} · ${Math.round(confidence * 100)}%` })
 
-    // Ya se anunció esta seña con las manos arriba → no repetir al bajarlas.
-    if (announcedUpRef.current === prediction) return
-    announcedUpRef.current = prediction
-    triggerRecognition(prediction, confidence)
+    if (announcedUpRef.current === predUp) return
+    announcedUpRef.current = predUp
+    triggerRecognition(predUp, confidence)
   }
 
-  function runPrediction(frames, { finalize = false } = {}) {
+  function runPrediction(frames, { finalize = false, lettersOnly = false } = {}) {
     if (!runningRef.current || !mlAvailableRef.current) return
-    if (cooldownRef.current > 0 || apiInFlightRef.current) return
-    if (frames.length < MIN_FRAMES) return
+    if (inferenceLockedRef.current || apiInFlightRef.current) return
+    const minFrames = lettersOnly ? SPELL_MIN_FRAMES : MIN_FRAMES
+    if (frames.length < minFrames) return
 
     const bufferCopy = padBuffer([...frames])
+    lastPredictFrameRef.current = bufferCopy[bufferCopy.length - 1] ?? null
+    const useLetters = lettersOnly || spellBufRef.current.length > 0
+    motionSincePredictRef.current = false
     apiInFlightRef.current = true
 
     const controller = new AbortController()
@@ -798,59 +968,73 @@ export default function InterpretScreen({ onBack, onHome }) {
         const resp = await fetch(`${ML_API_URL}/predict`, {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
-          body:    JSON.stringify({ frames: bufferCopy }),
+          body:    JSON.stringify({ frames: bufferCopy, letters_only: useLetters }),
           signal:  controller.signal,
         })
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
 
         const { prediction: rawPred, confidence, is_idle } = await resp.json()
-        // Cinturón en cliente: forma ILY → TE_AMO; F/separación → COMO↔FAMILIA.
-        let prediction = maybeCorrectTeAmo(rawPred || '', bufferCopy)
-        const isTeAmoFamily = ['TE_AMO', 'ME_AMAS', 'ME_AMA', 'LO_AMO', 'LA_AMO', 'NOS_AMAMOS', 'YO_TE_AMO'].includes(
-          String(prediction || '').toUpperCase(),
-        )
-        if (!isTeAmoFamily) {
-          prediction = maybeCorrectComoFamilia(prediction || rawPred || '', bufferCopy) || ''
+        let prediction = String(rawPred || '').toUpperCase()
+        const teAmoFamily = new Set([
+          'TE_AMO', 'ME_AMAS', 'ME_AMA', 'LO_AMO', 'LA_AMO', 'NOS_AMAMOS', 'YO_TE_AMO',
+        ])
+
+        if (useLetters) {
+          if (!prediction || is_idle || !isLetterToken(prediction)) return
+          prediction = maybeCorrectSpellingGNMNÑ(prediction, bufferCopy)
+          if (!isLetterToken(prediction)) return
+        } else {
+          prediction = maybeCorrectTeAmo(rawPred || '', bufferCopy)
+          const isTeAmo = teAmoFamily.has(String(prediction || '').toUpperCase())
+          if (!isTeAmo) {
+            prediction = maybeCorrectComoFamilia(prediction || rawPred || '', bufferCopy) || ''
+          }
+          if ((is_idle && !teAmoFamily.has(String(prediction || '').toUpperCase())) || !prediction) return
         }
-        if ((is_idle && !isTeAmoFamily) || !prediction) return
+
+        const letterPred = isLetterToken(prediction)
+        const inSpellFlow = useLetters || letterPred
+        const needStable = inSpellFlow ? SPELL_STABILITY : STABILITY_NEED
+        const confFloor = inSpellFlow ? SPELL_UMBRAL : UMBRAL
 
         predHistRef.current.push(prediction)
-        if (predHistRef.current.length > STABILITY_NEED) {
-          predHistRef.current.shift()
-        }
+        if (predHistRef.current.length > needStable) predHistRef.current.shift()
         const stable =
-          predHistRef.current.length >= STABILITY_NEED &&
+          predHistRef.current.length >= needStable &&
           new Set(predHistRef.current).size === 1
 
-        // Fin de seña: umbral más alto; si ya hubo estabilidad en live, vale
-        // UMBRAL normal. Evita confirmar la primera hipótesis al soltar la mano.
+        if (prediction === lastSignRef.current) return
+        if (useLetters && motionSincePredictRef.current) return
+
+        let confirmed = false
+
         if (
           finalize &&
           prediction !== lastSignRef.current &&
+          !motionSincePredictRef.current &&
           (
-            (stable && confidence >= UMBRAL) ||
-            confidence >= FINALIZE_UMBRAL
+            useLetters
+              ? confidence >= confFloor
+              : (stable && confidence >= confFloor) || confidence >= FINALIZE_UMBRAL
           )
         ) {
           confirmSign(prediction, confidence)
-          return
-        }
-
-        // Live: casi nunca 1-shot (HIGH_CONF_INSTANT ≈ 0.96); lo normal es
-        // STABILITY_NEED predicciones idénticas por encima del umbral.
-        if (
+          confirmed = true
+        } else if (
           !finalize &&
           prediction !== lastSignRef.current &&
-          confidence >= UMBRAL &&
-          (stable || confidence >= HIGH_CONF_INSTANT)
+          confidence >= confFloor &&
+          (stable || confidence >= HIGH_CONF_INSTANT) &&
+          !motionSincePredictRef.current
         ) {
           confirmSign(prediction, confidence)
+          confirmed = true
+        }
+
+        if (!confirmed && useLetters && pauseFiredRef.current && !inferenceLockedRef.current && deliberateMotionRef.current) {
+          pauseFiredRef.current = false
         }
       } catch {
-        // Incluye abort por timeout: se trata igual que cualquier otra falla
-        // de red. Marca el servidor como no disponible (igual que antes) y
-        // muestra el botón de "Reintentar conexión" — evita quedar con el
-        // HUD colgado en "Detectando…" sin ninguna explicación ni salida.
         mlAvailableRef.current = false
         setMlMode(false)
       } finally {
@@ -862,164 +1046,240 @@ export default function InterpretScreen({ onBack, onHome }) {
 
   // ── Callback principal de MediaPipe ───────────────────────────────────────
   function handleResults(results) {
-    const canvas = canvasRef.current
-    const video  = videoRef.current
-    if (!canvas || !video) return
-
-    const hasLeft  = !!results.leftHandLandmarks
+    const hasLeft = !!results.leftHandLandmarks
     const hasRight = !!results.rightHandLandmarks
-    const hasHands = hasLeft || hasRight
-
-    // Overlay: siempre el frame actual. Sin manos → puntos fuera YA
-    // (antes NO_HAND_GRACE los dejaba “pegados” ~1 s).
     drawLeftRef.current = hasLeft ? copyHandLandmarks(results.leftHandLandmarks) : null
     drawRightRef.current = hasRight ? copyHandLandmarks(results.rightHandLandmarks) : null
 
-    const wasHandVisible = handVisibleRef.current
-    handVisibleRef.current = hasHands
-    if (wasHandVisible !== hasHands) {
-      // Solo al aparecer/desaparecer (raro), no cada frame.
-      setHandVisible(hasHands)
-      if (handBadgeRef.current) {
+    const hasHands = hasLeft || hasRight
+    if (handVisibleRef.current !== hasHands) {
+      handVisibleRef.current = hasHands
+      if (runningRef.current) setHandVisible(hasHands)
+      if (handBadgeRef.current && runningRef.current) {
         handBadgeRef.current.style.display = hasHands ? '' : 'none'
       }
     }
 
-    if (cooldownRef.current > 0) cooldownRef.current--
+    if (!runningRef.current) return
 
-    const cooling = cooldownRef.current > 0
-    if (inCooldownRef.current !== cooling) {
-      inCooldownRef.current = cooling
-      // Cooldown es raro (tras confirmar seña); ahí sí podemos pintar React.
-      setInCooldown(cooling)
-    }
-
-    // ── Sin manos ────────────────────────────────────────────────────────────
     if (!hasHands) {
       noHandCountRef.current++
 
-      // Parpadeo momentáneo: conservar BUFFER para no romper la seña, pero
-      // los puntos ya se limpiaron arriba (no se quedan pegados).
       if (handWasVisibleRef.current && noHandCountRef.current < NO_HAND_GRACE) {
-        const status = mlMode ? 'Detectando…' : 'Servidor IA no conectado'
-        updateCaptureHud(landmarkBufferRef.current.length, { showHud: true, status })
         return
       }
 
-      // Pérdida sostenida: ahí sí se acabó la seña — predecir con lo
-      // capturado y reiniciar el pipeline.
       const hadHands = handWasVisibleRef.current
       const snapshot = hadHands ? [...landmarkBufferRef.current] : []
+      const skipFinalize = inferenceLockedRef.current
+      const letterModeDrop = isLetterMode(
+        snapshot.length,
+        stillPeakRef.current,
+        stillCountRef.current,
+        spellBufRef.current.length,
+        gesturePeakRef.current,
+      )
 
       landmarkBufferRef.current = []
       prevFrameRef.current      = null
       stillCountRef.current     = 0
+      stillPeakRef.current      = 0
+      gesturePeakRef.current    = 0
+      pauseFiredRef.current     = false
       peakMovementRef.current   = 0
-      lastLiveAtRef.current     = 0
       handWasVisibleRef.current = false
+      inferenceLockedRef.current = false
+      movementSinceEmitRef.current = 0
 
-      const status = !runningRef.current
-        ? (cameraOk ? 'Listo' : 'Conectando…')
-        : (mlMode ? 'Muestra una mano' : 'Servidor IA no conectado')
-      updateCaptureHud(0, { showHud: false, status })
-
-      if (hadHands && snapshot.length >= MIN_FRAMES) {
-        runPrediction(snapshot, { finalize: true })
+      if (hadHands && snapshot.length >= SPELL_MIN_FRAMES && !skipFinalize && !apiInFlightRef.current && !pauseFiredRef.current) {
+        runPrediction(snapshot, {
+          finalize: true,
+          lettersOnly: wantsLettersOnly(spellBufRef.current.length, letterModeDrop),
+        })
       }
 
-      // Manos fuera un rato: cerrar deletreo en curso (nombre parcial).
-      if (noHandCountRef.current >= NO_HAND_RESET && spellBufRef.current.length) {
+      if (hadHands && spellBufRef.current.length >= 2) {
+        flushSpellBuffer()
+      } else if (noHandCountRef.current >= NO_HAND_RESET && spellBufRef.current.length) {
         flushSpellBuffer()
       }
 
       if (noHandCountRef.current >= NO_HAND_RESET) {
         predHistRef.current = []
-        // Manos fuera del todo: se puede volver a anunciar la misma seña.
         lastSignRef.current = ''
         announcedUpRef.current = ''
+      }
+
+      hudTickRef.current++
+      if (hudTickRef.current % HUD_UPDATE_EVERY_N === 0) {
+        const status = !runningRef.current
+          ? (cameraOk ? 'Listo' : 'Conectando…')
+          : (mlMode ? 'Muestra una mano' : 'Servidor IA no conectado')
+        updateCaptureHud(0, { showHud: false, status })
       }
       return
     }
 
-    // ── Con manos ────────────────────────────────────────────────────────────
-    noHandCountRef.current    = 0
+    noHandCountRef.current = 0
     handWasVisibleRef.current = true
 
-    const currFrame = extractLandmarks(results)   // crudo: alineado con el entrenamiento
-    const movement  = frameMovement(prevFrameRef.current, currFrame)
+    const currFrame = extractLandmarks(results)
+    const movement = frameMovement(prevFrameRef.current, currFrame)
+    const fingerDelta = prevFrameRef.current
+      ? fingerProfileDistance(prevFrameRef.current, currFrame)
+      : 0
     prevFrameRef.current = currFrame
+
+    if (movement > peakMovementRef.current) peakMovementRef.current = movement
+    if (stillCountRef.current === 0 && movement >= Math.max(STOP_ABS, peakMovementRef.current * STOP_FRAC)) {
+      gesturePeakRef.current = Math.max(gesturePeakRef.current, peakMovementRef.current)
+    }
+
+    const stopThreshold = Math.max(STOP_ABS, peakMovementRef.current * STOP_FRAC)
+    const handMoving = movement >= stopThreshold || fingerDelta >= FINGER_MOTION_MIN
+    handStillRef.current = !handMoving
+    const deliberateMotion =
+      movement >= CONFIRM_BLOCK_MOVEMENT || fingerDelta >= CONFIRM_BLOCK_FINGER
+    deliberateMotionRef.current = deliberateMotion
+    if (deliberateMotion) {
+      motionSincePredictRef.current = true
+      if (!inferenceLockedRef.current) predHistRef.current = []
+    }
+
+    if (inferenceLockedRef.current) {
+      movementSinceEmitRef.current += movement
+      const spelling = spellBufRef.current.length > 0
+      let unlocked = false
+      if (spelling && lockedPoseRef.current) {
+        const profileDelta = fingerProfileDistance(currFrame, lockedPoseRef.current)
+        if (profileDelta >= FINGER_PROFILE_UNLOCK) {
+          shapeUnlockStreakRef.current++
+        } else {
+          shapeUnlockStreakRef.current = 0
+        }
+        unlocked = shapeUnlockStreakRef.current >= SHAPE_UNLOCK_FRAMES
+      } else if (spelling) {
+        unlocked = false
+      } else if (lockedPoseRef.current) {
+        const shapeDelta = spellingShapeDelta(currFrame, lockedPoseRef.current)
+        if (shapeDelta >= SHAPE_UNLOCK_MIN) {
+          shapeUnlockStreakRef.current++
+        } else {
+          shapeUnlockStreakRef.current = 0
+        }
+        unlocked =
+          shapeUnlockStreakRef.current >= SHAPE_UNLOCK_FRAMES ||
+          peakMovementRef.current >= MOVED_MIN * 1.25
+      } else {
+        unlocked =
+          movementSinceEmitRef.current >= POSE_UNLOCK_MIN ||
+          peakMovementRef.current >= MOVED_MIN * 1.15
+      }
+      if (unlocked) {
+        inferenceLockedRef.current = false
+        pauseFiredRef.current = false
+        movementSinceEmitRef.current = 0
+        lastSignRef.current = ''
+        predHistRef.current = []
+        peakMovementRef.current = 0
+        gesturePeakRef.current = 0
+        shapeUnlockStreakRef.current = 0
+        spellUnlockGenRef.current++
+      }
+    }
 
     let len = 0
     if (runningRef.current) {
-      // Acumular el frame (mientras la mano esté visible). Se limita el buffer
-      // a los últimos SEQ_LEN para no crecer sin fin en gestos largos.
       landmarkBufferRef.current.push(currFrame)
       if (landmarkBufferRef.current.length > SEQ_LEN) {
         landmarkBufferRef.current.shift()
       }
       len = landmarkBufferRef.current.length
 
-      // Umbral ADAPTATIVO de "detenido": relativo al pico de movimiento de la
-      // seña en curso, con un piso absoluto. Robusto al tembleque de MediaPipe
-      // (una mano quieta que vibra un poco no cuenta como movimiento).
-      const wasGesture =
-        peakMovementRef.current >= MOVED_MIN ||
-        (len >= HELD_MIN_FRAMES && peakMovementRef.current >= HELD_MOVED_MIN)
-      if (movement > peakMovementRef.current) peakMovementRef.current = movement
-      const stopThreshold = Math.max(STOP_ABS, peakMovementRef.current * STOP_FRAC)
-      // Dinámicas (HOLA…) o sostenidas (TE_AMO, SI…): ambas cuentan como gesto.
+      if (movement < stopThreshold) {
+        if (stillCountRef.current === 0) stillPeakRef.current = movement
+        else stillPeakRef.current = Math.max(stillPeakRef.current, movement)
+        stillCountRef.current++
+      } else {
+        stillCountRef.current = 0
+        stillPeakRef.current = 0
+        if (!inferenceLockedRef.current && deliberateMotion) pauseFiredRef.current = false
+        gesturePeakRef.current = peakMovementRef.current
+      }
+
+      const letterMode = isLetterMode(
+        len,
+        stillPeakRef.current,
+        stillCountRef.current,
+        spellBufRef.current.length,
+        gesturePeakRef.current,
+      )
+      const spellingFlow = wantsLettersOnly(spellBufRef.current.length, letterMode)
+      const minFrames = spellingFlow ? SPELL_MIN_FRAMES : MIN_FRAMES
+      const stopNeed = spellingFlow ? SPELL_STOP_FRAMES : STOP_FRAMES
+      const heldMin = spellingFlow ? SPELL_HELD_MIN : HELD_MIN_FRAMES
+
       const gestureHappened =
-        peakMovementRef.current >= MOVED_MIN ||
-        (len >= HELD_MIN_FRAMES && peakMovementRef.current >= HELD_MOVED_MIN)
+        gesturePeakRef.current >= MOVED_MIN ||
+        (len >= heldMin && gesturePeakRef.current >= HELD_MOVED_MIN) ||
+        (letterMode && len >= minFrames)
 
-      // Al ARRANCAR una seña nueva NO limpiamos lastSign aquí: si el usuario
-      // baja las manos tras un anuncio en vivo, el finalize no debe volver a
-      // decirla. Se puede repetir la misma seña tras sacar las manos del todo
-      // (announcedUpRef / lastSign se reinician en NO_HAND_RESET).
-
-      if (movement < stopThreshold) stillCountRef.current++
-      else stillCountRef.current = 0
-
-      // Fin de seña (principal): gesto real + pausa breve → predice YA con
-      // los frames capturados (padBuffer → SEQ_LEN). No espera 24.
       if (
-        !cooling && !apiInFlightRef.current &&
-        gestureHappened &&
-        stillCountRef.current === STOP_FRAMES &&
-        len >= MIN_FRAMES
+        letterMode &&
+        stillCountRef.current >= stopNeed &&
+        inferenceLockedRef.current &&
+        spellBufRef.current.length === 0
       ) {
+        inferenceLockedRef.current = false
+        movementSinceEmitRef.current = 0
+        lastSignRef.current = ''
+        predHistRef.current = []
+      }
+
+      if (
+        !inferenceLockedRef.current &&
+        !apiInFlightRef.current &&
+        !pauseFiredRef.current &&
+        gestureHappened &&
+        stillCountRef.current >= stopNeed &&
+        len >= minFrames
+      ) {
+        pauseFiredRef.current = true
         const snapshot = [...landmarkBufferRef.current]
         landmarkBufferRef.current = []
         peakMovementRef.current   = 0
-        lastLiveAtRef.current     = 0
+        gesturePeakRef.current    = 0
         stillCountRef.current     = 0
-        runPrediction(snapshot, { finalize: true })
-      }
-      // Respaldo en movimiento continuo: desde MIN_FRAMES, cada LIVE_STRIDE
-      // frames (estabilidad de 3 predicciones evita falsos positivos).
-      else if (
-        !cooling && !apiInFlightRef.current &&
-        gestureHappened &&
-        len >= MIN_FRAMES &&
-        (len - lastLiveAtRef.current) >= LIVE_STRIDE
-      ) {
-        lastLiveAtRef.current = len
-        runPrediction(landmarkBufferRef.current)
+        stillPeakRef.current      = 0
+        runPrediction(snapshot, {
+          finalize: true,
+          lettersOnly: spellingFlow,
+        })
       }
     }
 
-    const gesturing = peakMovementRef.current >= MOVED_MIN && stillCountRef.current === 0
-    const showHud = runningRef.current && mlAvailableRef.current && len > 0 && !cooling
-    const status = !runningRef.current
-      ? (cameraOk ? 'Listo' : 'Conectando…')
-      : !mlMode
-        ? 'Servidor IA no conectado'
-        : gesturing
-          ? 'Escuchando…'
-          : len >= MIN_FRAMES
-            ? 'Pausa para confirmar…'
-            : 'Haz la seña'
-    updateCaptureHud(len, { showHud, status, gesturing })
+    hudTickRef.current++
+    if (hudTickRef.current % HUD_UPDATE_EVERY_N === 0 && runningRef.current) {
+      const spell = spellBufRef.current.length
+        ? spellBufRef.current.join(' ')
+        : ''
+      const gesturing = handMoving || (peakMovementRef.current >= MOVED_MIN && stillCountRef.current === 0)
+      const status = spell
+        ? `Deletreando: ${spell}`
+        : !mlMode
+          ? 'Servidor IA no conectado'
+          : gesturing
+            ? 'Escuchando…'
+            : handStillRef.current && len >= MIN_FRAMES
+              ? 'Pausa para confirmar…'
+              : 'Haz la seña'
+      updateCaptureHud(len, {
+        showHud: mlAvailableRef.current && len > 0 && !inferenceLockedRef.current,
+        status,
+        gesturing,
+      })
+      setBufferLen(len)
+    }
   }
 
   handleResultsRef.current = handleResults
@@ -1032,6 +1292,9 @@ export default function InterpretScreen({ onBack, onHome }) {
     let lastPaintedTime = -1
     let lastPaintedBlur = false
     let overlayCtx = null
+    let segmentTick = 0
+    let exposeTick = 0
+    let maskDirty = false
     // Máscara sticky: si un frame falla la segmentación, reutilizamos la anterior
     // (evitar apagar el blur → parpadeo).
     let maskReady = false
@@ -1082,8 +1345,9 @@ export default function InterpretScreen({ onBack, onHome }) {
         lastVideoTime = t
         try {
           detectCtx.drawImage(video, 0, 0, DETECT_W, DETECT_H)
-          // Poca luz: subir exposición solo en el canvas de inferencia.
           autoExposeCanvas(detectCtx, DETECT_W, DETECT_H)
+          const handResult = hand.detectForVideo(detectCanvas, ts)
+          handleResultsRef.current(adaptHandResult(handResult))
           if (segmenter) {
             try {
               segmenter.segmentForVideo(video, ts, (result) => {
@@ -1122,8 +1386,6 @@ export default function InterpretScreen({ onBack, onHome }) {
               // Mantener maskReady.
             }
           }
-          const handResult = hand.detectForVideo(detectCanvas, ts)
-          handleResultsRef.current(adaptHandResult(handResult))
         } catch (e) {
           console.warn('detectForVideo:', e)
         }
@@ -1147,18 +1409,17 @@ export default function InterpretScreen({ onBack, onHome }) {
       }
 
       const frameCanvas = displayFrameCanvasRef.current
-      if (frameCanvas.width !== w || frameCanvas.height !== h) {
-        frameCanvas.width = w
-        frameCanvas.height = h
-        lastPaintedTime = -1
-      }
-
-      // Solo recomponer cuando hay frame nuevo (el blur es caro).
-      if (t !== lastPaintedTime || useBlur !== lastPaintedBlur) {
-        lastPaintedTime = t
-        lastPaintedBlur = useBlur
-        const fctx = frameCanvas.getContext('2d', { alpha: false })
-        if (useBlur) {
+      if (useBlur) {
+        if (frameCanvas.width !== w || frameCanvas.height !== h) {
+          frameCanvas.width = w
+          frameCanvas.height = h
+          lastPaintedTime = -1
+        }
+        if (t !== lastPaintedTime || useBlur !== lastPaintedBlur || maskDirty) {
+          lastPaintedTime = t
+          lastPaintedBlur = useBlur
+          maskDirty = false
+          const fctx = frameCanvas.getContext('2d', { alpha: false })
           composeStudioFrame({
             destCtx: fctx,
             video,
@@ -1172,10 +1433,9 @@ export default function InterpretScreen({ onBack, onHome }) {
             w,
             h,
           })
-        } else {
-          fctx.imageSmoothingEnabled = true
-          fctx.drawImage(video, 0, 0, w, h)
         }
+      } else {
+        lastPaintedBlur = false
       }
 
       try {
@@ -1220,8 +1480,8 @@ export default function InterpretScreen({ onBack, onHome }) {
     setSentence([])
     setDisplaySign('')
     setDisplayConf(0)
+    setSpellPreview('')
     setBufferLen(0)
-    setInCooldown(false)
     if (sentenceClearRef.current) clearTimeout(sentenceClearRef.current)
     stopSpeech()
   }, [resetPipelineState])
@@ -1243,8 +1503,9 @@ export default function InterpretScreen({ onBack, onHome }) {
     if (!cameraOk && cameraError)  return 'Sin acceso a cámara'
     if (!running)                  return cameraOk ? 'Listo' : 'Conectando…'
     if (!mlMode)                   return 'Servidor IA no conectado'
+    if (spellPreview)              return `Deletreando: ${spellPreview}`
     if (!handVisible)              return 'Muestra una mano'
-    if (displaySign && inCooldown) return `${displaySign.replace(/_/g, ' ')} · ${Math.round(displayConf * 100)}%`
+    if (displaySign)               return `${displaySign.replace(/_/g, ' ')} · ${Math.round(displayConf * 100)}%`
     if (bufferLen > 0)             return 'Escuchando…'
     return 'Haz la seña'
   })()
@@ -1511,9 +1772,24 @@ export default function InterpretScreen({ onBack, onHome }) {
                   className="motion-surface animate-motion-scale-in rounded-[1.5rem] border-[3px] border-pastel-purple-line bg-white p-5 shadow-[0_16px_36px_-22px_rgba(45,42,38,0.35)] sm:p-6"
                 >
                   <p className="text-[10px] font-bold uppercase tracking-[0.22em] text-pastel-grape">Última seña</p>
-                  {latest ? (
+                  {spellPreview ? (
                     <>
-                      <p className="mt-3 text-4xl font-extrabold uppercase tracking-tight text-pastel-grape sm:text-5xl">
+                      <p className="mt-2 text-xs font-bold uppercase tracking-[0.18em] text-pastel-sub">
+                        Deletreando
+                      </p>
+                      <p
+                        className={`mt-2 max-h-28 overflow-y-auto break-all font-extrabold uppercase text-pastel-grape ${
+                          spellPreview.replace(/\s/g, '').length > 10
+                            ? 'text-xl leading-snug tracking-wide'
+                            : 'text-3xl tracking-[0.15em] sm:text-4xl'
+                        }`}
+                      >
+                        {spellPreview.replace(/ /g, '')}
+                      </p>
+                    </>
+                  ) : latest ? (
+                    <>
+                      <p className="mt-3 max-h-28 overflow-y-auto break-all text-3xl font-extrabold uppercase tracking-tight text-pastel-grape sm:text-4xl">
                         {(latest.displayText || latest.sign.replace(/_/g, ' '))}
                       </p>
                       {latest.lang && latest.lang !== 'es' && (
@@ -1563,7 +1839,7 @@ export default function InterpretScreen({ onBack, onHome }) {
                         <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg bg-white text-xs font-extrabold text-pastel-grape">
                           {i + 1}
                         </span>
-                        <span className="flex-1 text-sm font-bold text-pastel-ink">
+                        <span className="min-w-0 flex-1 break-all text-sm font-bold text-pastel-ink">
                           {(h.displayText || h.sign.replace(/_/g, ' '))}
                         </span>
                         <span className="text-xs font-extrabold text-pastel-sub">{Math.round((h.confidence || 0) * 100)}%</span>

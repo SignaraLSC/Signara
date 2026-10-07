@@ -218,13 +218,16 @@ export function createBaker(vrm) {
 
   /**
    * @param {object} rawDataset
-   * @param {{ direction?: string, chain?: 'solo'|'start'|'middle'|'end'|'hold' }} [opts]
+   * @param {{ direction?: string, chain?: 'solo'|'start'|'middle'|'end'|'hold'|'phrase-start'|'phrase-follow'|'phrase-release' }} [opts]
    * chain: deletreo — omitir entrada/salida a reposo entre letras seguidas.
    *   solo   = comportamiento normal (entry + seña + exit)
    *   start  = entry + seña (sin exit)
    *   middle = blend→seña (sin entry/exit a idle)
    *   end    = blend→seña + exit
    *   hold   = solo cuerpo de la seña (para coser un deletreo continuo)
+   *   phrase-start   = entrada + seña a velocidad original, sin salida
+   *   phrase-follow  = pose actual → seña a velocidad original, sin salida
+   *   phrase-release = solo salida de la última seña al reposo
    */
   function bakeSolver(rawDataset, {
     direction = 'neutral',
@@ -264,11 +267,12 @@ export function createBaker(vrm) {
       ? { ...trimmed, frames: [...trimmed.frames].reverse() }
       : trimmed
     const arms = activeArms(dataset)
-    // Overrides mínimos de giro de palma (solo donde el +45° global no basta).
-    // MAL: pulgar abajo → hace falta ~−100° (menos de −90°).
+    // Overrides mínimos de giro de palma para orientaciones sintetizadas o
+    // calibradas manualmente. MAL NO pertenece a esta tabla: con la fuente
+    // actual `hand`, sus 21 landmarks ya contienen el giro pulgar-abajo y
+    // volver a sumarle −100° deja la mano de lado/arriba.
     const token = (dataset.token || '').toUpperCase()
     const WRIST_OVERRIDES = {
-      MAL: (-100 * Math.PI) / 180,
       // SCOOBA: palma de la mano en boca más de frente al rostro.
       SCOOBA: (55 * Math.PI) / 180,
       // AYUDA: sin roll global — el +45° volcaba la palma y el puño.
@@ -296,11 +300,17 @@ export function createBaker(vrm) {
       // T: roll 0 — pulgar↑ + índice perpendicular.
       T: 0,
     }
-    // Overrides calibrados contra la fuente 'pose' — no aplican si se está
-    // probando 'hand' (esa fuente tiene su propio giro base, wristRollHand).
+    // Compatibilidad con la fuente antigua pose_world: allí MAL sí necesitaba
+    // un roll adicional porque esa fuente no capturaba con suficiente detalle
+    // el plano de la palma. No se aplica nunca a los 21 landmarks.
+    const POSE_ONLY_WRIST_OVERRIDES = {
+      MAL: (-100 * Math.PI) / 180,
+    }
     const bakeWristRoll = CONFIG.wristSource === 'hand'
       ? (token in WRIST_OVERRIDES ? WRIST_OVERRIDES[token] : CONFIG.wristRollHand)
-      : (token in WRIST_OVERRIDES ? WRIST_OVERRIDES[token] : CONFIG.wristRoll)
+      : (token in POSE_ONLY_WRIST_OVERRIDES
+          ? POSE_ONLY_WRIST_OVERRIDES[token]
+          : (token in WRIST_OVERRIDES ? WRIST_OVERRIDES[token] : CONFIG.wristRoll))
     const R = {
       up: getBone('rightUpperArm'), lo: getBone('rightLowerArm'),
       hd: getBone('rightHand'), mid: getBone('rightMiddleProximal'),
@@ -1236,7 +1246,6 @@ export function createBaker(vrm) {
     // 3b) Hornear con IK: la muñeca llega a su posición real → las manos se juntan.
     const poses = []
     for (let i = 0; i < frames.length; i++) {
-      const dirs = rawDirs[i]
       const wrists = rawWri[i]
       setIdlePose(vrm) // brazos inactivos quedan en reposo
       vrm.scene.updateMatrixWorld(true)
@@ -1720,8 +1729,8 @@ export function createBaker(vrm) {
     const transSteps = TRANS_STEPS - 1
     const entryStepMs = LEAD_IN_MS / TRANS_STEPS
     const exitStepMs = 480 / TRANS_STEPS
-    const wantEntry = chain === 'solo' || chain === 'start'
-    const wantExit = chain === 'solo' || chain === 'end'
+    const wantEntry = chain === 'solo' || chain === 'start' || chain === 'phrase-start'
+    const wantExit = chain === 'solo' || chain === 'end' || chain === 'phrase-release'
     // Deletreo: nunca bajar a idle entre letras. 'hold' = solo el gesto.
     const CHAIN_BLEND_MS = 260
     const spelling = chain === 'start' || chain === 'middle' || chain === 'end' || chain === 'hold'
@@ -1738,6 +1747,8 @@ export function createBaker(vrm) {
       // Empalme exacto con frame 0: mismo pose y duración del primer frame de la
       // seña, sin duplicar keyframe (evita micro-pausa por tramo de delta cero).
       entryKfs.push({ duration: spellDur, pose: { ...first } })
+    } else if (chain === 'phrase-release') {
+      entryKfs = []
     } else if (chain === 'hold') {
       // Solo cuerpo — el cosido del deletreo añade el morph entre letras.
       entryKfs = [{ duration: spellDur, pose: { ...first } }]
@@ -1745,7 +1756,7 @@ export function createBaker(vrm) {
       // middle/end sueltos: morph desde pose actual del player → esta letra.
       entryKfs = [{ duration: CHAIN_BLEND_MS, pose: { ...first } }]
     }
-    const signKfsBody = poses.length > 1
+    const signKfsBody = chain !== 'phrase-release' && poses.length > 1
       ? poses.slice(1).map((p) => ({ duration: spellDur, pose: p }))
       : []
     let exitKfs = []

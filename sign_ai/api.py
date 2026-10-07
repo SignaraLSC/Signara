@@ -33,7 +33,7 @@ from core.gnn_model import GCN_LSTM, SEQ_LEN
 from core.confusion import evaluate_prediction
 from core.direction_reader import classify_direction
 from core.directional_verbs import DIRECTIONAL_VERBS, conjugate
-from core.handshape_hints import correct_spelling_letter, looks_like_ily, resolve_como_familia
+from core.handshape_hints import looks_like_ily, resolve_como_familia
 from core.preprocess import sequence_compact_to_gnn
 
 # ─── Rutas ────────────────────────────────────────────────────────────────────
@@ -275,9 +275,6 @@ async def predict(req: PredictRequest):
     # quieta se reconoce y se muestra/dice como si fuera una seña más.
     if prediction is None or prediction == "IDLE":
         return PredictResponse(prediction="", confidence=confidence, is_idle=True)
-
-    if letters_only and prediction:
-        prediction = correct_spelling_letter(prediction, data)
 
     # Fase 2B: conjugación geométrica (AYUDA→AYUDAME/…, TE_AMO→ME_AMAS/…).
     # TE_AMO usa umbrales propios (ILY estático → cita, no inventar ME_AMAS).

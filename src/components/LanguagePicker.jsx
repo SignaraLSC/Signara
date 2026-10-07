@@ -98,7 +98,7 @@ export default function LanguagePicker({
       document.removeEventListener('mousedown', onDoc)
       document.removeEventListener('keydown', onKey)
     }
-  }, [open])
+  }, [open, stretch])
 
   function select(code) {
     if (isInput) storeInputLang(code)

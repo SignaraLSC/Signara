@@ -18,6 +18,22 @@ function quatOfEuler(e) {
 // simple (no tiene sentido un slerp de cuaterniones para un escalar).
 const EXPR_NAMES = ['aa', 'ih', 'ou', 'ee', 'oh', 'blink', 'surprised', 'angry', 'sad']
 
+/** El baker usa el rig real para calcular IK; al terminar deja sus huesos en reposo. */
+export function bakePreservingPose(vrm, bake) {
+  const bones = Object.keys(vrm.humanoid.normalizedHumanBones || {})
+    .map((name) => vrm.humanoid.getNormalizedBoneNode(name))
+    .filter(Boolean)
+  const rotations = bones.map((bone) => bone.quaternion.clone())
+  const expressions = EXPR_NAMES.map((name) => vrm.expressionManager?.getValue(name) ?? 0)
+  try {
+    return bake()
+  } finally {
+    bones.forEach((bone, i) => bone.quaternion.copy(rotations[i]))
+    EXPR_NAMES.forEach((name, i) => vrm.expressionManager?.setValue(name, expressions[i]))
+    vrm.scene.updateMatrixWorld(true)
+  }
+}
+
 export function playSolverAnim(vrm, kfs, onDone) {
   const getBone = (n) => vrm.humanoid.getNormalizedBoneNode(n)
   // 'expr' no es un hueso — se excluye de la pista de cuaterniones y se

@@ -69,12 +69,18 @@ def df_to_tensor(df_sample):
     Convierte un sample (df de una muestra) a tensor (SEQ_LEN, 42, 4).
     Nodos 0-20 = lh (mano=0), nodos 21-41 = rh (mano=1).
     Features por nodo: [x, y, z, mano]
+
+    La selección temporal debe coincidir con padBuffer() de InterpretScreen:
+    cuando sobran frames se conservan los últimos SEQ_LEN; cuando faltan se
+    remuestrea la secuencia completa.
     """
-    X = np.zeros((SEQ_LEN, N_NODES, N_FEATURES), dtype=np.float32)
-
     frames = sorted(df_sample["frame"].unique())
+    if not frames:
+        return np.zeros((SEQ_LEN, N_NODES, N_FEATURES), dtype=np.float32)
 
-    for fi, frame in enumerate(frames[:SEQ_LEN]):
+    raw = np.zeros((len(frames), N_NODES, N_FEATURES), dtype=np.float32)
+
+    for fi, frame in enumerate(frames):
         df_f = df_sample[df_sample["frame"] == frame]
 
         # Mano izquierda → nodos 0-20
@@ -82,16 +88,18 @@ def df_to_tensor(df_sample):
         for _, row in df_lh.iterrows():
             lid = int(row["id"])
             if 0 <= lid < 21:
-                X[fi, lid] = [row["x"], row["y"], row["z"], 0.0]
+                raw[fi, lid] = [row["x"], row["y"], row["z"], 0.0]
 
         # Mano derecha → nodos 21-41
         df_rh = df_f[df_f["mano"] == 1]
         for _, row in df_rh.iterrows():
             lid = int(row["id"])
             if 0 <= lid < 21:
-                X[fi, lid + 21] = [row["x"], row["y"], row["z"], 1.0]
+                raw[fi, lid + 21] = [row["x"], row["y"], row["z"], 1.0]
 
-    return X   # (30, 42, 4)
+    if len(raw) >= SEQ_LEN:
+        return raw[-SEQ_LEN:]
+    return resample_frames(raw, SEQ_LEN)
 
 
 def augment_sample(x: np.ndarray, rng: np.random.Generator) -> np.ndarray:

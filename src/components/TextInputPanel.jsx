@@ -15,6 +15,7 @@ const TextInputPanel = forwardRef(function TextInputPanel(
     onSubmit,
     onLiveWord,
     onVoiceEnd,
+    onListeningChange,
     busy = false,
     pendingWord = '',
     missedWord = '',
@@ -30,9 +31,11 @@ const TextInputPanel = forwardRef(function TextInputPanel(
   const onSubmitRef = useRef(onSubmit)
   const onLiveWordRef = useRef(onLiveWord)
   const onVoiceEndRef = useRef(onVoiceEnd)
+  const onListeningChangeRef = useRef(onListeningChange)
   onSubmitRef.current = onSubmit
   onLiveWordRef.current = onLiveWord
   onVoiceEndRef.current = onVoiceEnd
+  onListeningChangeRef.current = onListeningChange
 
   const liveEmittedRef = useRef([])
   // Tras limpiar la barra en voz, el API sigue mandando el transcript COMPLETO
@@ -94,14 +97,18 @@ const TextInputPanel = forwardRef(function TextInputPanel(
     liveEmittedRef.current = allWords.slice()
   }
 
-  function handleLive(text, isFinal) {
+  function handleLive(text) {
     const cleaned = String(text || '').trim()
     const words = cleaned.split(/\s+/).filter(Boolean)
     // Barra: solo lo dicho desde el último clear (no todo el historial de sesión).
     setValue(words.slice(displayFromRef.current).join(' '))
-    // Interim: la última palabra puede seguir cambiando, no se emite todavía.
-    // Final: ya está confirmada completa, se emite también la última.
-    emitNewWords(isFinal ? words : words.slice(0, -1))
+    // También enviamos la última palabra interim. El reconocedor puede
+    // mostrarla en pantalla y no volver a emitir otro evento cuando la marca
+    // como final; si la excluimos, frases como "cómo estás" dejan pasar
+    // únicamente "cómo" al avatar. `emitNewWords` conserva el prefijo y
+    // deduplica la confirmación posterior, mientras la ventana contextual
+    // decide si esa palabra ya es una seña o todavía debe esperar otra.
+    emitNewWords(words)
   }
 
   // Tras traducir: barra vacía. En voz HAY que conservar liveEmittedRef —
@@ -128,6 +135,10 @@ const TextInputPanel = forwardRef(function TextInputPanel(
       clearBar({ keepVoiceMemory: true })
     }
   })
+
+  useEffect(() => {
+    onListeningChangeRef.current?.(listening)
+  }, [listening])
 
   function stopMicAndNotify() {
     stop()

@@ -8,17 +8,29 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "lint": "eslint ."
+    "tauri": "tauri",
+    "desktop:dev": "tauri dev",
+    "desktop:build": "tauri build",
+    "lint": "eslint .",
+    "test:sign-plan": "node scripts/test-sign-plan.mjs",
+    "test:semantic-catalog": "node scripts/test-semantic-catalog.mjs",
+    "test:context-window": "node scripts/test-contextual-sign-window.mjs",
+    "test:conversation-context": "node scripts/test-conversation-context.mjs",
+    "test:lsc-planner": "node scripts/test-lsc-grammar-planner.mjs",
+    "test:voice-transcript": "node scripts/test-voice-transcript.mjs",
+    "test:vrm-phrase-playback": "node scripts/test-vrm-phrase-playback.mjs"
   },
   "dependencies": {
     "@mediapipe/tasks-vision": "^0.10.35",
     "@pixiv/three-vrm": "^3.5.5",
+    "@tauri-apps/api": "^2.12.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "three": "^0.184.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.4",
+    "@tauri-apps/cli": "^2.12.1",
     "@vitejs/plugin-react": "^4.3.1",
     "autoprefixer": "^10.4.19",
     "eslint": "^9.39.4",

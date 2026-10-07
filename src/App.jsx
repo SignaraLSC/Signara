@@ -2,8 +2,11 @@ import { lazy, Suspense, useEffect, useState } from 'react'
 import LandingScreen from './components/LandingScreen.jsx'
 import ModeSelection from './components/ModeSelection.jsx'
 import ScreenTransition from './components/ScreenTransition.jsx'
-import { setCurrentAvatar } from './utils/signMap.js'
 import { warmupMlApi } from './utils/mlApi.js'
+import {
+  showDesktopInterpretOverlayWindow,
+  showDesktopOverlayWindow,
+} from './utils/desktopWindow.js'
 
 const AVATAR_VRM_URL = '/avatar/signara-avatar.vrm'
 
@@ -29,6 +32,7 @@ const importTranslation = () => import('./components/TranslationScreen.jsx')
 const importInterpret = () => import('./components/InterpretScreen.jsx')
 const TranslationScreen = lazy(importTranslation)
 const InterpretScreen = lazy(importInterpret)
+const FloatingAvatarWidget = lazy(() => import('./components/FloatingAvatarWidget.jsx'))
 
 function ScreenFallback() {
   return (
@@ -62,8 +66,6 @@ function ScreenFallback() {
  * en el hash de la URL (#mode, #translate, #interpret) para conservarla al recargar.
  */
 
-const AVATAR_KEY = 'signara:avatarId'
-const VALID_IDS = ['alex', 'anuar', 'grace']
 const VALID_SCREENS = ['landing', 'mode', 'translate', 'interpret']
 const SCREEN_DEPTH = { landing: 0, mode: 1, translate: 2, interpret: 2 }
 
@@ -72,20 +74,6 @@ function motionClassForTransition(from, to) {
   if (delta > 0) return 'animate-motion-enter-forward'
   if (delta < 0) return 'animate-motion-enter-back'
   return 'animate-motion-fade-through'
-}
-
-function readStoredAvatar() {
-  try {
-    const v = window.localStorage.getItem(AVATAR_KEY)
-    if (VALID_IDS.includes(v)) return v
-  } catch (_) {}
-  return 'alex'
-}
-
-function saveStoredAvatar(id) {
-  try {
-    window.localStorage.setItem(AVATAR_KEY, id)
-  } catch (_) {}
 }
 
 /** Pantalla actual desde el hash (#mode, #translate, #interpret). */
@@ -102,15 +90,11 @@ function syncLocation(screen) {
 }
 
 export default function App() {
+  const overlayMode = new URLSearchParams(window.location.search).get('overlay')
+  const isAvatarOverlay = overlayMode === '1' || overlayMode === 'avatar'
+  const isInterpretOverlay = overlayMode === 'interpret'
   const [screen, setScreen] = useState(screenFromLocation)
-  const [avatarId, setAvatarId] = useState('alex')
   const [motionClass, setMotionClass] = useState('animate-motion-enter')
-
-  useEffect(() => {
-    const stored = readStoredAvatar()
-    setAvatarId(stored)
-    setCurrentAvatar(stored)
-  }, [])
 
   useEffect(() => {
     if (screen === 'landing' || screen === 'mode') {
@@ -159,11 +143,38 @@ export default function App() {
     window.scrollTo(0, 0)
   }
 
-  const handleAvatarChange = (id) => {
-    if (!VALID_IDS.includes(id)) return
-    setAvatarId(id)
-    setCurrentAvatar(id)
-    saveStoredAvatar(id)
+  const openFloatingAvatar = async () => {
+    const shown = await showDesktopOverlayWindow()
+    if (shown) return
+    const url = new URL(window.location.href)
+    url.search = '?overlay=1'
+    url.hash = ''
+    window.open(url.toString(), 'signara-overlay', 'width=420,height=650,resizable=yes')
+  }
+
+  const openFloatingInterpret = async () => {
+    const shown = await showDesktopInterpretOverlayWindow()
+    if (shown) return
+    const url = new URL(window.location.href)
+    url.search = '?overlay=interpret'
+    url.hash = ''
+    window.open(url.toString(), 'signara-interpret-overlay', 'width=360,height=460,resizable=yes')
+  }
+
+  if (isAvatarOverlay) {
+    return (
+      <Suspense fallback={<ScreenFallback />}>
+        <FloatingAvatarWidget />
+      </Suspense>
+    )
+  }
+
+  if (isInterpretOverlay) {
+    return (
+      <Suspense fallback={<ScreenFallback />}>
+        <InterpretScreen compactVoiceOnly />
+      </Suspense>
+    )
   }
 
   return (
@@ -186,6 +197,8 @@ export default function App() {
               <ModeSelection
                 onBack={() => navigate('landing')}
                 onSelect={(m) => navigate(m)}
+                onOpenFloating={openFloatingAvatar}
+                onOpenFloatingInterpret={openFloatingInterpret}
               />
             )
           }
@@ -206,6 +219,7 @@ export default function App() {
                 <InterpretScreen
                   onBack={() => navigate('mode')}
                   onHome={() => navigate('landing')}
+                  onOpenFloating={openFloatingInterpret}
                 />
               </Suspense>
             )

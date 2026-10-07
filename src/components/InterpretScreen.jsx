@@ -29,8 +29,16 @@ import {
   getStoredOutputLang,
 } from '../data/outputLanguages.js'
 import { translateFromSpanish } from '../utils/translateApi.js'
-import { maybeCorrectTeAmo, maybeCorrectComoFamilia, maybeCorrectSpellingGNMNÑ } from '../utils/handshapeHints.js'
+import { maybeCorrectTeAmo, maybeCorrectComoFamilia } from '../utils/handshapeHints.js'
 import { isLetterToken } from '../utils/fingerspell.js'
+import {
+  hideDesktopWindow,
+  isTauriDesktop,
+  minimizeDesktopWindow,
+  showDesktopMainWindow,
+  startDesktopDrag,
+  startDesktopResize,
+} from '../utils/desktopWindow.js'
 
 // Migrado de @mediapipe/holistic (legacy) a @mediapipe/tasks-vision:
 // HandLandmarker con GPU, solo manos. FaceLandmarker se pospuso: no se usa
@@ -63,17 +71,24 @@ const MIN_FRAMES     = 8
 // ── Fin de seña (camino principal, tiempo real) ─────────────────────────────
 const STOP_FRAMES = 4
 const STOP_FRAC   = 0.4
-const STOP_ABS    = 0.006
+// Piso de quietud por encima del jitter normal de MediaPipe a 192×144. Con
+// 0.006 el contador se reiniciaba mientras la mano seguía visible y la seña
+// solo se enviaba al quitarla del cuadro.
+const STOP_ABS    = 0.012
 // Gesto dinámico (HOLA, ADIOS…): hace falta movimiento claro.
 const MOVED_MIN   = 0.018
 // Señas casi estáticas (TE_AMO, SI, NO): sostener la forma cuenta como gesto
 // aunque la muñeca casi no se mueva — sin bajar el umbral dinámico de arriba.
 const HELD_MOVED_MIN = 0.003
 const HELD_MIN_FRAMES = 12
+// Lecturas de respaldo mientras la mano sigue visible. Sirven para señas cuyo
+// jitter impide detectar cuatro frames de pausa perfectos.
+const PROBE_MIN_FRAMES = 12
+const PROBE_INTERVAL_MS = 450
 
 /** Tras emitir letra/seña: no /predict hasta cambio real de pose. */
 const POSE_UNLOCK_MIN = 0.014
-/** Desbloqueo entre letras: cambio de extensión de dedos (invariante a posición en cámara). */
+/** Desbloqueo entre letras: cambio de forma de dedos (invariante a posición en cámara). */
 const FINGER_PROFILE_UNLOCK = 0.038
 const FINGER_PROFILE_SAME = 0.028
 const SHAPE_UNLOCK_FRAMES = 3
@@ -88,18 +103,28 @@ const CONFIRM_BLOCK_MOVEMENT = MOVED_MIN * 0.55
 const SPELL_MIN_FRAMES = 5
 const SPELL_HELD_MIN = 4
 const SPELL_STOP_FRAMES = 3
-const SPELL_UMBRAL = 0.80
-const SPELL_STABILITY = 2
+// Alineado con `letters_only` del backend. Allí también se exige margen top-2,
+// por lo que 0.70 no acepta una letra ambigua; evita descartar N correctas que
+// suelen quedar en 0.76–0.79.
+const SPELL_UMBRAL = 0.70
+// Quietud propia del deletreo: tolera un pequeño desplazamiento natural de la
+// muñeca, pero exige que la configuración de dedos ya no esté cambiando.
+const SPELL_POSITION_STILL_MAX = 0.012
+const SPELL_SHAPE_STILL_MAX = 0.055
+// La estabilidad se valida ANTES de consultar al modelo: cambio de dedos por
+// SHAPE_UNLOCK_FRAMES y nueva forma quieta por SPELL_STOP_FRAMES. Exigir además
+// dos peticiones al servidor añadía una espera larga y el jitter podía borrar
+// el primer voto, dejando el deletreo bloqueado indefinidamente.
+const SPELL_STABILITY = 1
 
-function isLetterMode(len, stillPeak, stillCount, spellBufLen, gesturePeak) {
-  if (len < SPELL_HELD_MIN || stillCount < SPELL_STOP_FRAMES) return false
-  if (spellBufLen > 0) {
-    // Deletreo activo: tolerar micro-movimiento al cambiar dedos entre letras.
-    if (stillPeak >= MOVED_MIN * 1.35) return false
-    return true
-  }
-  if (stillPeak >= MOVED_MIN) return false
-  return gesturePeak < MOVED_MIN * 1.8
+function isLetterMode(len, spellStableCount, spellBufLen) {
+  // La primera letra no necesita entrar por una ruta especial: se consulta al
+  // modelo normal y `confirmSign` la incorpora al buffer si realmente es una
+  // letra. Si activábamos `letters_only` solo por estar quieto, cualquier seña
+  // estática (GRACIAS, POR_FAVOR, TENGO_SED...) se enviaba como si fuera una
+  // letra y el backend descartaba su clase correcta.
+  if (spellBufLen <= 0) return false
+  return len >= SPELL_HELD_MIN && spellStableCount >= SPELL_STOP_FRAMES
 }
 
 function wantsLettersOnly(spellBufLen, letterMode) {
@@ -107,8 +132,7 @@ function wantsLettersOnly(spellBufLen, letterMode) {
 }
 
 
-// Segmentador / HUD: no en cada frame del camino crítico de landmarks.
-const SEGMENT_EVERY_N = 6
+// HUD: no en cada frame del camino crítico de landmarks.
 const HUD_UPDATE_EVERY_N = 12
 
 // Inferencia: equilibrio velocidad / tracking (izq. sufría a 160×120).
@@ -339,51 +363,98 @@ function handShapeDistance(a, b) {
   return n ? sum / n : 0
 }
 
-/** Cambio de configuración de dedos (puntas + nudillos + pulgar), invariante a muñeca. */
-function fingerConfigDistance(a, b) {
-  const ha = activeHandBlock(a)
-  const hb = activeHandBlock(b)
-  if (!ha || !hb) return 0
-  const wx = ha[0], wy = ha[1]
-  const wx2 = hb[0], wy2 = hb[1]
-  const scale =
-    Math.hypot(ha[9] - wx, ha[10] - wy) ||
-    Math.hypot(hb[9] - wx2, hb[10] - wy2) ||
-    1e-4
-  const landmarks = [4, 5, 8, 9, 12, 13, 16, 17, 20]
-  let sum = 0
-  for (const li of landmarks) {
-    const o = li * 3
-    const dx = (ha[o] - wx) - (hb[o] - wx2)
-    const dy = (ha[o + 1] - wy) - (hb[o + 1] - wy2)
-    sum += Math.hypot(dx, dy) / scale
-  }
-  return sum / landmarks.length
-}
-
 /** Extensión tip↔MCP relativa a muñeca — estable al mover la mano en el espacio. */
 function fingerExtFromBlock(block, mcp, tip) {
   const wx = block[0]
   const wy = block[1]
-  const bone = Math.hypot(block[mcp * 3] - wx, block[mcp * 3 + 1] - wy) || 1e-4
+  const wz = block[2]
+  const bone = Math.hypot(
+    block[mcp * 3] - wx,
+    block[mcp * 3 + 1] - wy,
+    block[mcp * 3 + 2] - wz,
+  ) || 1e-4
   const tipLen = Math.hypot(
     block[tip * 3] - block[mcp * 3],
     block[tip * 3 + 1] - block[mcp * 3 + 1],
+    block[tip * 3 + 2] - block[mcp * 3 + 2],
   )
   return tipLen / bone
 }
 
-/** Distancia entre perfiles de extensión (índice/medio/anular/meñique). */
+function jointBendFromBlock(block, a, b, c) {
+  const ab = [
+    block[b * 3] - block[a * 3],
+    block[b * 3 + 1] - block[a * 3 + 1],
+    block[b * 3 + 2] - block[a * 3 + 2],
+  ]
+  const bc = [
+    block[c * 3] - block[b * 3],
+    block[c * 3 + 1] - block[b * 3 + 1],
+    block[c * 3 + 2] - block[b * 3 + 2],
+  ]
+  const den = Math.hypot(...ab) * Math.hypot(...bc)
+  if (den < 1e-8) return 0
+  const dot = ab[0] * bc[0] + ab[1] * bc[1] + ab[2] * bc[2]
+  return Math.acos(Math.max(-1, Math.min(1, dot / den))) / Math.PI
+}
+
+function normalizedLandmarkDistance(block, a, b) {
+  const palm = Math.hypot(
+    block[9 * 3] - block[0],
+    block[9 * 3 + 1] - block[1],
+    block[9 * 3 + 2] - block[2],
+  ) || 1e-4
+  return Math.hypot(
+    block[a * 3] - block[b * 3],
+    block[a * 3 + 1] - block[b * 3 + 1],
+    block[a * 3 + 2] - block[b * 3 + 2],
+  ) / palm
+}
+
+/**
+ * Distancia entre configuraciones de los CINCO dedos. Combina extensión,
+ * doblez articular y relación del pulgar con índice/medio. No usa la posición
+ * global de la muñeca: acercar/alejar o desplazar la mano no es requisito para
+ * pasar a la letra siguiente.
+ */
 function fingerProfileDistance(a, b) {
   const ha = activeHandBlock(a)
   const hb = activeHandBlock(b)
   if (!ha || !hb) return 0
-  const pairs = [[5, 8], [9, 12], [13, 16], [17, 20]]
-  let sum = 0
+  const pairs = [[1, 4], [5, 8], [9, 12], [13, 16], [17, 20]]
+  let extensionDelta = 0
   for (const [mcp, tip] of pairs) {
-    sum += Math.abs(fingerExtFromBlock(ha, mcp, tip) - fingerExtFromBlock(hb, mcp, tip))
+    extensionDelta += Math.abs(
+      fingerExtFromBlock(ha, mcp, tip) - fingerExtFromBlock(hb, mcp, tip),
+    )
   }
-  return sum / pairs.length
+  extensionDelta /= pairs.length
+
+  const joints = [
+    [1, 2, 3], [2, 3, 4],
+    [5, 6, 7], [6, 7, 8],
+    [9, 10, 11], [10, 11, 12],
+    [13, 14, 15], [14, 15, 16],
+    [17, 18, 19], [18, 19, 20],
+  ]
+  let bendDelta = 0
+  for (const [p, q, r] of joints) {
+    bendDelta += Math.abs(
+      jointBendFromBlock(ha, p, q, r) - jointBendFromBlock(hb, p, q, r),
+    )
+  }
+  bendDelta /= joints.length
+
+  // El pulgar distingue muchas letras que el perfil de los otros cuatro dedos
+  // no puede separar (A/E/M/N/S/T, por ejemplo).
+  const thumbRelationDelta = (
+    Math.abs(normalizedLandmarkDistance(ha, 4, 5) - normalizedLandmarkDistance(hb, 4, 5)) +
+    Math.abs(normalizedLandmarkDistance(ha, 4, 8) - normalizedLandmarkDistance(hb, 4, 8)) +
+    Math.abs(normalizedLandmarkDistance(ha, 4, 9) - normalizedLandmarkDistance(hb, 4, 9)) +
+    Math.abs(normalizedLandmarkDistance(ha, 4, 12) - normalizedLandmarkDistance(hb, 4, 12))
+  ) / 4
+
+  return Math.max(extensionDelta, bendDelta * 0.8, thumbRelationDelta * 0.35)
 }
 
 /** Mayor sensibilidad al cambiar letra sin mover la mano en el espacio. */
@@ -393,7 +464,8 @@ function spellingShapeDelta(a, b) {
 
 // ── Componente principal ──────────────────────────────────────────────────────
 
-export default function InterpretScreen({ onBack, onHome }) {
+export default function InterpretScreen({ onBack, onHome, onOpenFloating, compactVoiceOnly = false }) {
+  const desktop = isTauriDesktop()
   const videoRef     = useRef(null)
   const canvasRef    = useRef(null)
   const handLandmarkerRef = useRef(null)
@@ -418,6 +490,7 @@ export default function InterpretScreen({ onBack, onHome }) {
   const prevFrameRef      = useRef(null) // frame anterior para calcular movimiento
   const noHandCountRef    = useRef(0)    // frames consecutivos sin manos
   const stillCountRef     = useRef(0)    // frames consecutivos "detenido" (mano visible)
+  const settleCountRef    = useRef(0)    // quietud adaptativa, tolera jitter residual
   const stillPeakRef      = useRef(0)    // movimiento max durante la pausa actual
   const gesturePeakRef    = useRef(0)    // movimiento max antes de la pausa (señas dinámicas)
   const pauseFiredRef     = useRef(false) // evita repetir /predict en la misma pausa
@@ -427,7 +500,13 @@ export default function InterpretScreen({ onBack, onHome }) {
   const lastSignRef       = useRef('')
   const announcedUpRef    = useRef('')
   const spellBufRef       = useRef([])
+  const spellStableCountRef = useRef(0)
   const apiInFlightRef    = useRef(false)
+  // Permite volver a consultar una pose que todavía no alcanzó consenso sin
+  // disparar peticiones en cada frame. Antes `pauseFired` quedaba bloqueado
+  // después del primer intento fallido y solo se liberaba al retirar la mano.
+  const predictionRetryAtRef = useRef(0)
+  const lastProbeAtRef       = useRef(0)
   const mlAvailableRef    = useRef(false)
   const sentenceClearRef  = useRef(null)
   const handleResultsRef  = useRef(() => {})
@@ -439,6 +518,7 @@ export default function InterpretScreen({ onBack, onHome }) {
   const motionSincePredictRef = useRef(false)
   const handStillRef = useRef(true)
   const deliberateMotionRef = useRef(false)
+  const compactAutoStartedRef = useRef(false)
   const hudTickRef        = useRef(0)
   const lastHudStatusRef  = useRef('')
   const handWasVisibleRef = useRef(false)
@@ -469,7 +549,12 @@ export default function InterpretScreen({ onBack, onHome }) {
   // UI state
   const [scriptsLoaded, setScriptsLoaded] = useState(false)
   const [scriptsError,  setScriptsError]  = useState(null)
-  const [cameraConsent, setCameraConsent] = useState(null)
+  // La ventana Tauri se crea oculta al arrancar: no pedir cámara hasta que
+  // realmente reciba foco. En el fallback de navegador la pestaña sí nace
+  // visible y puede pedirla inmediatamente.
+  const [cameraConsent, setCameraConsent] = useState(
+    compactVoiceOnly && !desktop ? 'accepted' : null,
+  )
   const [cameraRetryKey, setCameraRetryKey] = useState(0)
   const [cameraOk,      setCameraOk]      = useState(false)
   const [cameraError,   setCameraError]   = useState(null)
@@ -478,6 +563,7 @@ export default function InterpretScreen({ onBack, onHome }) {
   const [mlConnecting,  setMlConnecting]  = useState(false)
   const [audioOn,       setAudioOn]       = useState(true)
   const [studioBg,      setStudioBg]      = useState(() => {
+    if (compactVoiceOnly) return false
     try { return localStorage.getItem('signara:studioBg') === '1' } catch { return false }
   })
   const [handVisible,   setHandVisible]   = useState(false)
@@ -501,8 +587,23 @@ export default function InterpretScreen({ onBack, onHome }) {
   }, [audioOn])
   useEffect(() => {
     studioBgRef.current = studioBg
-    try { localStorage.setItem('signara:studioBg', studioBg ? '1' : '0') } catch { /* ignore */ }
-  }, [studioBg])
+    if (!compactVoiceOnly) {
+      try { localStorage.setItem('signara:studioBg', studioBg ? '1' : '0') } catch { /* ignore */ }
+    }
+  }, [studioBg, compactVoiceOnly])
+
+  useEffect(() => {
+    if (!compactVoiceOnly) return undefined
+    document.documentElement.classList.add('signara-overlay')
+    document.body.classList.add('signara-overlay')
+    const activateWhenShown = () => setCameraConsent('accepted')
+    if (desktop) window.addEventListener('focus', activateWhenShown)
+    return () => {
+      if (desktop) window.removeEventListener('focus', activateWhenShown)
+      document.documentElement.classList.remove('signara-overlay')
+      document.body.classList.remove('signara-overlay')
+    }
+  }, [compactVoiceOnly, desktop])
 
   // Chrome carga voces de forma async; calentar lista para acertar idioma.
   useEffect(() => {
@@ -791,6 +892,7 @@ export default function InterpretScreen({ onBack, onHome }) {
   function flushSpellBuffer() {
     const letters = spellBufRef.current
     spellBufRef.current = []
+    spellStableCountRef.current = 0
     setSpellPreview('')
 
     const resetSpellingInference = () => {
@@ -846,6 +948,7 @@ export default function InterpretScreen({ onBack, onHome }) {
     predHistRef.current       = []
     prevFrameRef.current      = null
     stillCountRef.current     = 0
+    settleCountRef.current    = 0
     stillPeakRef.current      = 0
     gesturePeakRef.current    = 0
     pauseFiredRef.current     = false
@@ -863,10 +966,13 @@ export default function InterpretScreen({ onBack, onHome }) {
     handStillRef.current = true
     deliberateMotionRef.current = false
     apiInFlightRef.current    = false
+    predictionRetryAtRef.current = 0
+    lastProbeAtRef.current = 0
     handVisibleRef.current    = false
     drawLeftRef.current = null
     drawRightRef.current = null
     spellBufRef.current = []
+    spellStableCountRef.current = 0
     setSpellPreview('')
     lastHudStatusRef.current = ''
     if (handBadgeRef.current) handBadgeRef.current.style.display = 'none'
@@ -912,7 +1018,9 @@ export default function InterpretScreen({ onBack, onHome }) {
       predHistRef.current       = []
       prevFrameRef.current      = null
       stillCountRef.current     = 0
+      settleCountRef.current    = 0
       stillPeakRef.current      = 0
+      spellStableCountRef.current = 0
       pauseFiredRef.current     = true
       peakMovementRef.current   = 0
       gesturePeakRef.current    = 0
@@ -930,6 +1038,7 @@ export default function InterpretScreen({ onBack, onHome }) {
     prevFrameRef.current      = null
     stillCountRef.current     = 0
     stillPeakRef.current      = 0
+    spellStableCountRef.current = 0
     pauseFiredRef.current     = true
     peakMovementRef.current   = 0
     gesturePeakRef.current    = 0
@@ -948,7 +1057,7 @@ export default function InterpretScreen({ onBack, onHome }) {
     triggerRecognition(predUp, confidence)
   }
 
-  function runPrediction(frames, { finalize = false, lettersOnly = false } = {}) {
+  function runPrediction(frames, { finalize = false, lettersOnly = false, probe = false } = {}) {
     if (!runningRef.current || !mlAvailableRef.current) return
     if (inferenceLockedRef.current || apiInFlightRef.current) return
     const minFrames = lettersOnly ? SPELL_MIN_FRAMES : MIN_FRAMES
@@ -981,7 +1090,6 @@ export default function InterpretScreen({ onBack, onHome }) {
 
         if (useLetters) {
           if (!prediction || is_idle || !isLetterToken(prediction)) return
-          prediction = maybeCorrectSpellingGNMNÑ(prediction, bufferCopy)
           if (!isLetterToken(prediction)) return
         } else {
           prediction = maybeCorrectTeAmo(rawPred || '', bufferCopy)
@@ -1006,40 +1114,46 @@ export default function InterpretScreen({ onBack, onHome }) {
         if (prediction === lastSignRef.current) return
         if (useLetters && motionSincePredictRef.current) return
 
-        let confirmed = false
-
         if (
           finalize &&
           prediction !== lastSignRef.current &&
           !motionSincePredictRef.current &&
           (
             useLetters
-              ? confidence >= confFloor
+              // La ventana ya fue validada geométricamente como una forma
+              // estable; aquí solo exigimos confianza y margen del clasificador.
+              ? stable && confidence >= confFloor
               : (stable && confidence >= confFloor) || confidence >= FINALIZE_UMBRAL
           )
         ) {
           confirmSign(prediction, confidence)
-          confirmed = true
         } else if (
           !finalize &&
           prediction !== lastSignRef.current &&
           confidence >= confFloor &&
-          (stable || confidence >= HIGH_CONF_INSTANT) &&
+          (probe ? stable : (stable || confidence >= HIGH_CONF_INSTANT)) &&
           !motionSincePredictRef.current
         ) {
           confirmSign(prediction, confidence)
-          confirmed = true
         }
 
-        if (!confirmed && useLetters && pauseFiredRef.current && !inferenceLockedRef.current && deliberateMotionRef.current) {
-          pauseFiredRef.current = false
-        }
       } catch {
         mlAvailableRef.current = false
         setMlMode(false)
       } finally {
         clearTimeout(timer)
         apiInFlightRef.current = false
+        // Si la primera ventana todavía no alcanza consenso, permitir una
+        // segunda lectura de la MISMA forma quieta. No se exige desplazar la
+        // muñeca ni acercar/alejar la mano para volver a consultar al modelo.
+        if (!inferenceLockedRef.current) {
+          // Si el modelo no confirmó esta ventana, la pose sigue siendo válida:
+          // dejar que se llene otra ventana y pedir una nueva lectura. El
+          // pequeño cooldown evita repetir /predict continuamente mientras
+          // MediaPipe entrega muchos frames iguales.
+          pauseFiredRef.current = false
+          predictionRetryAtRef.current = performance.now() + 260
+        }
       }
     })()
   }
@@ -1074,16 +1188,17 @@ export default function InterpretScreen({ onBack, onHome }) {
       const skipFinalize = inferenceLockedRef.current
       const letterModeDrop = isLetterMode(
         snapshot.length,
-        stillPeakRef.current,
-        stillCountRef.current,
+        spellStableCountRef.current,
         spellBufRef.current.length,
-        gesturePeakRef.current,
       )
 
       landmarkBufferRef.current = []
       prevFrameRef.current      = null
       stillCountRef.current     = 0
+      settleCountRef.current    = 0
+      lastProbeAtRef.current    = 0
       stillPeakRef.current      = 0
+      spellStableCountRef.current = 0
       gesturePeakRef.current    = 0
       pauseFiredRef.current     = false
       peakMovementRef.current   = 0
@@ -1130,12 +1245,37 @@ export default function InterpretScreen({ onBack, onHome }) {
       : 0
     prevFrameRef.current = currFrame
 
+    // Contador de quietud específico para deletreo. A diferencia del detector
+    // de fin de una seña dinámica, tolera el pequeño temblor de muñeca de una
+    // mano sostenida y verifica que los dedos sí hayan dejado de cambiar.
+    if (
+      movement <= SPELL_POSITION_STILL_MAX &&
+      fingerDelta <= SPELL_SHAPE_STILL_MAX
+    ) {
+      spellStableCountRef.current++
+    } else {
+      spellStableCountRef.current = 0
+    }
+
     if (movement > peakMovementRef.current) peakMovementRef.current = movement
     if (stillCountRef.current === 0 && movement >= Math.max(STOP_ABS, peakMovementRef.current * STOP_FRAC)) {
       gesturePeakRef.current = Math.max(gesturePeakRef.current, peakMovementRef.current)
     }
 
     const stopThreshold = Math.max(STOP_ABS, peakMovementRef.current * STOP_FRAC)
+    // Segunda lectura de quietud: en algunas señas la mano ya terminó, pero
+    // uno o dos landmarks siguen saltando por encima de STOP_ABS. Este umbral
+    // relativo a la propia seña detecta que el movimiento cayó claramente sin
+    // confundirlo con un frame completamente inmóvil.
+    const settleThreshold = Math.max(
+      STOP_ABS * 1.5,
+      peakMovementRef.current * 0.55,
+    )
+    if (movement < settleThreshold) {
+      settleCountRef.current = Math.min(6, settleCountRef.current + 1)
+    } else {
+      settleCountRef.current = 0
+    }
     const handMoving = movement >= stopThreshold || fingerDelta >= FINGER_MOTION_MIN
     handStillRef.current = !handMoving
     const deliberateMotion =
@@ -1143,6 +1283,7 @@ export default function InterpretScreen({ onBack, onHome }) {
     deliberateMotionRef.current = deliberateMotion
     if (deliberateMotion) {
       motionSincePredictRef.current = true
+      predictionRetryAtRef.current = 0
       if (!inferenceLockedRef.current) predHistRef.current = []
     }
 
@@ -1181,6 +1322,14 @@ export default function InterpretScreen({ onBack, onHome }) {
         movementSinceEmitRef.current = 0
         lastSignRef.current = ''
         predHistRef.current = []
+        // Muy importante en deletreo: descartar la letra anterior y los frames
+        // del cambio. La nueva ventana empieza únicamente cuando ya cambió la
+        // configuración de los dedos; antes se clasificaba una mezcla A→B.
+        landmarkBufferRef.current = []
+        stillCountRef.current = 0
+        settleCountRef.current = 0
+        stillPeakRef.current = 0
+        spellStableCountRef.current = 0
         peakMovementRef.current = 0
         gesturePeakRef.current = 0
         shapeUnlockStreakRef.current = 0
@@ -1199,9 +1348,14 @@ export default function InterpretScreen({ onBack, onHome }) {
       if (movement < stopThreshold) {
         if (stillCountRef.current === 0) stillPeakRef.current = movement
         else stillPeakRef.current = Math.max(stillPeakRef.current, movement)
-        stillCountRef.current++
+        stillCountRef.current = Math.min(STOP_FRAMES, stillCountRef.current + 1)
       } else {
-        stillCountRef.current = 0
+        // MediaPipe puede producir un frame aislado con jitter aunque la mano
+        // ya haya terminado la seña. Antes ese frame ponía el contador en 0 y
+        // obligaba a retirar la mano para entrar por la rama de no-hand. La
+        // recuperación gradual conserva la protección contra movimiento real
+        // sostenido sin borrar toda una pausa válida por un único salto.
+        stillCountRef.current = Math.max(0, stillCountRef.current - 1)
         stillPeakRef.current = 0
         if (!inferenceLockedRef.current && deliberateMotion) pauseFiredRef.current = false
         gesturePeakRef.current = peakMovementRef.current
@@ -1209,24 +1363,34 @@ export default function InterpretScreen({ onBack, onHome }) {
 
       const letterMode = isLetterMode(
         len,
-        stillPeakRef.current,
-        stillCountRef.current,
+        spellStableCountRef.current,
         spellBufRef.current.length,
-        gesturePeakRef.current,
       )
       const spellingFlow = wantsLettersOnly(spellBufRef.current.length, letterMode)
       const minFrames = spellingFlow ? SPELL_MIN_FRAMES : MIN_FRAMES
       const stopNeed = spellingFlow ? SPELL_STOP_FRAMES : STOP_FRAMES
       const heldMin = spellingFlow ? SPELL_HELD_MIN : HELD_MIN_FRAMES
+      const gestureSignal = Math.max(gesturePeakRef.current, peakMovementRef.current)
+      const stableEnough = spellingFlow
+        ? spellStableCountRef.current >= stopNeed
+        : stillCountRef.current >= stopNeed || (
+          len >= HELD_MIN_FRAMES &&
+          settleCountRef.current >= 3 &&
+          gestureSignal >= MOVED_MIN
+        )
 
+      // `gesturePeak` solo se llenaba cuando el movimiento superaba el umbral
+      // de quietud. En señas suaves el pico podía quedar en `peakMovement`
+      // aunque la mano ya estuviera quieta; al usar solo `gesturePeak` nunca se
+      // llamaba a /predict hasta que la persona retiraba la mano.
       const gestureHappened =
-        gesturePeakRef.current >= MOVED_MIN ||
-        (len >= heldMin && gesturePeakRef.current >= HELD_MOVED_MIN) ||
+        gestureSignal >= MOVED_MIN ||
+        (len >= heldMin && gestureSignal >= HELD_MOVED_MIN) ||
         (letterMode && len >= minFrames)
 
       if (
         letterMode &&
-        stillCountRef.current >= stopNeed &&
+        stableEnough &&
         inferenceLockedRef.current &&
         spellBufRef.current.length === 0
       ) {
@@ -1240,8 +1404,9 @@ export default function InterpretScreen({ onBack, onHome }) {
         !inferenceLockedRef.current &&
         !apiInFlightRef.current &&
         !pauseFiredRef.current &&
+        performance.now() >= predictionRetryAtRef.current &&
         gestureHappened &&
-        stillCountRef.current >= stopNeed &&
+        stableEnough &&
         len >= minFrames
       ) {
         pauseFiredRef.current = true
@@ -1250,10 +1415,34 @@ export default function InterpretScreen({ onBack, onHome }) {
         peakMovementRef.current   = 0
         gesturePeakRef.current    = 0
         stillCountRef.current     = 0
+        settleCountRef.current    = 0
         stillPeakRef.current      = 0
+        spellStableCountRef.current = 0
         runPrediction(snapshot, {
           finalize: true,
           lettersOnly: spellingFlow,
+        })
+      }
+
+      // Respaldo para una seña que no consigue una pausa perfecta por jitter:
+      // no reemplaza la confirmación normal y exige dos respuestas iguales.
+      // La ventana no se borra, por lo que el modelo sigue viendo la secuencia
+      // más reciente de landmarks reales.
+      const now = performance.now()
+      const probeReady =
+        !inferenceLockedRef.current &&
+        !apiInFlightRef.current &&
+        !spellingFlow &&
+        len >= PROBE_MIN_FRAMES &&
+        now >= predictionRetryAtRef.current &&
+        now - lastProbeAtRef.current >= PROBE_INTERVAL_MS &&
+        settleCountRef.current >= 2 &&
+        gestureHappened
+      if (probeReady) {
+        lastProbeAtRef.current = now
+        runPrediction([...landmarkBufferRef.current], {
+          finalize: false,
+          probe: true,
         })
       }
     }
@@ -1292,8 +1481,6 @@ export default function InterpretScreen({ onBack, onHome }) {
     let lastPaintedTime = -1
     let lastPaintedBlur = false
     let overlayCtx = null
-    let segmentTick = 0
-    let exposeTick = 0
     let maskDirty = false
     // Máscara sticky: si un frame falla la segmentación, reutilizamos la anterior
     // (evitar apagar el blur → parpadeo).
@@ -1404,8 +1591,13 @@ export default function InterpretScreen({ onBack, onHome }) {
       }
 
       const useBlur = !!(segmenter && maskReady)
+      // En la ventana transparente de Tauri/WebView2 la capa nativa de <video>
+      // puede verse negra aunque MediaPipe sí reciba sus fotogramas. En el modo
+      // flotante pintamos el video dentro del mismo canvas de los landmarks para
+      // evitar esa incompatibilidad del compositor.
+      const paintVideoOnCanvas = compactVoiceOnly && !useBlur
       if (video.style) {
-        video.style.opacity = useBlur ? '0' : '1'
+        video.style.opacity = (useBlur || paintVideoOnCanvas) ? '0' : '1'
       }
 
       const frameCanvas = displayFrameCanvasRef.current
@@ -1442,6 +1634,9 @@ export default function InterpretScreen({ onBack, onHome }) {
         if (useBlur) {
           overlayCtx.clearRect(0, 0, w, h)
           overlayCtx.drawImage(frameCanvas, 0, 0)
+        } else if (paintVideoOnCanvas) {
+          overlayCtx.clearRect(0, 0, w, h)
+          overlayCtx.drawImage(video, 0, 0, w, h)
         } else {
           overlayCtx.clearRect(0, 0, w, h)
         }
@@ -1457,19 +1652,63 @@ export default function InterpretScreen({ onBack, onHome }) {
     }
     detectRafRef.current = requestAnimationFrame(loop)
     return () => { if (detectRafRef.current) cancelAnimationFrame(detectRafRef.current) }
-  }, [])
+  }, [compactVoiceOnly])
 
   // ── Controles ─────────────────────────────────────────────────────────────
-  function startDetect() {
+  const startDetect = useCallback(() => {
     resetPipelineState()
     noHandCountRef.current    = 0
     handWasVisibleRef.current = false
     setRunning(true)
-  }
+  }, [resetPipelineState])
 
   function stopDetect() {
     setRunning(false)
     stopSpeech()
+  }
+
+  // En la cámara flotante la experiencia es manos-libres: al quedar lista la
+  // cámara y conectarse el modelo, empieza a reconocer y hablar. Una pausa
+  // manual permanece pausada hasta que la persona pulse el botón otra vez.
+  useEffect(() => {
+    if (!compactVoiceOnly) return
+    audioRef.current = true
+    if (cameraOk && scriptsLoaded && mlMode && !compactAutoStartedRef.current) {
+      compactAutoStartedRef.current = true
+      startDetect()
+    }
+  }, [compactVoiceOnly, cameraOk, scriptsLoaded, mlMode, startDetect])
+
+  async function openFullInterpretApp() {
+    stopDetect()
+    compactAutoStartedRef.current = false
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop())
+    mediaStreamRef.current = null
+    setCameraConsent(null)
+    if (desktop) {
+      await showDesktopMainWindow()
+      await hideDesktopWindow()
+      return
+    }
+    window.location.href = '/#interpret'
+  }
+
+  async function closeCompactInterpret() {
+    stopDetect()
+    compactAutoStartedRef.current = false
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop())
+    mediaStreamRef.current = null
+    setCameraConsent(null)
+    await hideDesktopWindow()
+  }
+
+  async function openCompactInterpret() {
+    stopDetect()
+    mediaStreamRef.current?.getTracks().forEach((track) => track.stop())
+    mediaStreamRef.current = null
+    setCameraOk(false)
+    setCameraConsent('declined')
+    await onOpenFloating?.()
   }
 
   const handleReset = useCallback(() => {
@@ -1514,6 +1753,89 @@ export default function InterpretScreen({ onBack, onHome }) {
 
   const tutorial = useModeTutorial('interpret')
 
+  if (compactVoiceOnly) {
+    return (
+      <main className="h-screen w-screen overflow-hidden bg-transparent p-2">
+        <section className="relative flex h-full flex-col overflow-hidden rounded-[2rem] border-2 border-white/70 bg-[#f8f4ed]/95 shadow-[0_20px_60px_-18px_rgba(45,42,38,0.55)]">
+          {desktop && <CompactResizeHandles />}
+          <header className="flex items-center justify-between gap-2 border-b border-pastel-ink/10 bg-white/90 px-3 py-2">
+            <div
+              className="min-w-0 flex-1 cursor-move py-1"
+              onMouseDown={(event) => { if (event.button === 0) startDesktopDrag() }}
+            >
+              <p className="truncate text-sm font-black text-pastel-grape">Signara</p>
+            </div>
+            <div className="flex shrink-0 gap-1">
+              {desktop && <CompactMiniButton label="Minimizar" onClick={minimizeDesktopWindow}>—</CompactMiniButton>}
+              <CompactMiniButton label="Abrir Signara completa" onClick={openFullInterpretApp}>□</CompactMiniButton>
+              {desktop && <CompactMiniButton label="Cerrar cámara" onClick={closeCompactInterpret}>×</CompactMiniButton>}
+            </div>
+          </header>
+
+          <div className="relative min-h-0 flex-1 overflow-hidden bg-[#1f1d1b]">
+            <video
+              ref={videoRef}
+              autoPlay
+              playsInline
+              muted
+              className="absolute inset-0 h-full w-full object-cover"
+              style={{ transform: 'scaleX(-1)' }}
+            />
+            <canvas
+              ref={canvasRef}
+              className="pointer-events-none absolute inset-0 h-full w-full"
+              style={{ transform: 'scaleX(-1)' }}
+            />
+
+            <div
+              aria-label={running ? 'Interpretando y reproduciendo por voz' : 'Interpretación pausada'}
+              title={running ? 'Interpretando y reproduciendo por voz' : 'Interpretación pausada'}
+              className="absolute left-3 top-3 z-20 flex h-8 w-8 items-center justify-center rounded-full border-2 border-white/40 bg-black/55"
+            >
+              <span className={'h-2.5 w-2.5 rounded-full ' + (running ? 'animate-pulse bg-red-400' : cameraOk ? 'bg-green-400' : 'bg-white/50')} />
+            </div>
+
+            {cameraConsent === null && (
+              <CompactCameraOverlay
+                icon="camera"
+                actionLabel="Activar cámara"
+                onAction={acceptCameraPermission}
+              />
+            )}
+            {cameraConsent === 'accepted' && !scriptsLoaded && !scriptsError && (
+              <CompactCameraOverlay icon="clock" />
+            )}
+            {scriptsError && (
+              <CompactCameraOverlay icon="alert" actionLabel="Reintentar" onAction={() => window.location.reload()} />
+            )}
+            {scriptsLoaded && cameraConsent === 'accepted' && !cameraOk && !cameraError && (
+              <CompactCameraOverlay icon="camera" />
+            )}
+            {cameraError && (
+              <CompactCameraOverlay icon="ban" actionLabel="Reintentar" onAction={retryCameraAccess} />
+            )}
+            {cameraOk && !mlMode && !mlConnecting && (
+              <CompactCameraOverlay icon="alert" actionLabel="Conectar modelo" onAction={retryMlConnection} />
+            )}
+          </div>
+
+          <footer className="flex items-center justify-center border-t border-pastel-ink/10 bg-white/92 p-3">
+            <button
+              type="button"
+              disabled={!cameraOk || !mlMode}
+              onClick={running ? stopDetect : startDetect}
+              aria-label={running ? 'Pausar interpretación' : 'Empezar a interpretar'}
+              title={running ? 'Pausar interpretación' : 'Empezar a interpretar'}
+              className={'inline-flex h-12 w-12 items-center justify-center rounded-full text-white shadow-sm transition hover:scale-105 disabled:opacity-40 ' + (running ? 'bg-pastel-pink' : 'bg-pastel-grape')}
+            >
+              {running ? <StopIcon /> : <PlayIcon />}
+            </button>
+          </footer>
+        </section>
+      </main>
+    )
+  }
+
   return (
     <AppPage>
       <AppPageHeader>
@@ -1555,6 +1877,16 @@ export default function InterpretScreen({ onBack, onHome }) {
               </div>
 
               <AppPageStagger className="flex flex-wrap gap-2">
+                {onOpenFloating && (
+                  <button
+                    type="button"
+                    onClick={openCompactInterpret}
+                    className="inline-flex items-center gap-2 rounded-full border-2 border-pastel-purple-line bg-white px-3 py-1.5 text-xs font-extrabold text-pastel-grape transition hover:bg-pastel-purple"
+                  >
+                    <Icon name="camera" className="h-4 w-4" strokeWidth={2.25} />
+                    Abrir cámara flotante
+                  </button>
+                )}
                 <MlStatusPill
                   mlMode={mlMode}
                   mlConnecting={mlConnecting}
@@ -1876,6 +2208,61 @@ function StatusPill({ variant, children }) {
     <span className={'inline-flex items-center gap-1.5 rounded-full border-2 px-3 py-1.5 text-xs font-bold ' + styles[variant]}>
       {children}
     </span>
+  )
+}
+
+function CompactMiniButton({ children, label, onClick }) {
+  return (
+    <button
+      type="button"
+      title={label}
+      aria-label={label}
+      onClick={onClick}
+      className="inline-flex h-8 min-w-8 items-center justify-center rounded-lg border border-pastel-ink/10 bg-white px-2 text-xs font-black text-pastel-grape hover:bg-pastel-purple/40"
+    >
+      {children}
+    </button>
+  )
+}
+
+function CompactResizeHandles() {
+  const begin = (direction) => (event) => {
+    if (event.button !== 0) return
+    event.preventDefault()
+    event.stopPropagation()
+    startDesktopResize(direction)
+  }
+
+  return (
+    <>
+      <div aria-hidden="true" onMouseDown={begin('North')} className="absolute inset-x-4 top-0 z-50 h-2 cursor-n-resize" />
+      <div aria-hidden="true" onMouseDown={begin('South')} className="absolute inset-x-4 bottom-0 z-50 h-2 cursor-s-resize" />
+      <div aria-hidden="true" onMouseDown={begin('West')} className="absolute inset-y-4 left-0 z-50 w-2 cursor-w-resize" />
+      <div aria-hidden="true" onMouseDown={begin('East')} className="absolute inset-y-4 right-0 z-50 w-2 cursor-e-resize" />
+      <div aria-hidden="true" onMouseDown={begin('NorthWest')} className="absolute left-0 top-0 z-[51] h-5 w-5 cursor-nw-resize" />
+      <div aria-hidden="true" onMouseDown={begin('NorthEast')} className="absolute right-0 top-0 z-[51] h-5 w-5 cursor-ne-resize" />
+      <div aria-hidden="true" onMouseDown={begin('SouthWest')} className="absolute bottom-0 left-0 z-[51] h-5 w-5 cursor-sw-resize" />
+      <div aria-hidden="true" onMouseDown={begin('SouthEast')} className="absolute bottom-0 right-0 z-[51] h-5 w-5 cursor-se-resize" />
+    </>
+  )
+}
+
+function CompactCameraOverlay({ icon, actionLabel, onAction }) {
+  return (
+    <div className="absolute inset-0 z-30 flex items-center justify-center bg-pastel-ink/70 p-4">
+      <div className="flex flex-col items-center gap-3 rounded-2xl border-2 border-white/60 bg-[#FAF6EC]/95 p-4 text-center shadow-xl">
+        <Icon name={icon} className="h-8 w-8 text-pastel-grape" strokeWidth={1.8} />
+        {actionLabel && (
+          <button
+            type="button"
+            onClick={onAction}
+            className="rounded-xl bg-pastel-grape px-4 py-2 text-xs font-extrabold text-white transition hover:brightness-110"
+          >
+            {actionLabel}
+          </button>
+        )}
+      </div>
+    </div>
   )
 }
 

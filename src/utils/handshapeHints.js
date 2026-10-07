@@ -390,11 +390,17 @@ function looksLikeX(hand) {
   return ie >= 0.38 && ie <= 0.68
 }
 
-/** Correcciones mínimas de deletreo: G↔X/S y M/N/Ñ. */
+/** Correcciones mínimas de deletreo: G↔X y M/N/Ñ/P. */
 export function maybeCorrectSpellingGNMNÑ(prediction, framesCompact) {
   const pred = String(prediction || '').toUpperCase()
-  const gConfused = pred === 'G' || pred === 'X' || pred === 'S'
-  const mnConfused = new Set(['M', 'N', 'Ñ', 'P', 'SI', 'S', 'NO'])
+  // Una S validada por el GNN se respeta. Su puño puede caer en los umbrales
+  // geométricos de G cuando MediaPipe abre apenas el índice, y la corrección
+  // anterior la reemplazaba aunque el modelo hubiese acertado.
+  const gConfused = pred === 'G' || pred === 'X'
+  // S no pertenece al grupo M/N/Ñ/P. Incluirla aquí hacía que una S correcta
+  // pudiera ser reescrita como N por la heurística de índice+medio, aun cuando
+  // el GNN hubiese clasificado S con buena confianza.
+  const mnConfused = new Set(['M', 'N', 'Ñ', 'P', 'SI', 'NO'])
   if (!gConfused && !mnConfused.has(pred)) return prediction
   if (!framesCompact?.length) return prediction
 

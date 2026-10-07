@@ -53,6 +53,7 @@ const VRM_IDLE = {
   leftLowerArm: { x: 0, y: 0, z: 0 },
   leftHand: { x: 0, y: 0, z: 0 },
   head: { x: 0, y: 0, z: 0 },
+  neck: { x: 0, y: 0, z: 0 },
   spine: { x: 0, y: 0, z: 0 },
   chest: { x: 0, y: 0, z: 0 },
   ...restFingerPose('right'),

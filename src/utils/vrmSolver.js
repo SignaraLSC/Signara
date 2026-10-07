@@ -179,7 +179,6 @@ export function frameToArmDirs(frame, arms = { right: true, left: true }) {
   // Preferir 3D real (pose_world) si está; si no, caer a imagen 2D (legacy).
   const useWorld = hasWorld(frame);
   const pose = useWorld ? unmirrorWorld(frame.pose_world) : unmirrorPose(frame.pose || []);
-  const gain = CONFIG.fwdGain;   // inclina hacia adelante (calibrable), también en 3D
   const g = (i) => (present(pose[i]) ? worldize(pose[i]) : null);
 
   const Rsh = g(12), Lsh = g(11);

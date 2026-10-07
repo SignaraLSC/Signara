@@ -28,6 +28,7 @@ export default function useVoiceInput({
   const onResultRef = useRef(onResult)
   const onLiveRef = useRef(onLiveTranscript)
   const lastFinalRef = useRef('')
+  const lastLiveRef = useRef('')
   onResultRef.current = onResult
   onLiveRef.current = onLiveTranscript
 
@@ -63,12 +64,22 @@ export default function useVoiceInput({
       // explícito, nunca con concatenación directa.
       const finalParts = []
       const interimParts = []
+      const appendDistinct = (parts, value) => {
+        const key = value.toLocaleLowerCase('es').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+        const last = parts.at(-1)
+        const lastKey = last
+          ? last.toLocaleLowerCase('es').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+          : ''
+        // WebView2 puede reenviar el mismo SpeechRecognitionResult dos veces
+        // al reiniciar el servicio. No convertirlo en dos frases iguales.
+        if (key !== lastKey) parts.push(value)
+      }
       for (let i = 0; i < event.results.length; i++) {
         const r = event.results[i]
         const t = (r[0].transcript || '').trim()
         if (!t) continue
-        if (r.isFinal) finalParts.push(t)
-        else interimParts.push(t)
+        if (r.isFinal) appendDistinct(finalParts, t)
+        else appendDistinct(interimParts, t)
       }
       const finalText = finalParts.join(' ')
       const interimText = interimParts.join(' ')
@@ -85,7 +96,8 @@ export default function useVoiceInput({
         })
       }
 
-      if (combined) {
+      if (combined && combined !== lastLiveRef.current) {
+        lastLiveRef.current = combined
         setInterim(interimText)
         if (onLiveRef.current) onLiveRef.current(combined, isFullyFinal)
       }
@@ -121,7 +133,11 @@ export default function useVoiceInput({
     recognition.onerror = (e) => {
       console.warn('[useVoiceInput] error:', e.error)
       setError(e.error || 'speech-error')
-      if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+      if (
+        e.error === 'not-allowed' ||
+        e.error === 'service-not-allowed' ||
+        e.error === 'network'
+      ) {
         wantListenRef.current = false
         setListening(false)
       }
@@ -151,6 +167,7 @@ export default function useVoiceInput({
     setError(null)
     setInterim('')
     lastFinalRef.current = ''
+    lastLiveRef.current = ''
     if (!recognitionRef.current) return
     wantListenRef.current = true
     try {

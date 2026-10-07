@@ -22,8 +22,17 @@ import { translateText } from '../utils/translateText.js'
 import { tokenize, normalizeForSearch } from '../utils/textNormalizer.js'
 import { SIGNED_LANG_LABEL } from '../utils/signLanguage.js'
 import { resolveDirectionalForm } from '../utils/directionalVerbs.js'
+import {
+  compileSignPlanToPlayTokens,
+} from '../utils/signPlan.js'
+import { inspectSemanticPrefix, semanticTextToSignPlan } from '../utils/semanticCatalog.js'
+import {
+  flushContextWindow,
+  pushContextWord,
+} from '../utils/contextualSignWindow.js'
 import { tryFingerspellSuffix } from '../utils/fingerspell.js'
 import { translateToSpanish } from '../utils/translateApi.js'
+import { showDesktopOverlayWindow } from '../utils/desktopWindow.js'
 import LanguagePicker from './LanguagePicker.jsx'
 import {
   findOutputLang,
@@ -104,6 +113,7 @@ export default function TranslationScreen({
   const [poseFinished, setPoseFinished] = useState(false)
   const [busy, setBusy] = useState(false)
   const [liveMode, setLiveMode] = useState(false)
+  const [micListening, setMicListening] = useState(false)
   const [pendingWord, setPendingWord] = useState('')
   const [missedWord, setMissedWord] = useState('')
 
@@ -124,6 +134,7 @@ export default function TranslationScreen({
   const liveQueueBufferRef = useRef([])
   const useSignerRef = useRef(false)
   const pendingWordsRef = useRef([])
+  const contextWordsRef = useRef([])
   const inputLangRef = useRef(inputLang)
   const liveTranslateBusyRef = useRef(false)
   const liveTranslateSeqRef = useRef(0)
@@ -193,6 +204,7 @@ export default function TranslationScreen({
     liveMatchedRef.current = false
     liveQueueBufferRef.current = []
     pendingWordsRef.current = []
+    contextWordsRef.current = []
     liveTranslateSeqRef.current += 1
     liveTranslateBusyRef.current = false
     lastLiveQueueRef.current = { token: '', t: 0 }
@@ -228,14 +240,22 @@ export default function TranslationScreen({
     }
     setSpanishText(textEs)
 
-    const tokens = tokenize(textEs).map((w) => w.toUpperCase())
     const available = availableTokensRef.current
-    const matched = matchSignTokens(tokens, available)
+    const signPlan = semanticTextToSignPlan({
+      sourceText: textEs,
+      availableTokens: available,
+      fallbackResolver: matchSignTokens,
+      source: 'text',
+      intent: 'unknown',
+    })
+    const playableTokens = compileSignPlanToPlayTokens(signPlan)
 
-    if (matched.length > 0) {
+    if (playableTokens.length > 0) {
+      // Días 2-3: el catálogo semántico resuelve primero expresiones y
+      // ambigüedades explícitas; el matcher anterior queda como respaldo.
       setTranslateSource('signer3d')
       signerRef.current?.clear()
-      setSignerTokens(matched)
+      setSignerTokens(playableTokens)
       setUseSigner(true)
       useSignerRef.current = true
       setBusy(false)
@@ -291,6 +311,7 @@ export default function TranslationScreen({
     lastLiveQueueRef.current = { token: dedupeKey, t: now }
 
     setMissedWord('')
+    setPoseFinished(false)
     liveMatchedRef.current = true
     setTranslateSource('signer3d')
     // No setSignerTokens aquí: el useEffect haría replace() y reiniciaría la cola.
@@ -302,6 +323,28 @@ export default function TranslationScreen({
       setUseSigner(true)
     }
   }, [])
+
+  // Si el micrófono se activa antes de que termine /animations, no perder la
+  // primera palabra ni enviarla al fallback de deletreo con un catálogo vacío.
+  // Se reprocesa exactamente con el mismo contexto cuando ya hay tokens.
+  useEffect(() => {
+    if (!signerMounted || !availableTokensRef.current.length || !contextWordsRef.current.length) return
+    const waiting = contextWordsRef.current.slice()
+    contextWordsRef.current = []
+    let pending = []
+    for (const word of waiting) {
+      const result = pushContextWord(pending, word, {
+        availableTokens: availableTokensRef.current,
+        fallbackResolver: matchSignTokens,
+        source: 'voice',
+      })
+      pending = result.pendingWords
+      for (const unit of result.committed) {
+        if (unit.playTokens.length) queueLiveTokens(unit.playTokens)
+      }
+    }
+    contextWordsRef.current = pending
+  }, [signerMounted, queueLiveTokens])
 
   const flushLiveTranslate = useCallback(() => {
     const lang = inputLangRef.current
@@ -346,21 +389,32 @@ export default function TranslationScreen({
     const normalized = normalizeForSearch(cleaned)
     if (!normalized) return
 
+    // No resolver palabras mientras /animations siga cargando. Guardarlas aquí
+    // evita que semanticTextToSignPlan las descarte o las deletree por error.
+    if (!availableTokensRef.current.length) {
+      contextWordsRef.current = [...contextWordsRef.current, normalized]
+      pendingWordRef.current = contextWordsRef.current.join(' ')
+      setPendingWord(pendingWordRef.current)
+      return
+    }
+
     const lang = inputLangRef.current
-    // Español: match directo (como antes).
+    // Español: ventana semántica incremental. Confirma frases completas sin
+    // esperar toda la conversación y evita señar palabras aisladas que todavía
+    // pueden cambiar de sentido ("como" → "como estas", "por la" → mañana).
     if (!lang || lang === 'es') {
-      const candidate = [...pendingWordsRef.current, normalized.toUpperCase()]
-      const hit = tryMatchSuffix(candidate, availableTokensRef.current)
-      if (hit) {
-        queueLiveTokens(hit.tokens)
-        pendingWordsRef.current = candidate.slice(0, candidate.length - hit.consumed)
-        return
+      const result = pushContextWord(contextWordsRef.current, normalized, {
+        availableTokens: availableTokensRef.current,
+        fallbackResolver: matchSignTokens,
+        source: 'voice',
+      })
+      contextWordsRef.current = result.pendingWords
+      for (const unit of result.committed) {
+        if (unit.playTokens.length) queueLiveTokens(unit.playTokens)
       }
-      pendingWordsRef.current = candidate
-      if (pendingWordsRef.current.length > 2) {
-        const dropped = pendingWordsRef.current.shift()
-        setMissedWord(dropped)
-      }
+      const pending = contextWordsRef.current.join(' ')
+      pendingWordRef.current = pending
+      setPendingWord(pending)
       return
     }
 
@@ -377,6 +431,28 @@ export default function TranslationScreen({
     pendingWordRef.current = ''
     setPendingWord('')
     setLiveMode(false)
+
+    // Cierra la ventana española: al terminar la frase ya no llegará otra
+    // palabra capaz de completar el contexto pendiente.
+    if ((!inputLangRef.current || inputLangRef.current === 'es') && contextWordsRef.current.length) {
+      // Web Speech marca cada fragmento confirmado como "final", incluso
+      // cuando la conversación continúa. No debemos vaciar aquí prefijos
+      // como "cómo" o "tengo": todavía pueden convertirse en COMO_ESTAS o
+      // TENGO_SED. Antes se vaciaban en este punto y el fallback los
+      // deletreaba antes de que llegara la siguiente palabra.
+      const isSemanticPrefix = inspectSemanticPrefix(contextWordsRef.current).extensions.length > 0
+      if (!isSemanticPrefix && availableTokensRef.current.length) {
+        const result = flushContextWindow(contextWordsRef.current, {
+          availableTokens: availableTokensRef.current,
+          fallbackResolver: matchSignTokens,
+          source: 'voice',
+        })
+        contextWordsRef.current = []
+        for (const unit of result.committed) {
+          if (unit.playTokens.length) queueLiveTokens(unit.playTokens)
+        }
+      }
+    }
     // Nadie más viene detrás — cualquier palabra que quedó esperando pareja
     // (ej. dijiste "por" y ahí terminó, sin "favor") no va a combinar con
     // nada; se limpia el buffer para la próxima frase.
@@ -391,15 +467,15 @@ export default function TranslationScreen({
       return
     }
     if (text?.trim()) handleSubmit(text.trim())
-  }, [handleSubmit])
+  }, [handleSubmit, queueLiveTokens])
 
   // Apagar mic: limpia UI en vivo. No toca liveMatchedRef — el onResult
   // final de la sesión aún puede llegar y necesita ese flag.
   const handleVoiceEnd = useCallback(() => {
     setLiveMode(false)
     pendingWordsRef.current = []
-    pendingWordRef.current = ''
-    setPendingWord('')
+    // No limpiar contextWordsRef aquí: Web Speech puede entregar onend antes
+    // del último resultado final; handleVoiceFinal es quien lo confirma.
     liveTranslateSeqRef.current += 1
     liveTranslateBusyRef.current = false
   }, [])
@@ -415,6 +491,7 @@ export default function TranslationScreen({
     liveMatchedRef.current = false
     setLiveMode(false)
     pendingWordsRef.current = []
+    contextWordsRef.current = []
     handleSubmit(text)
   }, [handleVoiceFinal, handleSubmit])
 
@@ -433,7 +510,17 @@ export default function TranslationScreen({
     storeInputLang(code)
     setInputLang(code)
     pendingWordsRef.current = []
+    contextWordsRef.current = []
   }
+
+  const openFloatingAvatar = useCallback(async () => {
+    const shown = await showDesktopOverlayWindow()
+    if (shown) return
+    const url = new URL(window.location.href)
+    url.search = '?overlay=1'
+    url.hash = ''
+    window.open(url.toString(), 'signara-overlay', 'width=420,height=650,resizable=yes')
+  }, [])
 
   return (
     <AppPage>
@@ -496,6 +583,7 @@ export default function TranslationScreen({
                 onSubmit={handlePanelSubmit}
                 onLiveWord={handleLiveWord}
                 onVoiceEnd={handleVoiceEnd}
+                onListeningChange={setMicListening}
                 busy={busy}
                 pendingWord={pendingWord}
                 missedWord={missedWord}
@@ -558,19 +646,31 @@ export default function TranslationScreen({
 
               <div className="ta-avatar animate-motion-scale-in self-start">
                 <div className="relative flex w-full flex-col overflow-hidden rounded-[2rem] border-[3px] border-pastel-blue-line bg-pastel-blue p-5 shadow-[0_24px_50px_-28px_rgba(147,190,240,0.7)] sm:p-7">
-                  <div className="relative mb-4">
-                    <p className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-[0.22em] text-pastel-ink/70">
-                      <Icon name="eye" className="h-3.5 w-3.5" strokeWidth={2.25} /> Mira aquí
-                    </p>
-                    <p className="mt-1 text-xl font-extrabold text-pastel-ink sm:text-2xl">
-                      {hasPose3d && !useSigner
-                        ? poseFinished
-                          ? `Seña ${SIGNED_LANG_LABEL} (final)`
-                          : `Seña ${SIGNED_LANG_LABEL} (3D)`
-                        : signerMounted
-                          ? `Seña ${SIGNED_LANG_LABEL} (avatar 3D)`
-                          : 'Escribe para ver la animación'}
-                    </p>
+                  <div className="relative mb-4 flex items-start justify-between gap-3">
+                    <div className="min-w-0">
+                      <p className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-[0.22em] text-pastel-ink/70">
+                        <Icon name="eye" className="h-3.5 w-3.5" strokeWidth={2.25} /> Mira aquí
+                      </p>
+                      <p className="mt-1 text-xl font-extrabold text-pastel-ink sm:text-2xl">
+                        {hasPose3d && !useSigner
+                          ? poseFinished
+                            ? `Seña ${SIGNED_LANG_LABEL} (final)`
+                            : `Seña ${SIGNED_LANG_LABEL} (3D)`
+                          : signerMounted
+                            ? `Seña ${SIGNED_LANG_LABEL} (avatar 3D)`
+                            : 'Escribe para ver la animación'}
+                      </p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={openFloatingAvatar}
+                      className="inline-flex shrink-0 items-center gap-2 rounded-xl border-2 border-pastel-blue-line bg-white px-3 py-2 text-xs font-extrabold text-pastel-ink shadow-sm transition hover:-translate-y-0.5 hover:bg-pastel-blue-line hover:text-white focus:outline-none focus:ring-4 focus:ring-white/70"
+                      title="Usar el avatar sobre Word u otras aplicaciones"
+                    >
+                      <span aria-hidden="true">↗</span>
+                      <span className="hidden sm:inline">Abrir flotante</span>
+                      <span className="sm:hidden">Flotante</span>
+                    </button>
                   </div>
 
                   {poseError && (
@@ -587,6 +687,7 @@ export default function TranslationScreen({
                         <AvatarSignerVRM
                           ref={signerRef}
                           apiUrl={ML_API_URL}
+                          live={micListening}
                           onFinish={() => setPoseFinished(true)}
                         />
                       </div>

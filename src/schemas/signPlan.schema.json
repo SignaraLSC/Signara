@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://signara.co/schemas/sign-plan-v1.json",
+  "title": "Signara SignPlan",
+  "description": "Contrato intermedio entre comprensión de español/LSC y reproducción del avatar.",
+  "type": "object",
+  "required": ["schemaVersion", "planId", "source", "intent", "tokens", "metadata"],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "const": "1.0" },
+    "planId": { "type": "string", "minLength": 1 },
+    "source": {
+      "type": "object",
+      "required": ["kind", "locale", "text"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["text", "voice", "camera"] },
+        "locale": { "type": "string", "minLength": 1 },
+        "text": { "type": "string" }
+      }
+    },
+    "intent": { "type": "string", "minLength": 1 },
+    "tokens": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/token" }
+    },
+    "metadata": { "type": "object" }
+  },
+  "$defs": {
+    "baseToken": {
+      "type": "object",
+      "required": ["id", "type", "sourceText", "sourceSpan", "gloss", "playToken", "availability", "status", "confidence", "payload"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "type": { "enum": ["sign", "phrase", "temporal", "pronoun", "direction", "facial"] },
+        "sourceText": { "type": "string" },
+        "sourceSpan": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "required": ["start", "end"],
+              "additionalProperties": false,
+              "properties": {
+                "start": { "type": "integer", "minimum": 0 },
+                "end": { "type": "integer", "minimum": 0 }
+              }
+            }
+          ]
+        },
+        "gloss": { "type": ["string", "null"] },
+        "playToken": { "type": ["string", "null"] },
+        "availability": { "enum": ["available", "missing", "modifier"] },
+        "status": { "enum": ["pending", "committed"] },
+        "confidence": { "type": "number", "minimum": 0, "maximum": 1 },
+        "payload": { "type": "object" }
+      }
+    },
+    "token": {
+      "allOf": [
+        { "$ref": "#/$defs/baseToken" },
+        {
+          "if": { "properties": { "type": { "const": "temporal" } } },
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "required": ["kind", "value"],
+                "properties": {
+                  "kind": { "enum": ["day", "day_period", "date", "time", "duration", "frequency", "relative"] },
+                  "value": { "type": "string", "minLength": 1 },
+                  "orientation": { "enum": ["past", "present", "future", "contextual"] }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "pronoun" } } },
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "required": ["person", "number", "implicit"],
+                "properties": {
+                  "person": { "enum": [1, 2, 3] },
+                  "number": { "enum": ["singular", "plural"] },
+                  "implicit": { "type": "boolean" },
+                  "referentId": { "type": "string" },
+                  "locus": { "enum": ["self", "listener", "left", "right", "group"] }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "direction" } } },
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "required": ["direction", "appliesTo"],
+                "properties": {
+                  "direction": { "enum": ["neutral", "self", "listener", "third", "group_self", "group_third", "fan_out", "third_self", "third_group_self", "plead"] },
+                  "appliesTo": { "type": "string", "minLength": 1 }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "type": { "const": "facial" } } },
+          "then": {
+            "properties": {
+              "payload": {
+                "type": "object",
+                "required": ["appliesTo", "channels"],
+                "properties": {
+                  "appliesTo": { "type": "string", "minLength": 1 },
+                  "channels": {
+                    "type": "object",
+                    "minProperties": 1,
+                    "propertyNames": { "enum": ["brows", "eyes", "mouth", "cheeks", "head"] },
+                    "additionalProperties": { "type": "number", "minimum": 0, "maximum": 1 }
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

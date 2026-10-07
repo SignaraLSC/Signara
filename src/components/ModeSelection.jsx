@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { SectionLabel } from './AppShell.jsx'
 import {
   AppPage,
@@ -11,7 +12,7 @@ import {
 /**
  * ModeSelection — elección entre Traducir e Interpretar.
  */
-export default function ModeSelection({ onSelect, onBack }) {
+export default function ModeSelection({ onSelect, onBack, onOpenFloating, onOpenFloatingInterpret }) {
   return (
     <AppPage>
       <AppPageHeader>
@@ -55,6 +56,9 @@ export default function ModeSelection({ onSelect, onBack }) {
                 icon={<TranslateIcon />}
                 cta="Empezar a traducir"
                 onClick={() => onSelect('translate')}
+                floatingAction={onOpenFloating}
+                floatingLabel="Abrir avatar flotante"
+                floatingDescription="Sobre Word, Teams u otra aplicación"
               />
               <ModeCard
                 number="02"
@@ -67,6 +71,9 @@ export default function ModeSelection({ onSelect, onBack }) {
                 icon={<CameraIcon />}
                 cta="Empezar a interpretar"
                 onClick={() => onSelect('interpret')}
+                floatingAction={onOpenFloatingInterpret}
+                floatingLabel="Abrir cámara flotante"
+                floatingDescription="Escucha las señas sin mostrar el texto"
               />
             </AppPageStagger>
 
@@ -102,6 +109,7 @@ const CARD_STYLES = {
     cta: 'border-[3px] border-pastel-blue-line bg-white text-pastel-ink shadow-[0_10px_24px_-12px_rgba(147,190,240,0.45)] hover:bg-pastel-blue-line hover:text-white',
     check: 'bg-pastel-blue-line',
     bigNumber: 'text-pastel-blue-line',
+    menu: 'border-pastel-blue-line hover:bg-pastel-blue',
   },
   purple: {
     card: 'border-pastel-purple-line bg-pastel-purple hover:border-pastel-purple-line hover:shadow-[0_28px_50px_-24px_rgba(188,164,230,0.85)]',
@@ -111,6 +119,7 @@ const CARD_STYLES = {
     cta: 'border-[3px] border-pastel-purple-line bg-white text-pastel-ink shadow-[0_10px_24px_-12px_rgba(188,164,230,0.45)] hover:bg-pastel-purple-line hover:text-white',
     check: 'bg-pastel-purple-line',
     bigNumber: 'text-pastel-purple-line',
+    menu: 'border-pastel-purple-line hover:bg-pastel-purple',
   },
 }
 
@@ -125,13 +134,16 @@ function ModeCard({
   icon,
   cta,
   onClick,
+  floatingAction,
+  floatingLabel,
+  floatingDescription,
 }) {
   const s = CARD_STYLES[color]
+  const [menuOpen, setMenuOpen] = useState(false)
   return (
-    <button
-      onClick={onClick}
+    <article
       className={
-        'group motion-surface relative flex min-h-[420px] flex-col overflow-hidden rounded-[2rem] border-[3px] p-7 text-left shadow-[0_20px_44px_-28px_rgba(45,42,38,0.5)] hover:-translate-y-2 focus:outline-none focus:ring-4 focus:ring-pastel-ink/15 md:p-8 ' +
+        'group motion-surface relative flex min-h-[420px] flex-col rounded-[2rem] border-[3px] p-7 text-left shadow-[0_20px_44px_-28px_rgba(45,42,38,0.5)] hover:-translate-y-2 md:p-8 ' +
         s.card
       }
     >
@@ -183,16 +195,40 @@ function ModeCard({
         </ul>
       </div>
 
-      <span
-        className={
-          'relative mt-8 inline-flex w-full items-center justify-center gap-2 rounded-2xl px-6 py-4 text-sm font-extrabold transition group-hover:scale-[1.02] ' +
-          s.cta
-        }
-      >
-        {cta}
-        <ArrowRightIcon />
-      </span>
-    </button>
+      <div className="relative mt-8 flex gap-1">
+        <button
+          type="button"
+          onClick={onClick}
+          className={'inline-flex min-w-0 flex-1 items-center justify-center gap-2 rounded-2xl px-6 py-4 text-sm font-extrabold transition group-hover:scale-[1.01] ' + s.cta}
+        >
+          {cta}
+          <ArrowRightIcon />
+        </button>
+        {floatingAction && (
+          <button
+            type="button"
+            aria-label={`Más opciones de ${title.toLowerCase()}`}
+            aria-expanded={menuOpen}
+            onClick={() => setMenuOpen((value) => !value)}
+            className={'w-14 rounded-2xl text-lg font-black transition ' + s.cta}
+          >
+            ▾
+          </button>
+        )}
+        {floatingAction && menuOpen && (
+          <div className={'absolute bottom-full right-0 z-20 mb-2 w-64 rounded-2xl border-2 bg-white p-2 shadow-2xl ' + s.menu.split(' ')[0]}>
+            <button
+              type="button"
+              onClick={() => { setMenuOpen(false); floatingAction() }}
+              className={'w-full rounded-xl px-3 py-3 text-left text-sm font-extrabold text-pastel-ink ' + s.menu.split(' ')[1]}
+            >
+              {floatingLabel}
+              <span className="mt-1 block text-xs font-semibold text-pastel-sub">{floatingDescription}</span>
+            </button>
+          </div>
+        )}
+      </div>
+    </article>
   )
 }
 

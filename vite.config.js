@@ -6,7 +6,7 @@ function translateDevProxy(env) {
   return {
     name: 'signara-translate-dev',
     configureServer(server) {
-      server.middlewares.use('/api/translate', async (req, res, next) => {
+      server.middlewares.use('/api/translate', async (req, res, _next) => {
         if (req.method === 'OPTIONS') {
           res.statusCode = 204
           res.end()

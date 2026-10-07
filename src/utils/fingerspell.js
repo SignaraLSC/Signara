@@ -23,9 +23,9 @@ export function wordToLetters(word) {
   const raw = String(word || '')
     .normalize('NFD')
     .replace(/n\u0303/gi, 'Ñ') // ñ como letra propia antes de quitar marcas
-    .replace(/Ñ/g, '\u0001')
+    .replace(/Ñ/g, '__enye__')
     .replace(/[\u0300-\u036f]/g, '')
-    .replace(/\u0001/g, 'Ñ')
+    .replace(/__enye__/g, 'Ñ')
     .toUpperCase()
     .replace(/[^A-ZÑ]/g, '')
   if (raw.length < 2) return []

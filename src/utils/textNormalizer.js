@@ -32,9 +32,9 @@ export function normalizeForSearch(text) {
     String(text)
       .toLowerCase()
       .normalize('NFD')
-      .replace(/n\u0303/g, '\u0001') // ñ = n + tilde → proteger
+      .replace(/n\u0303/g, '__enye__') // ñ = n + tilde → proteger
       .replace(/[̀-ͯ]/g, '')   // quitar acentos
-      .replace(/\u0001/g, 'ñ')
+      .replace(/__enye__/g, 'ñ')
       .replace(/[¿¡.,!?;:()-]/g, ' ')  // puntuación → espacio
       .replace(/\s+/g, ' ')
       .trim()

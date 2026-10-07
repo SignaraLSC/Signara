@@ -259,3 +259,172 @@ export function maybeCorrectComoFamilia(prediction, framesCompact) {
   if ((geo.fShape ?? 0) >= 0.4 || (geo.wristDist ?? 1) <= 0.3) return 'FAMILIA'
   return geo.preferred || prediction
 }
+
+function letterFingerProfile(hand) {
+  const ie = fingerExt(hand, INDEX_MCP, INDEX_TIP)
+  const me = fingerExt(hand, MIDDLE_MCP, MIDDLE_TIP)
+  const re = fingerExt(hand, RING_MCP, RING_TIP)
+  const pe = fingerExt(hand, PINKY_MCP, PINKY_TIP)
+  return { ie, me, re, pe, twoOpen: Math.min(ie, me) }
+}
+
+function looksLikeN(hand) {
+  const { ie, me, re, pe, twoOpen } = letterFingerProfile(hand)
+  if (ie < 0.55 || me < 0.50) return false
+  if (me < ie * 0.72) return false
+  const ringDown = re <= 1.05 && twoOpen - re >= 0.015
+  const pinkyDown = pe <= 1.18
+  return ringDown && pinkyDown
+}
+
+/** Regla checkpoint L3477: índice+medio juntos → N (GNN suele decir P). */
+function isIndexMiddleNShape(hand) {
+  const { ie, me } = letterFingerProfile(hand)
+  return ie >= 0.50 && me >= ie * 0.68
+}
+
+function looksLikeP(hand) {
+  const { ie, me, re, pe } = letterFingerProfile(hand)
+  if (ie < 0.48) return false
+  if (me >= ie * 0.72) return false
+  return me <= 0.68 && re <= 1.12 && pe <= 1.12
+}
+
+function classifyMNÑ(hand, barrido = false) {
+  const ie = fingerExt(hand, INDEX_MCP, INDEX_TIP)
+  const me = fingerExt(hand, MIDDLE_MCP, MIDDLE_TIP)
+  const re = fingerExt(hand, RING_MCP, RING_TIP)
+  const pe = fingerExt(hand, PINKY_MCP, PINKY_TIP)
+  if (ie < 0.65 || me < 0.65) return null
+  const twoOpen = Math.min(ie, me)
+  const ringOpen = re >= 0.72 && re >= twoOpen * 0.75
+  const pinkyDown = pe <= 1.12 && Math.min(ie, me, re) > pe * 1.03
+  if (ringOpen && pinkyDown) return 'M'
+  const ringDown = re <= 1.0 && twoOpen - re >= 0.025 && re < twoOpen * 0.97
+  if (ringDown && pe <= 1.15) return barrido ? 'Ñ' : 'N'
+  return null
+}
+
+/**
+ * Barrido deliberado de Ñ: meñique se mueve respecto a la muñeca en una
+ * dirección sostenida, con índice y medio estables (forma N estática).
+ * Umbrales viejos (total≥0.038 OR maxStep≥0.022) marcaban temblor como Ñ.
+ */
+function hasEnyeSweep(framesCompact) {
+  const seq = pickActiveHand(framesCompact)
+  if (!seq || seq.length < 6) return false
+
+  const relPinky = []
+  const relIndex = []
+  const relMiddle = []
+  for (const h of seq) {
+    const wx = h[0].x
+    const wy = h[0].y
+    relPinky.push({ x: h[PINKY_TIP].x - wx, y: h[PINKY_TIP].y - wy })
+    relIndex.push({ x: h[INDEX_TIP].x - wx, y: h[INDEX_TIP].y - wy })
+    relMiddle.push({ x: h[MIDDLE_TIP].x - wx, y: h[MIDDLE_TIP].y - wy })
+  }
+
+  let indexMiddleJitter = 0
+  for (let i = 1; i < seq.length; i++) {
+    indexMiddleJitter = Math.max(
+      indexMiddleJitter,
+      Math.hypot(relIndex[i].x - relIndex[i - 1].x, relIndex[i].y - relIndex[i - 1].y),
+      Math.hypot(relMiddle[i].x - relMiddle[i - 1].x, relMiddle[i].y - relMiddle[i - 1].y),
+    )
+  }
+  if (indexMiddleJitter > 0.028) return false
+
+  const n = relPinky.length
+  const net = Math.hypot(
+    relPinky[n - 1].x - relPinky[0].x,
+    relPinky[n - 1].y - relPinky[0].y,
+  )
+
+  let bestRun = 0
+  let run = 0
+  let prevDx = 0
+  let prevDy = 0
+  for (let i = 1; i < n; i++) {
+    const dx = relPinky[i].x - relPinky[i - 1].x
+    const dy = relPinky[i].y - relPinky[i - 1].y
+    const step = Math.hypot(dx, dy)
+    if (step < 0.007) {
+      run = 0
+      continue
+    }
+    const sameDir = i === 1 || dx * prevDx + dy * prevDy > 0
+    run = sameDir ? run + step : step
+    bestRun = Math.max(bestRun, run)
+    prevDx = dx
+    prevDy = dy
+  }
+
+  return net >= 0.048 && bestRun >= 0.038
+}
+
+function looksLikeG(hand) {
+  const ie = fingerExt(hand, INDEX_MCP, INDEX_TIP)
+  const me = fingerExt(hand, MIDDLE_MCP, MIDDLE_TIP)
+  const re = fingerExt(hand, RING_MCP, RING_TIP)
+  const pe = fingerExt(hand, PINKY_MCP, PINKY_TIP)
+  const closed = Math.max(me, re, pe)
+  if (closed > 1.08 || ie < 0.52 || ie > 0.98) return false
+  if (ie >= 0.74 && me >= 0.74) return false
+  const bone =
+    Math.hypot(hand[INDEX_MCP].x - hand[0].x, hand[INDEX_MCP].y - hand[0].y) || 1e-4
+  const thumbToIndexTip =
+    Math.hypot(hand[4].x - hand[INDEX_TIP].x, hand[4].y - hand[INDEX_TIP].y) / bone
+  return ie >= 0.56 && ie <= 0.90 && closed <= 1.06 &&
+    thumbToIndexTip >= 0.20 && thumbToIndexTip <= 0.58
+}
+
+function looksLikeX(hand) {
+  const ie = fingerExt(hand, INDEX_MCP, INDEX_TIP)
+  const closed = Math.max(
+    fingerExt(hand, MIDDLE_MCP, MIDDLE_TIP),
+    fingerExt(hand, RING_MCP, RING_TIP),
+    fingerExt(hand, PINKY_MCP, PINKY_TIP),
+  )
+  if (closed > 1.1 || ie >= 0.72) return false
+  return ie >= 0.38 && ie <= 0.68
+}
+
+/** Correcciones mínimas de deletreo: G↔X y M/N/Ñ/P. */
+export function maybeCorrectSpellingGNMNÑ(prediction, framesCompact) {
+  const pred = String(prediction || '').toUpperCase()
+  // Una S validada por el GNN se respeta. Su puño puede caer en los umbrales
+  // geométricos de G cuando MediaPipe abre apenas el índice, y la corrección
+  // anterior la reemplazaba aunque el modelo hubiese acertado.
+  const gConfused = pred === 'G' || pred === 'X'
+  // S no pertenece al grupo M/N/Ñ/P. Incluirla aquí hacía que una S correcta
+  // pudiera ser reescrita como N por la heurística de índice+medio, aun cuando
+  // el GNN hubiese clasificado S con buena confianza.
+  const mnConfused = new Set(['M', 'N', 'Ñ', 'P', 'SI', 'NO'])
+  if (!gConfused && !mnConfused.has(pred)) return prediction
+  if (!framesCompact?.length) return prediction
+
+  const seq = pickActiveHand(framesCompact)
+  if (!seq) return prediction
+  const hand = meanHand(seq.slice(-Math.min(8, seq.length)))
+  const enyeSweep = hasEnyeSweep(framesCompact)
+  const { ie, me } = letterFingerProfile(hand)
+
+  if (pred === 'P' || pred === 'N' || pred === 'Ñ' || pred === 'M' || mnConfused.has(pred)) {
+    // Checkpoint L3477: medio ≥ 68 % del índice → N (aunque el GNN diga P).
+    if (isIndexMiddleNShape(hand)) return enyeSweep ? 'Ñ' : 'N'
+    if (looksLikeN(hand)) return enyeSweep ? 'Ñ' : 'N'
+    if (pred === 'Ñ' && !enyeSweep) return 'N'
+    if (pred === 'P' && me >= ie * 0.68 && ie >= 0.50) return enyeSweep ? 'Ñ' : 'N'
+    if (looksLikeP(hand)) return 'P'
+    const mn = classifyMNÑ(hand, enyeSweep)
+    if (mn) return mn
+  }
+
+  if (gConfused) {
+    if (looksLikeG(hand) && !looksLikeX(hand)) return 'G'
+    if (pred === 'X' && looksLikeX(hand) && !looksLikeG(hand)) return 'X'
+  }
+
+  return prediction
+}

@@ -16,7 +16,6 @@
  */
 
 // ── Offsets de cada segmento dentro del array de 124 puntos ────────────────
-const OVAL = 0        // 36 puntos (no usado todavía)
 const R_EYE = 36       // 16 puntos
 const L_EYE = 52       // 16 puntos
 const R_BROW = 68      // 5 puntos — FACE_R_BROW [107,66,105,63,70]
@@ -42,9 +41,7 @@ const EYE_L_TOP = L_EYE + 12     // landmark 386 — párpado superior ojo izq
 const EYE_L_BOTTOM = L_EYE + 4      // landmark 374 — párpado inferior ojo izq
 
 // Cejas: índice 0 ≈ interna (glabela), 2 ≈ centro, 4 ≈ externa.
-const BROW_R_INNER = R_BROW + 0   // landmark 107
 const BROW_R_MID = R_BROW + 2     // landmark 105
-const BROW_L_INNER = L_BROW + 0   // landmark 336
 const BROW_L_MID = L_BROW + 2     // landmark 334
 
 export const FACE_CONFIG = {

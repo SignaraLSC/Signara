@@ -5,7 +5,17 @@ import reactRefresh from 'eslint-plugin-react-refresh'
 import globals from 'globals'
 
 export default [
-  { ignores: ['dist/**', 'node_modules/**', 'sign_ai/**', 'public/**'] },
+  {
+    ignores: [
+      'dist/**',
+      'node_modules/**',
+      'sign_ai/**',
+      'public/**',
+      '.checkpoint-replay/**',
+      '.checkpoint-replay-v2/**',
+      'tmp/**',
+    ],
+  },
   js.configs.recommended,
   {
     files: ['**/*.{js,jsx,mjs}'],

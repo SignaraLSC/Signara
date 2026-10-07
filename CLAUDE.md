@@ -177,6 +177,44 @@ toward chest → `AYUDAME`; clear circular/sweep → `AYUDANOS`; static TE_AMO
 Keep direction keys (`self` / `listener` / `third` / `group_self` / …) in sync
 between the JS and Python `DIRECTIONAL_VERBS` tables.
 
+### SignPlan v1 (semantic intermediate representation)
+
+Translation no longer has to couple Spanish words directly to avatar file
+names. `src/utils/signPlan.js` defines the versioned intermediate contract with
+six token types: `sign`, `phrase`, `temporal`, `pronoun`, `direction`, and
+`facial`. Its formal JSON Schema is `src/schemas/signPlan.schema.json`; design
+and examples live in `docs/sign-plan-v1.md`.
+
+The production avatar still accepts string play tokens. Use
+`compileSignPlanToPlayTokens(plan)` at that boundary. `direction` and `facial`
+are modifiers and must never be queued as independent clips. Batch translation
+already crosses this contract through `legacyPlayTokensToSignPlan`; later
+semantic phases should replace that compatibility adapter rather than bypass
+the plan. Validate changes with `npm run test:sign-plan`.
+
+`src/data/semanticCatalog.js` is the versioned educational lexicon used before
+literal matching. `src/utils/semanticCatalog.js` performs longest-match
+segmentation and preserves understood-but-unrecorded meanings as
+`availability: missing`; only available clips compile to the avatar queue.
+Do not turn pending ambiguity notes into automatic LSC output without community
+review. Validate catalog changes with `npm run test:semantic-catalog`.
+
+### Desktop floating avatar (Tauri 2)
+
+`src-tauri/` packages Signara as a Windows desktop app with two windows:
+`main` (the normal app) and `overlay` (`/?overlay=1`, transparent, borderless,
+resizable and always-on-top). The overlay UI is
+`src/components/FloatingAvatarWidget.jsx`; native-safe window helpers live in
+`src/utils/desktopWindow.js`. The tray is built in `src-tauri/src/lib.rs` and
+must always provide a way to disable click-through again.
+
+Use `npm run desktop:dev` for the native app or open `/?overlay=1` in the
+normal Vite server for UI-only testing. Full instructions are in
+`docs/desktop-widget.md`. Conversation memory v1 is implemented in
+`src/utils/conversationContext.js`; validate it together with the incremental
+window using `npm run test:conversation-context` and
+`npm run test:context-window`.
+
 ### Words with multiple valid signs (variants)
 Some words have more than one genuinely different way of signing them (e.g. a
 regional LSC variant), as opposed to just stylistic differences between people.

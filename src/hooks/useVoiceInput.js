@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
+import { advanceVoiceResultLedger, createVoiceResultLedger } from '../utils/voiceTranscript.js'
 
 /**
  * useVoiceInput
@@ -6,9 +7,8 @@ import { useEffect, useRef, useState, useCallback } from 'react'
  *
  * Two callbacks for the streaming use-case:
  *   - onLiveTranscript(text)   fires continuously with the in-progress
- *                              interim transcription. Used to drive the
- *                              real-time word queue.
- *   - onResult(text)           fires once per finalised utterance.
+ *                              interim transcription for preview only.
+ *   - onResult(text)           delivers only new confirmed fragments.
  *
  * `continuous: true` keeps the recogniser open and re-arms on `onend`.
  */
@@ -27,7 +27,6 @@ export default function useVoiceInput({
   const wantListenRef = useRef(false)
   const onResultRef = useRef(onResult)
   const onLiveRef = useRef(onLiveTranscript)
-  const lastFinalRef = useRef('')
   const lastLiveRef = useRef('')
   onResultRef.current = onResult
   onLiveRef.current = onLiveTranscript
@@ -47,44 +46,27 @@ export default function useVoiceInput({
     recognition.interimResults = true
     recognition.maxAlternatives = 1
 
+    let ledger = createVoiceResultLedger()
+    let previousFinalParts = []
+    let newSpeech = false
+    let disposed = false
+    recognition.onstart = () => {
+      if (disposed) return
+      ledger = createVoiceResultLedger(previousFinalParts)
+      newSpeech = false
+      lastLiveRef.current = ''
+      setInterim('')
+      onLiveRef.current?.('', true, { interimText: '', finalText: '', delta: '' })
+    }
+    recognition.onspeechstart = () => { newSpeech = true }
+
     recognition.onresult = (event) => {
-      // OJO #1: event.resultIndex es poco fiable entre navegadores — en
-      // algunos se queda en 0 (cada evento trae el texto COMPLETO
-      // acumulado), en otros avanza (cada evento trae solo lo NUEVO).
-      // Solución: reconstruir SIEMPRE el texto completo iterando TODOS los
-      // resultados desde el índice 0.
-      // OJO #2 (el bug real): cuando hay VARIOS resultados — típico si hablas
-      // con una pequeña pausa entre palabras, cada palabra queda como su
-      // propio result — concatenarlos con += los pegaba SIN ESPACIO
-      // ("hola"+"gracias"+"bien" → "holagraciasbien"), porque
-      // result.transcript no trae espacio propio de forma consistente. Al
-      // separar por espacios después, esa palabra pegada contaba como UNA
-      // sola — la del medio "desaparecía" (fusionada), leyéndose como
-      // salto/duplicado según cómo cayera el conteo. Se une con join(' ')
-      // explícito, nunca con concatenación directa.
-      const finalParts = []
-      const interimParts = []
-      const appendDistinct = (parts, value) => {
-        const key = value.toLocaleLowerCase('es').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-        const last = parts.at(-1)
-        const lastKey = last
-          ? last.toLocaleLowerCase('es').normalize('NFD').replace(/[\u0300-\u036f]/g, '')
-          : ''
-        // WebView2 puede reenviar el mismo SpeechRecognitionResult dos veces
-        // al reiniciar el servicio. No convertirlo en dos frases iguales.
-        if (key !== lastKey) parts.push(value)
-      }
-      for (let i = 0; i < event.results.length; i++) {
-        const r = event.results[i]
-        const t = (r[0].transcript || '').trim()
-        if (!t) continue
-        if (r.isFinal) appendDistinct(finalParts, t)
-        else appendDistinct(interimParts, t)
-      }
-      const finalText = finalParts.join(' ')
-      const interimText = interimParts.join(' ')
-      const combined = [finalText, interimText].filter(Boolean).join(' ')
-      const isFullyFinal = interimText === '' // ninguna palabra queda "en progreso"
+      if (disposed) return
+      // No convertir hipótesis («se»→«sed») en palabras irrevocables.
+      // El ledger consume cada resultado final una vez, aunque el navegador
+      // reenvíe toda la sesión o acorte/corrija los resultados provisionales.
+      const snapshot = advanceVoiceResultLedger(ledger, event.results, { newSpeech })
+      const { finalText, interimText, combined, isFullyFinal, delta } = snapshot
 
       // TEMPORAL: activa con window.__SIGNARA_VOICE_DEBUG = true en la consola
       // antes de hablar, para ver exactamente qué manda el navegador si el
@@ -96,41 +78,20 @@ export default function useVoiceInput({
         })
       }
 
-      if (combined && combined !== lastLiveRef.current) {
+      if (combined !== lastLiveRef.current || delta) {
         lastLiveRef.current = combined
         setInterim(interimText)
-        if (onLiveRef.current) onLiveRef.current(combined, isFullyFinal)
+        if (onLiveRef.current) onLiveRef.current(combined, isFullyFinal, snapshot)
       }
 
-      // Respaldo (traducción de frase completa): solo cuando ya no hay nada
-      // pendiente Y el texto final creció de verdad respecto al último aviso.
-      // En continuous, tras una pausa el API reenvía TODO lo final acumulado
-      // de la sesión — solo entregamos el DELTA de palabras nuevas para no
-      // retraducir / re-apendar la frase entera.
-      if (isFullyFinal && finalText && finalText !== lastFinalRef.current) {
-        const prev = (lastFinalRef.current || '').trim()
-        const full = finalText.trim()
-        lastFinalRef.current = full
-        let delta = full
-        if (prev) {
-          const prevW = prev.split(/\s+/).filter(Boolean)
-          const fullW = full.split(/\s+/).filter(Boolean)
-          let i = 0
-          while (
-            i < prevW.length &&
-            i < fullW.length &&
-            prevW[i].localeCompare(fullW[i], 'es', { sensitivity: 'base' }) === 0
-          ) i++
-          delta = i > 0 ? fullW.slice(i).join(' ') : full
-        }
-        if (delta) {
-          setTranscript(delta)
-          if (onResultRef.current) onResultRef.current(delta)
-        }
+      if (delta) {
+        setTranscript(delta)
+        if (onResultRef.current) onResultRef.current(delta)
       }
     }
 
     recognition.onerror = (e) => {
+      if (disposed) return
       console.warn('[useVoiceInput] error:', e.error)
       setError(e.error || 'speech-error')
       if (
@@ -144,6 +105,10 @@ export default function useVoiceInput({
     }
 
     recognition.onend = () => {
+      if (disposed) return
+      // Varios ciclos vacíos durante silencio no deben olvidar el último
+      // resultado: el servicio puede reenviarlo después de otra reconexión.
+      if (ledger.finalParts.length) previousFinalParts = ledger.finalParts.slice()
       if (wantListenRef.current) {
         try {
           recognition.start()
@@ -158,6 +123,7 @@ export default function useVoiceInput({
 
     recognitionRef.current = recognition
     return () => {
+      disposed = true
       wantListenRef.current = false
       try { recognition.abort() } catch (_) {}
     }
@@ -166,7 +132,6 @@ export default function useVoiceInput({
   const start = useCallback(() => {
     setError(null)
     setInterim('')
-    lastFinalRef.current = ''
     lastLiveRef.current = ''
     if (!recognitionRef.current) return
     wantListenRef.current = true

@@ -26,9 +26,7 @@ import { isLetterToken } from '../utils/fingerspell.js'
 
 const AVATAR_URL = '/avatar/signara-avatar.vrm'
 // Subir esto invalida el cache en memoria tras cambios del baker (SED/cuello, etc.).
-const BAKE_CACHE_VER = 310 // empalme de frases con pose sostenida y salida diferida
-const PHRASE_HOLD_MS = 650
-const LIVE_PHRASE_HOLD_MS = 1300
+const BAKE_CACHE_VER = 310 // empalme de frases; la salida a reposo ya no espera
 /** LL / RR: misma forma, rebote al FRENTE en UNA sola mano (se leen 2 letras). */
 const SPELL_BOUNCE_FWD_MS = 140
 const SPELL_BOUNCE_BACK_MS = 120
@@ -84,7 +82,7 @@ function tokenIsLetter(token) {
   return isLetterToken(parsePlayToken(token).citationToken)
 }
 
-const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, onFinish, live = false }, ref) {
+const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, onFinish }, ref) {
   const canvasRef = useRef(null)
   const sceneRef = useRef(null)
   const vrmRef = useRef(null)
@@ -92,13 +90,10 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
   const queueRef = useRef([])
   const playingRef = useRef(false)
   const cancelPlayRef = useRef(null)
-  const releaseTimerRef = useRef(null)
   const releasingRef = useRef(false)
   const activeTokenRef = useRef(null)
   const generationRef = useRef(0)
   const finishedRef = useRef(true)
-  const liveRef = useRef(live)
-  liveRef.current = live
   const [avatarReady, setAvatarReady] = useState(false)
   const [avatarError, setAvatarError] = useState(false)
 
@@ -230,8 +225,6 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
     return () => {
       cancelled = true
       playbackGeneration.current++
-      if (releaseTimerRef.current) clearTimeout(releaseTimerRef.current)
-      releaseTimerRef.current = null
       cancelPlayRef.current?.()
       cancelPlayRef.current = null
       playingRef.current = false
@@ -254,18 +247,22 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
     ;(async () => {
       for (const token of PREFETCH_TOKENS) {
         if (cancelled) return
-        const key = `${BAKE_CACHE_VER}:${apiUrl}:${token}:phrase-start`
-        if (sharedBakeCache[key]) continue
         try {
           const dataset = await fetchDataset(token) // tokens de prefetch son siempre formas neutras
           if (cancelled || !bakerRef.current) return
           // El baker usa el rig real. No interrumpir un clip ni el sostén
           // entre señas para preparar una animación futura.
-          if (!playingRef.current && !activeTokenRef.current && !queueRef.current.length) {
-            sharedBakeCache[key] = bakePreservingPose(
-              vrmRef.current,
-              () => bakerRef.current.bakeSolver(dataset, { chain: 'phrase-start' }),
-            )
+          for (const chain of ['phrase-start', 'phrase-follow', 'phrase-release']) {
+            const key = `${BAKE_CACHE_VER}:${apiUrl}:${token}:${chain}`
+            if (sharedBakeCache[key]) continue
+            if (!playingRef.current && !activeTokenRef.current && !queueRef.current.length) {
+              sharedBakeCache[key] = bakePreservingPose(
+                vrmRef.current,
+                () => bakerRef.current.bakeSolver(dataset, { chain }),
+              )
+            }
+            await new Promise((r) => requestAnimationFrame(r))
+            if (cancelled || !bakerRef.current) return
           }
         } catch {
           // Token no disponible en esta API — seguir con el resto.
@@ -288,6 +285,8 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
     const motionToken = cite === 'M' ? 'N' : cite === 'O' ? 'D' : citationToken
     const dataset = await fetchDataset(motionToken)
     const handShapeDataset = (cite === 'Ñ' || cite === 'M') ? await fetchDataset('N') : null
+    if (sharedBakeCache[key]) return sharedBakeCache[key]
+    if (!vrmRef.current || !bakerRef.current) return []
     const bakeTok = (cite === 'Ñ' || cite === 'M' || cite === 'O') ? cite : citationToken
     const keyframes = bakePreservingPose(vrmRef.current, () => bakerRef.current.bakeSolver(dataset, {
       direction,
@@ -334,8 +333,6 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
 
   const interruptPlayback = useCallback(() => {
     generationRef.current++
-    if (releaseTimerRef.current) clearTimeout(releaseTimerRef.current)
-    releaseTimerRef.current = null
     cancelPlayRef.current?.()
     cancelPlayRef.current = null
     playingRef.current = false
@@ -353,42 +350,35 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
         }
         return
       }
-      if (releaseTimerRef.current) return
-      // La voz puede entregar la siguiente palabra mientras termina esta.
-      // Conservar las manos arriba un instante y salir a reposo solo si no llega.
+      // Iniciar la salida en cuanto termina la última seña. Si llega otra
+      // palabra durante la salida, queue() la interrumpe y el siguiente clip
+      // parte de la pose visible en ese instante, sin quedarse inmóvil.
       const generation = generationRef.current
-      releaseTimerRef.current = setTimeout(async () => {
-        releaseTimerRef.current = null
-        if (generation !== generationRef.current) return
-        if (queueRef.current.length) { processQueue(); return }
-        playingRef.current = true
-        releasingRef.current = true
-        try {
-          const release = await bakeCached(activeTokenRef.current, 'phrase-release')
-          if (generation !== generationRef.current || !vrmRef.current) return
-          cancelPlayRef.current = playSolverAnim(vrmRef.current, release, () => {
-            if (generation !== generationRef.current) return
-            cancelPlayRef.current = null
-            playingRef.current = false
-            releasingRef.current = false
-            activeTokenRef.current = null
-            processQueue()
-          })
-        } catch (error) {
+      playingRef.current = true
+      releasingRef.current = true
+      try {
+        const release = await bakeCached(activeTokenRef.current, 'phrase-release')
+        if (generation !== generationRef.current || !vrmRef.current) return
+        cancelPlayRef.current = playSolverAnim(vrmRef.current, release, () => {
           if (generation !== generationRef.current) return
-          console.error(error)
-          setIdlePose(vrmRef.current)
+          cancelPlayRef.current = null
           playingRef.current = false
           releasingRef.current = false
           activeTokenRef.current = null
           processQueue()
-        }
-      }, liveRef.current ? LIVE_PHRASE_HOLD_MS : PHRASE_HOLD_MS)
+        })
+      } catch (error) {
+        if (generation !== generationRef.current) return
+        console.error(error)
+        setIdlePose(vrmRef.current)
+        playingRef.current = false
+        releasingRef.current = false
+        activeTokenRef.current = null
+        processQueue()
+      }
       return
     }
 
-    if (releaseTimerRef.current) clearTimeout(releaseTimerRef.current)
-    releaseTimerRef.current = null
     playingRef.current = true
     const generation = generationRef.current
     const follow = Boolean(activeTokenRef.current)
@@ -411,6 +401,11 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
       }
       if (generation !== generationRef.current || !vrmRef.current) return
       activeTokenRef.current = lastToken
+      // Preparar el siguiente empalme y la salida ANTES de que acabe este clip.
+      // El horneado preserva la pose visible: no baja las manos ni interrumpe.
+      const nextToken = queueRef.current[0]
+      if (nextToken) void bakeCached(nextToken, 'phrase-follow').catch(() => {})
+      void bakeCached(lastToken, 'phrase-release').catch(() => {})
       cancelPlayRef.current = playSolverAnim(vrmRef.current, keyframes, () => {
         if (generation !== generationRef.current) return
         cancelPlayRef.current = null
@@ -435,11 +430,24 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
     queue(token) {
       if (!token) return
       if (releasingRef.current) interruptPlayback()
-      if (releaseTimerRef.current) clearTimeout(releaseTimerRef.current)
-      releaseTimerRef.current = null
       finishedRef.current = false
       queueRef.current.push(token)
       warmDataset(token)
+      queueMicrotask(() => { if (!playingRef.current) processQueue() })
+    },
+    queueBatch(tokens) {
+      const valid = (tokens || []).filter(Boolean)
+      if (!valid.length) return
+      if (releasingRef.current) interruptPlayback()
+      finishedRef.current = false
+      queueRef.current.push(...valid)
+      valid.forEach(warmDataset)
+      // Una confirmación puede contener varias unidades semánticas. Encolarlas
+      // juntas mantiene el orden y evita tratarlas como reproducciones aisladas.
+      for (const token of valid.slice(0, 3)) {
+        void bakeCached(token, 'phrase-follow').catch(() => {})
+        void bakeCached(token, 'phrase-release').catch(() => {})
+      }
       queueMicrotask(() => { if (!playingRef.current) processQueue() })
     },
     replace(tokens) {
@@ -461,7 +469,7 @@ const AvatarSignerVRM = forwardRef(function AvatarSignerVRM({ apiUrl, onSign, on
       finishedRef.current = true
       if (vrmRef.current) setIdlePose(vrmRef.current)
     },
-  }), [interruptPlayback, processQueue, warmDataset])
+  }), [interruptPlayback, processQueue, warmDataset, bakeCached])
 
   return (
     <div className="relative h-full w-full overflow-hidden bg-transparent">

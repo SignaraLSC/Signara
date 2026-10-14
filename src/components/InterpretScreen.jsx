@@ -32,6 +32,37 @@ import { translateFromSpanish } from '../utils/translateApi.js'
 import { maybeCorrectTeAmo, maybeCorrectComoFamilia } from '../utils/handshapeHints.js'
 import { isLetterToken } from '../utils/fingerspell.js'
 import {
+  MAX_GESTURE_FRAMES,
+  resampleGestureFrames,
+  shouldProbeWhileSigning,
+  shouldConfirmLetter,
+  shouldUnlockSpellingStroke,
+  usesAlphabetOnly,
+  shouldCloseSpelling,
+  hasHandTrajectory,
+  shouldConfirmWord,
+  trimHeldGestureFrames,
+  isPoseSettled,
+  preserveShapeChangeStart,
+  confirmedPoseSnapshot,
+  preserveMotionPreparation,
+  shouldUnlockChangedShape,
+  stabilizeSingleHand,
+  findGestureAttemptStart,
+  refineSpellingAttempt,
+  retainMotionVotesAfterBoundary,
+  prefetchSpellingBoundary,
+  recheckStaticSpellingPose,
+  appendSpellingCandidate,
+  visibleSpellingLetters,
+  isStaticFingerPoseSettled,
+  isDownwardFingerPoseSettled,
+  hasFingerPendulumTrajectory,
+  newFrameCountSinceQuery,
+  sameFingerConfiguration,
+  hasWristTrajectory,
+} from '../utils/interpretTemporal.js'
+import {
   hideDesktopWindow,
   isTauriDesktop,
   minimizeDesktopWindow,
@@ -54,10 +85,6 @@ const HAND_COUNT     = 21
 // Más estricto: preferimos esperar un frame más a “adivinar” con 0.75.
 const UMBRAL         = 0.80
 const STABILITY_NEED = 2
-// Solo confirma en 1 shot live si es casi seguro (antes 0.90 disparaba de más).
-const HIGH_CONF_INSTANT = 0.94
-// Fin de seña (1 sola predicción): umbral aún un poco más alto.
-const FINALIZE_UMBRAL = 0.84
 const NO_HAND_RESET  = 12
 // Tiempo máximo de espera de /predict antes de abortar. Sin esto, si el
 // servidor ML está frío (Render) o la red falla a medias, el fetch podía
@@ -71,7 +98,7 @@ const MIN_FRAMES     = 8
 // ── Fin de seña (camino principal, tiempo real) ─────────────────────────────
 const STOP_FRAMES = 4
 const STOP_FRAC   = 0.4
-// Piso de quietud por encima del jitter normal de MediaPipe a 192×144. Con
+// Piso de quietud por encima del jitter normal de MediaPipe. Con
 // 0.006 el contador se reiniciaba mientras la mano seguía visible y la seña
 // solo se enviaba al quitarla del cuadro.
 const STOP_ABS    = 0.012
@@ -81,10 +108,10 @@ const MOVED_MIN   = 0.018
 // aunque la muñeca casi no se mueva — sin bajar el umbral dinámico de arriba.
 const HELD_MOVED_MIN = 0.003
 const HELD_MIN_FRAMES = 12
-// Lecturas de respaldo mientras la mano sigue visible. Sirven para señas cuyo
-// jitter impide detectar cuatro frames de pausa perfectos.
+// Lecturas provisionales DURANTE el gesto, sin exigir que la mano se detenga.
+// Dos predicciones concordantes deben pasar los filtros del modelo.
 const PROBE_MIN_FRAMES = 12
-const PROBE_INTERVAL_MS = 450
+const PROBE_INTERVAL_MS = 90
 
 /** Tras emitir letra/seña: no /predict hasta cambio real de pose. */
 const POSE_UNLOCK_MIN = 0.014
@@ -103,6 +130,9 @@ const CONFIRM_BLOCK_MOVEMENT = MOVED_MIN * 0.55
 const SPELL_MIN_FRAMES = 5
 const SPELL_HELD_MIN = 4
 const SPELL_STOP_FRAMES = 3
+// Los trazos pueden detenerse brevemente en una esquina (p. ej. Z). Una
+// pausa de tres frames no basta para decidir que terminó una letra móvil.
+const SPELL_MOVING_STOP_FRAMES = 6
 // Alineado con `letters_only` del backend. Allí también se exige margen top-2,
 // por lo que 0.70 no acepta una letra ambigua; evita descartar N correctas que
 // suelen quedar en 0.76–0.79.
@@ -116,6 +146,11 @@ const SPELL_SHAPE_STILL_MAX = 0.055
 // dos peticiones al servidor añadía una espera larga y el jitter podía borrar
 // el primer voto, dejando el deletreo bloqueado indefinidamente.
 const SPELL_STABILITY = 1
+const FIRST_LETTER_HOLD_FRAMES = 7
+// Una letra trazada puede parecer otra letra en sus primeros cuadros (J→I).
+// Conservar el recorrido y esperar al menos esta cantidad de cuadros reales
+// antes de aceptar la primera pausa de un gesto móvil.
+const SPELL_MOVING_MIN_FRAMES = 12
 
 function isLetterMode(len, spellStableCount, spellBufLen) {
   // La primera letra no necesita entrar por una ruta especial: se consulta al
@@ -136,8 +171,10 @@ function wantsLettersOnly(spellBufLen, letterMode) {
 const HUD_UPDATE_EVERY_N = 12
 
 // Inferencia: equilibrio velocidad / tracking (izq. sufría a 160×120).
-const DETECT_W = 192
-const DETECT_H = 144
+// Mantener el detalle de dedos desde la PRIMERA letra; cambiar resolución al
+// entrar en deletreo también producía saltos de landmarks dentro del trazo.
+const DETECT_W = 640
+const DETECT_H = 480
 
 // Dos detecciones muy cerca = casi siempre la misma mano “partida” al entrar.
 const DUP_HAND_DIST = 0.14
@@ -285,30 +322,6 @@ function extractLandmarks(results) {
     ...handCoords(results.rightHandLandmarks),  // slot lh (primeros 63)
     ...handCoords(results.leftHandLandmarks),   // slot rh (últimos 63)
   ]
-}
-
-// Ajusta el buffer a exactamente SEQ_LEN frames para /predict.
-//  - Si sobran: se queda con los últimos SEQ_LEN.
-//  - Si faltan: REMUESTREA (interpola linealmente) la secuencia real a SEQ_LEN,
-//    en vez de rellenar repitiendo un frame. Así una seña corta se "estira"
-//    suavemente a la longitud que el modelo espera, conservando su forma real
-//    (el relleno viejo creaba un tramo congelado al inicio que no se parecía a
-//    ninguna muestra de entrenamiento).
-function padBuffer(buffer) {
-  const n = buffer.length
-  if (n >= SEQ_LEN) return buffer.slice(-SEQ_LEN)
-  if (n === 0) return buffer
-  if (n === 1) return Array.from({ length: SEQ_LEN }, () => buffer[0])
-  const out = new Array(SEQ_LEN)
-  for (let i = 0; i < SEQ_LEN; i++) {
-    const t  = (i * (n - 1)) / (SEQ_LEN - 1)  // posición en 0..n-1
-    const lo = Math.floor(t)
-    const hi = Math.min(lo + 1, n - 1)
-    const f  = t - lo
-    const a  = buffer[lo], b = buffer[hi]
-    out[i] = a.map((v, k) => v + (b[k] - v) * f)
-  }
-  return out
 }
 
 // Movimiento medio (x,y) entre dos frames — igual que mov_entre() en
@@ -485,7 +498,7 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
   const audioRef     = useRef(true)
 
   // Pipeline refs (sin re-render)
-  const landmarkBufferRef = useRef([])   // frames del gesto en curso (máx SEQ_LEN)
+  const landmarkBufferRef = useRef([])   // gesto completo; remuestreo solo al consultar la red
   const predHistRef       = useRef([])   // historial de predicciones para estabilidad
   const prevFrameRef      = useRef(null) // frame anterior para calcular movimiento
   const noHandCountRef    = useRef(0)    // frames consecutivos sin manos
@@ -500,14 +513,19 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
   const lastSignRef       = useRef('')
   const announcedUpRef    = useRef('')
   const spellBufRef       = useRef([])
+  const spellLastActivityAtRef = useRef(0)
   const spellStableCountRef = useRef(0)
   const apiInFlightRef    = useRef(false)
+  const requestSeqRef     = useRef(0)
   // Permite volver a consultar una pose que todavía no alcanzó consenso sin
   // disparar peticiones en cada frame. Antes `pauseFired` quedaba bloqueado
   // después del primer intento fallido y solo se liberaba al retirar la mano.
   const predictionRetryAtRef = useRef(0)
   const lastProbeAtRef       = useRef(0)
+  const lastQueryEndRef = useRef(null)
   const mlAvailableRef    = useRef(false)
+  const sequenceReadyRef = useRef(false)
+  const pendingSpellingIndexRef = useRef(null)
   const sentenceClearRef  = useRef(null)
   const handleResultsRef  = useRef(() => {})
   const lockedPoseRef     = useRef(null)
@@ -515,7 +533,9 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
   const shapeUnlockStreakRef = useRef(0)
   const spellUnlockGenRef = useRef(0)
   const lastLetterUnlockGenRef = useRef(0)
-  const motionSincePredictRef = useRef(false)
+  const letterStrokeEndedRef = useRef(true)
+  const gestureEpochRef = useRef(0) // invalida respuestas de un gesto anterior
+  const pendingFinalizeRef = useRef(null)
   const handStillRef = useRef(true)
   const deliberateMotionRef = useRef(false)
   const compactAutoStartedRef = useRef(false)
@@ -530,6 +550,8 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
   const drawLeftRef  = useRef(null)
   const drawRightRef = useRef(null)
   const detectCanvasRef = useRef(null)
+  const diagnosticFramesRef = useRef([])
+  const diagnosticPredictionsRef = useRef([])
   const speakQueueRef = useRef([])
   const speakBusyRef = useRef(false)
   const speakTimerRef = useRef(null)
@@ -575,6 +597,47 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
   const [history,       setHistory]       = useState([])
   const [sentence,      setSentence]      = useState([])
   const [outputLang,    setOutputLang]    = useState(getStoredOutputLang)
+
+  useEffect(() => {
+    if (!import.meta.env.DEV) return undefined
+    // Diagnóstico local: exporta solo landmarks, nunca video ni audio.
+    // Ejecutar justo después de intentar una letra: signaraExportTrace('Z').
+    const exportTrace = (label) => {
+      const requested = label ?? window.prompt(
+        '¿Qué letras o secuencia intentaste? Por ejemplo: ALSA G Ñ J. Esto solo etiqueta el diagnóstico; no cambia el reconocimiento.',
+        '',
+      )
+      if (requested === null) return 0
+      const expected = String(requested).trim().slice(0, 120) || 'sin etiqueta'
+      const name = expected.replace(/[^a-zA-Z0-9_Ññ-]/g, '').slice(0, 20) || 'letra'
+      const payload = {
+        expected,
+        format: 'signara-hand-landmarks-v1',
+        pipelineRevision: 'spelling-provisional-n-v12',
+        backendRevision: getMlApiCache()?.fingerspellingRevision ?? null,
+        videoSize: [videoRef.current?.videoWidth || 0, videoRef.current?.videoHeight || 0],
+        detectionSize: [detectCanvasRef.current?.width || 0, detectCanvasRef.current?.height || 0],
+        frames: diagnosticFramesRef.current,
+        predictions: diagnosticPredictionsRef.current,
+      }
+      const url = URL.createObjectURL(new Blob([JSON.stringify(payload)], { type: 'application/json' }))
+      const link = document.createElement('a')
+      link.href = url
+      link.download = `signara-traza-${name}.json`
+      link.click()
+      // Cada exportación siguiente describe intentos nuevos, no vuelve a
+      // arrastrar las consultas anteriores de G/N/Ñ. Solo vaciar diagnóstico;
+      // nunca el buffer de inferencia ni el deletreo que sigue en curso.
+      diagnosticFramesRef.current = []
+      diagnosticPredictionsRef.current = []
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+      return payload.frames.length
+    }
+    window.signaraExportTrace = exportTrace
+    return () => {
+      if (window.signaraExportTrace === exportTrace) delete window.signaraExportTrace
+    }
+  }, [])
 
   useEffect(() => { runningRef.current = running }, [running])
   useEffect(() => {
@@ -623,6 +686,7 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
 
     if (cached) {
       mlAvailableRef.current = cached.ok
+      sequenceReadyRef.current = cached.sequenceReady
       setMlMode(cached.ok)
       setMlConnecting(false)
     } else {
@@ -632,6 +696,7 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
     checkMlApiHealth().then((result) => {
       if (cancelled) return
       mlAvailableRef.current = result.ok
+      sequenceReadyRef.current = result.sequenceReady
       setMlMode(result.ok)
       setMlConnecting(false)
     })
@@ -692,9 +757,9 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
 
     navigator.mediaDevices.getUserMedia({
       video: {
-        // Preview bajo: menos decode/composición; MediaPipe ya ve 160×120.
-        width: { ideal: 320, max: 480 },
-        height: { ideal: 240, max: 360 },
+        // Conservar detalle de dedos/pulgar; no agrandar una captura de 320.
+        width: { ideal: DETECT_W, max: DETECT_W },
+        height: { ideal: DETECT_H, max: DETECT_H },
         frameRate: { ideal: 30, max: 30 },
         facingMode: 'user',
       },
@@ -705,8 +770,8 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
         const track = stream.getVideoTracks()[0]
         if (track?.applyConstraints) {
           track.applyConstraints({
-            width: { ideal: 320, max: 480 },
-            height: { ideal: 240, max: 360 },
+            width: { ideal: DETECT_W, max: DETECT_W },
+            height: { ideal: DETECT_H, max: DETECT_H },
             frameRate: { ideal: 30, max: 30 },
           }).catch(() => {})
         }
@@ -859,13 +924,13 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
   }
 
   // ── Confirmar seña ────────────────────────────────────────────────────────
-  async function triggerRecognition(sign, confidence) {
+  async function triggerRecognition(sign, confidence, { spelled = false } = {}) {
     const textEs = sign.replace(/_/g, ' ')
     const lang = outputLangRef.current
     const langMeta = findOutputLang(lang)
     let displayText = textEs
     // Nombres deletreados (MARIA): no pasar por traductor palabra-a-palabra.
-    const isSpelledName = /^[A-ZÑ]{2,}$/u.test(String(sign || '').toUpperCase())
+    const isSpelledName = spelled
     if (lang !== 'es' && !isSpelledName) {
       try {
         displayText = await translateFromSpanish(textEs, lang)
@@ -880,6 +945,7 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
       displayText,
       lang,
       confidence,
+      spelled,
     }
     setLatest(det)
     setHistory((h) => [det, ...h].slice(0, 8))
@@ -889,21 +955,24 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
     speak(displayText, langMeta.speech)
   }
 
-  function flushSpellBuffer() {
-    const letters = spellBufRef.current
+  function flushSpellBuffer({ keepPoseLock = false } = {}) {
+    const letters = visibleSpellingLetters(spellBufRef.current, pendingSpellingIndexRef.current)
+    pendingSpellingIndexRef.current = null
     spellBufRef.current = []
     spellStableCountRef.current = 0
     setSpellPreview('')
 
     const resetSpellingInference = () => {
-      inferenceLockedRef.current = false
+      inferenceLockedRef.current = keepPoseLock
       movementSinceEmitRef.current = 0
       lastSignRef.current = ''
       predHistRef.current = []
       announcedUpRef.current = ''
-      lockedPoseRef.current = null
+      lockedPoseRef.current = keepPoseLock ? prevFrameRef.current : null
       shapeUnlockStreakRef.current = 0
       pauseFiredRef.current = false
+      landmarkBufferRef.current = []
+      spellLastActivityAtRef.current = 0
     }
 
     // Letras sueltas no se anuncian: solo nombres (≥2 letras).
@@ -917,14 +986,15 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
       return
     }
     const name = letters.join('')
-    const conf = 1
     setDisplaySign(name)
-    setDisplayConf(conf)
+    setDisplayConf(0)
     updateCaptureHud(0, {
       showHud: false,
       status: `${name} · deletreo`,
     })
-    triggerRecognition(name, conf)
+    // Un nombre concatenado no tiene una probabilidad conjunta calibrada.
+    // El 100 % anterior se asignaba artificialmente aun con letras erróneas.
+    triggerRecognition(name, null, { spelled: true })
     resetSpellingInference()
   }
 
@@ -944,7 +1014,11 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
   // Solo toca refs y setState setters (identidades estables) → useCallback
   // con deps vacías es correcto y permite referenciarla desde otros hooks.
   const resetPipelineState = useCallback(() => {
+    gestureEpochRef.current++
+    pendingFinalizeRef.current = null
     landmarkBufferRef.current = []
+    diagnosticFramesRef.current = []
+    diagnosticPredictionsRef.current = []
     predHistRef.current       = []
     prevFrameRef.current      = null
     stillCountRef.current     = 0
@@ -962,16 +1036,19 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
     shapeUnlockStreakRef.current = 0
     spellUnlockGenRef.current = 0
     lastLetterUnlockGenRef.current = 0
-    motionSincePredictRef.current = false
+    letterStrokeEndedRef.current = true
     handStillRef.current = true
     deliberateMotionRef.current = false
     apiInFlightRef.current    = false
     predictionRetryAtRef.current = 0
     lastProbeAtRef.current = 0
+    lastQueryEndRef.current = null
     handVisibleRef.current    = false
     drawLeftRef.current = null
     drawRightRef.current = null
     spellBufRef.current = []
+    spellLastActivityAtRef.current = 0
+    pendingSpellingIndexRef.current = null
     spellStableCountRef.current = 0
     setSpellPreview('')
     lastHudStatusRef.current = ''
@@ -983,29 +1060,34 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
     setDisplayConf(0)
   }, [])
 
-  function confirmSign(prediction, confidence) {
-    if (motionSincePredictRef.current) return
-
+  function confirmSign(prediction, confidence, { trailingFrames = [], confirmedFrame = lastPredictFrameRef.current, strokeEnded = handStillRef.current, provisional = false } = {}) {
     const predUp = String(prediction).toUpperCase()
 
     // Deletreo activo: ignorar palabras léxicas (HOLA, SI, NO…).
-    if (spellBufRef.current.length > 0 && !isLetterToken(predUp)) return
+    if (usesAlphabetOnly(spellBufRef.current) && !isLetterToken(predUp)) return false
 
     if (isLetterToken(predUp)) {
-      if (spellBufRef.current.at(-1) === predUp) return
+      const newLetterGesture = spellUnlockGenRef.current > lastLetterUnlockGenRef.current
+      if (spellBufRef.current.at(-1) === predUp && !newLetterGesture) return false
       if (
+        spellBufRef.current.length > 0 &&
+        !newLetterGesture &&
         lockedPoseRef.current &&
         lastPredictFrameRef.current &&
         fingerProfileDistance(lastPredictFrameRef.current, lockedPoseRef.current) <
           FINGER_PROFILE_SAME
       ) {
-        return
+        return false
       }
 
       lastLetterUnlockGenRef.current = spellUnlockGenRef.current
-      lockedPoseRef.current = lastPredictFrameRef.current
-      spellBufRef.current.push(predUp)
-      const spaced = spellBufRef.current.join(' ')
+      lockedPoseRef.current = confirmedFrame
+      letterStrokeEndedRef.current = strokeEnded
+      const updated = appendSpellingCandidate(spellBufRef.current, pendingSpellingIndexRef.current, predUp, provisional)
+      spellBufRef.current = updated.letters
+      pendingSpellingIndexRef.current = updated.pendingIndex
+      spellLastActivityAtRef.current = performance.now()
+      const spaced = visibleSpellingLetters(spellBufRef.current, pendingSpellingIndexRef.current).join(' ')
       setSpellPreview(spaced)
       setDisplaySign('')
       setDisplayConf(confidence)
@@ -1014,9 +1096,10 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
       lastSignRef.current = predUp
       inferenceLockedRef.current = true
       movementSinceEmitRef.current = 0
-      landmarkBufferRef.current = []
+      // Conservar cuadros llegados mientras respondía la API: pueden ser el
+      // comienzo de la letra siguiente y no deben desaparecer al confirmar.
+      landmarkBufferRef.current = trailingFrames
       predHistRef.current       = []
-      prevFrameRef.current      = null
       stillCountRef.current     = 0
       settleCountRef.current    = 0
       stillPeakRef.current      = 0
@@ -1026,14 +1109,18 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
       gesturePeakRef.current    = 0
       shapeUnlockStreakRef.current = 0
       setBufferLen(0)
-      return
+      return true
     }
+
+    // Cerrar el nombre antes de bloquear la palabra siguiente: el cierre
+    // reinicia las refs de deletreo y no debe cancelar la petición en curso.
+    if (spellBufRef.current.length) flushSpellBuffer()
 
     lastSignRef.current = predUp
     inferenceLockedRef.current = true
     movementSinceEmitRef.current = 0
     lockedPoseRef.current = lastPredictFrameRef.current
-    landmarkBufferRef.current = []
+    landmarkBufferRef.current = trailingFrames
     predHistRef.current       = []
     prevFrameRef.current      = null
     stillCountRef.current     = 0
@@ -1046,8 +1133,6 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
 
     setBufferLen(0)
 
-    if (spellBufRef.current.length) flushSpellBuffer()
-
     setDisplaySign(predUp)
     setDisplayConf(confidence)
     updateCaptureHud(0, { showHud: false, status: `${predUp.replace(/_/g, ' ')} · ${Math.round(confidence * 100)}%` })
@@ -1055,104 +1140,327 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
     if (announcedUpRef.current === predUp) return
     announcedUpRef.current = predUp
     triggerRecognition(predUp, confidence)
+    return true
   }
 
   function runPrediction(frames, { finalize = false, lettersOnly = false, probe = false } = {}) {
     if (!runningRef.current || !mlAvailableRef.current) return
     if (inferenceLockedRef.current || apiInFlightRef.current) return
-    const minFrames = lettersOnly ? SPELL_MIN_FRAMES : MIN_FRAMES
+    const minFrames = sequenceReadyRef.current ? 6 : (
+      lettersOnly || spellBufRef.current.length ? SPELL_MIN_FRAMES : MIN_FRAMES
+    )
     if (frames.length < minFrames) return
 
-    const bufferCopy = padBuffer([...frames])
+    const useSequence = sequenceReadyRef.current
+    // Una petición repetida sin un cuadro de cámara nuevo no es otro voto.
+    if (useSequence && frames.at(-1) === lastQueryEndRef.current) return
+    lastQueryEndRef.current = frames.at(-1)
+    const useLetters = lettersOnly || usesAlphabetOnly(spellBufRef.current)
+    const capturedFrames = frames.length
+    let shapeStart = 0, selectedShapeStart = 0
+    let attemptStart = useSequence ? findGestureAttemptStart(frames) : 0
+    if (attemptStart) {
+      frames = frames.slice(attemptStart)
+      // Una consulta pertenece a un intento, no a todas las letras rechazadas
+      // desde que apareció la mano. No borrar el comienzo del nuevo trazo.
+      const startIndex = landmarkBufferRef.current.indexOf(frames[0])
+      if (startIndex >= 0) landmarkBufferRef.current = landmarkBufferRef.current.slice(startIndex)
+      gestureEpochRef.current++
+      pendingFinalizeRef.current = null
+      predHistRef.current = retainMotionVotesAfterBoundary(predHistRef.current, frames)
+    }
+    let bufferCopy = useSequence ? trimHeldGestureFrames(frames) : resampleGestureFrames(frames, SEQ_LEN)
+    let confirmedFrame = confirmedPoseSnapshot(bufferCopy)
+    let queryPoseSettled = isPoseSettled(frames)
+    let gestureEpoch = gestureEpochRef.current
     lastPredictFrameRef.current = bufferCopy[bufferCopy.length - 1] ?? null
-    const useLetters = lettersOnly || spellBufRef.current.length > 0
-    motionSincePredictRef.current = false
+    // Primera letra: vocabulario completo. Al confirmarla, solo alfabeto hasta
+    // cerrar el nombre; las consultas durante el recorrido siguen habilitadas.
     apiInFlightRef.current = true
+    const requestSeq = ++requestSeqRef.current
+    const requestStartedAt = performance.now()
 
     const controller = new AbortController()
     const timer = setTimeout(() => controller.abort(), PREDICT_TIMEOUT_MS)
 
     ;(async () => {
       try {
-        const resp = await fetch(`${ML_API_URL}/predict`, {
+        const primaryResponse = fetch(`${ML_API_URL}${useSequence ? '/predict/sequence' : '/predict'}`, {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
           body:    JSON.stringify({ frames: bufferCopy, letters_only: useLetters }),
           signal:  controller.signal,
         })
+        const readBoundary = async input => {
+          const response = await fetch(`${ML_API_URL}/predict/sequence`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ frames: input, letters_only: true }), signal: controller.signal,
+          })
+          if (!response.ok) throw new Error(`HTTP ${response.status}`)
+          return response.json()
+        }
+        const speculativeRead = useSequence && useLetters
+          ? prefetchSpellingBoundary(frames, readBoundary) : readBoundary
+        let resp = await primaryResponse
+        // Un servidor que perdió el checkpoint nuevo debe seguir interpretando
+        // con el modelo anterior, sin dejar la cámara en estado desconectado.
+        if (useSequence && resp.status === 503) {
+          sequenceReadyRef.current = false
+          resp = await fetch(`${ML_API_URL}/predict`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              frames: resampleGestureFrames(frames, SEQ_LEN),
+              letters_only: useLetters,
+            }),
+            signal: controller.signal,
+          })
+        }
         if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
 
-        const { prediction: rawPred, confidence, is_idle } = await resp.json()
+        let result = await resp.json()
+        if (gestureEpoch !== gestureEpochRef.current) return
+        if (useSequence && result.preparation_frames > 0) {
+          const preparedBuffer = preserveMotionPreparation(
+            landmarkBufferRef.current, bufferCopy, result.preparation_frames)
+          if (preparedBuffer !== landmarkBufferRef.current) {
+            landmarkBufferRef.current = preparedBuffer
+            predHistRef.current = retainMotionVotesAfterBoundary(predHistRef.current, preparedBuffer)
+          }
+        }
+        const unsegmentedResult = result
+        let boundaryResult
+        if (useSequence && sequenceReadyRef.current && useLetters) {
+          const refined = await refineSpellingAttempt(frames, result, speculativeRead)
+          if (gestureEpoch !== gestureEpochRef.current) return
+          ;({ shapeStart, selectedShapeStart, boundaryResult } = refined)
+          if (selectedShapeStart) {
+            frames = refined.frames
+            result = refined.result
+            bufferCopy = trimHeldGestureFrames(frames)
+            queryPoseSettled = isPoseSettled(frames)
+            confirmedFrame = confirmedPoseSnapshot(bufferCopy)
+            lastPredictFrameRef.current = confirmedFrame
+            attemptStart += selectedShapeStart
+            const startIndex = landmarkBufferRef.current.indexOf(frames[0])
+            if (startIndex >= 0) landmarkBufferRef.current = landmarkBufferRef.current.slice(startIndex)
+            gestureEpoch = ++gestureEpochRef.current
+            pendingFinalizeRef.current = null
+            predHistRef.current = retainMotionVotesAfterBoundary(predHistRef.current, frames)
+          }
+        }
+        const { prediction: rawPred, confidence, is_idle, recognition_source, motion_detected, evaluated_frames, preparation_frames } = result
+        const diagnostic = import.meta.env.DEV ? {
+            prediction: rawPred,
+            confidence,
+            is_idle,
+            inputFrames: bufferCopy.length,
+            capturedFrames,
+            attemptStart,
+            shapeStart,
+            selectedShapeStart,
+            unsegmentedPrediction: unsegmentedResult.prediction,
+            boundaryPrediction: boundaryResult?.prediction,
+            frames: bufferCopy,
+            timestamp: performance.now(),
+            requestLatencyMs: performance.now() - requestStartedAt,
+            queryPoseSettled,
+            lettersOnly: useLetters,
+            finalized: finalize,
+            endpoint: useSequence ? '/predict/sequence' : '/predict',
+            recognitionSource: recognition_source,
+            motionDetected: motion_detected,
+            evaluatedFrames: evaluated_frames,
+            preparationFrames: preparation_frames,
+            poseEvidence: result.pose_evidence,
+            automaticSpelling: usesAlphabetOnly(spellBufRef.current),
+            probe,
+            decision: 'await_consensus',
+          } : null
+        if (diagnostic) {
+          diagnosticPredictionsRef.current.push(diagnostic)
+          if (diagnosticPredictionsRef.current.length > 120) diagnosticPredictionsRef.current.shift()
+        }
+        if (window.__SIGNARA_SPELL_DEBUG === true) {
+          console.debug('[deletreo]', {
+            prediction: rawPred,
+            confidence: Number(confidence).toFixed(3),
+            is_idle,
+            frames: frames.length,
+            mode: useLetters ? 'letras' : 'general',
+            finalized: finalize,
+          })
+        }
         let prediction = String(rawPred || '').toUpperCase()
         const teAmoFamily = new Set([
           'TE_AMO', 'ME_AMAS', 'ME_AMA', 'LO_AMO', 'LA_AMO', 'NOS_AMAMOS', 'YO_TE_AMO',
         ])
 
-        if (useLetters) {
-          if (!prediction || is_idle || !isLetterToken(prediction)) return
-          if (!isLetterToken(prediction)) return
+        if (useLetters || isLetterToken(prediction)) {
+          if (!prediction || is_idle || !isLetterToken(prediction)) {
+            if (diagnostic) diagnostic.decision = 'model_abstained'
+            predHistRef.current = []
+            return
+          }
         } else {
           prediction = maybeCorrectTeAmo(rawPred || '', bufferCopy)
           const isTeAmo = teAmoFamily.has(String(prediction || '').toUpperCase())
           if (!isTeAmo) {
             prediction = maybeCorrectComoFamilia(prediction || rawPred || '', bufferCopy) || ''
           }
-          if ((is_idle && !teAmoFamily.has(String(prediction || '').toUpperCase())) || !prediction) return
+          if ((is_idle && !teAmoFamily.has(String(prediction || '').toUpperCase())) || !prediction) {
+            if (diagnostic) diagnostic.decision = 'model_abstained'
+            predHistRef.current = []
+            return
+          }
         }
 
         const letterPred = isLetterToken(prediction)
         const inSpellFlow = useLetters || letterPred
-        const needStable = inSpellFlow ? SPELL_STABILITY : STABILITY_NEED
-        const confFloor = inSpellFlow ? SPELL_UMBRAL : UMBRAL
+        const needStable = inSpellFlow
+          ? (useSequence ? 2 : SPELL_STABILITY)
+          : STABILITY_NEED
+        const confFloor = inSpellFlow
+          ? (prediction === 'N' ? 0.66 : SPELL_UMBRAL)
+          : UMBRAL
 
-        predHistRef.current.push(prediction)
-        if (predHistRef.current.length > needStable) predHistRef.current.shift()
+        predHistRef.current.push({ prediction, confidence, frames: bufferCopy })
+        predHistRef.current = predHistRef.current.slice(-needStable)
         const stable =
           predHistRef.current.length >= needStable &&
-          new Set(predHistRef.current).size === 1
+          predHistRef.current.every(vote => vote.prediction === prediction)
+        const windowMinConfidence = Math.min(...predHistRef.current.map(vote => vote.confidence))
 
-        if (prediction === lastSignRef.current) return
-        if (useLetters && motionSincePredictRef.current) return
+        if (diagnostic) {
+          diagnostic.handledPrediction = prediction
+          diagnostic.consensus = stable
+          diagnostic.consensusVotes = predHistRef.current.map(vote => ({
+            prediction: vote.prediction, confidence: vote.confidence, frames: vote.frames?.length,
+          }))
+        }
+        if (prediction === lastSignRef.current) {
+          if (diagnostic) diagnostic.decision = 'duplicate'
+          return
+        }
+        // El desplazamiento de la muñeca es parte de J/S/Z, no una razón para
+        // descartar la respuesta. Solo invalida una respuesta atrasada cuando
+        // cambió la configuración de dedos desde el frame consultado.
+        let letterShapeChanged = inSpellFlow && lastPredictFrameRef.current &&
+          prevFrameRef.current &&
+          fingerProfileDistance(lastPredictFrameRef.current, prevFrameRef.current) >=
+            FINGER_PROFILE_UNLOCK
+        const requestEndIndex = useSequence
+          ? landmarkBufferRef.current.lastIndexOf(frames.at(-1)) : -1
+        let trailingFrames = requestEndIndex >= 0
+          ? landmarkBufferRef.current.slice(requestEndIndex + 1) : []
+        if (diagnostic) diagnostic.shapeChanged = Boolean(letterShapeChanged)
+        if (letterPred) {
+          const verifiedFingerPoseSettled = result.pose_evidence?.label === prediction &&
+            isDownwardFingerPoseSettled(frames, prediction) &&
+            isDownwardFingerPoseSettled(landmarkBufferRef.current, prediction)
+          const staticFingerPoseSettled = ['M', 'N'].includes(prediction) &&
+            (verifiedFingerPoseSettled || (isStaticFingerPoseSettled(frames) &&
+              isStaticFingerPoseSettled(landmarkBufferRef.current) &&
+              sameFingerConfiguration(frames.at(-1), prevFrameRef.current)))
+          let currentPoseValidated = false
+          if (useSequence && stable && ['M', 'N'].includes(prediction) &&
+              !staticFingerPoseSettled &&
+              (letterShapeChanged || !handStillRef.current || !queryPoseSettled)) {
+            const rechecked = await recheckStaticSpellingPose(prediction, landmarkBufferRef.current, async input => {
+              const response = await fetch(`${ML_API_URL}/predict/sequence`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ frames: input, letters_only: true }), signal: controller.signal,
+              })
+              if (!response.ok) throw new Error(`HTTP ${response.status}`)
+              return response.json()
+            }, { sequence: true })
+            if (gestureEpoch !== gestureEpochRef.current) return
+            if (diagnostic) diagnostic.poseRecheck = rechecked ? {
+              prediction: rechecked.result.prediction,
+              confidence: rechecked.result.confidence,
+              frames: rechecked.frames,
+            } : null
+            if (rechecked && isPoseSettled(landmarkBufferRef.current) && prevFrameRef.current &&
+                fingerProfileDistance(rechecked.confirmedFrame, prevFrameRef.current) < FINGER_PROFILE_UNLOCK) {
+              currentPoseValidated = true
+              confirmedFrame = rechecked.confirmedFrame
+              lastPredictFrameRef.current = confirmedFrame
+              letterShapeChanged = false
+              const poseEndIndex = landmarkBufferRef.current.lastIndexOf(confirmedFrame)
+              trailingFrames = poseEndIndex >= 0 ? landmarkBufferRef.current.slice(poseEndIndex + 1) : []
+            }
+          }
+          const poseSettled = (queryPoseSettled || currentPoseValidated) && isPoseSettled(landmarkBufferRef.current)
+          if (diagnostic) {
+            diagnostic.currentPoseValidated = currentPoseValidated
+            diagnostic.currentPoseSettled = poseSettled
+            diagnostic.staticFingerPoseSettled = staticFingerPoseSettled
+            diagnostic.verifiedFingerPoseSettled = verifiedFingerPoseSettled
+          }
+          if (shouldConfirmLetter({
+            prediction, confidence, stable, sequence: useSequence, probe,
+            shapeChanged: letterShapeChanged, handStill: handStillRef.current,
+            hasMotion: hasHandTrajectory(bufferCopy),
+            minConfidence: confFloor, windowMinConfidence, alphabetOnly: useLetters,
+            poseSettled,
+            currentPoseValidated,
+            staticFingerPoseSettled,
+          })) {
+            const accepted = confirmSign(prediction, confidence, {
+              trailingFrames, confirmedFrame, strokeEnded: queryPoseSettled || staticFingerPoseSettled,
+              // No bloquear/resetear de otra manera el arranque que ya logra
+              // reconocer Ñ. Diferir únicamente la salida de su posible N.
+              provisional: prediction === 'N' && !poseSettled,
+            })
+            if (diagnostic) {
+              diagnostic.decision = accepted
+                ? pendingSpellingIndexRef.current === null ? 'accepted' : 'provisional_letter'
+                : 'letter_not_unlocked'
+              diagnostic.spellingOutput = visibleSpellingLetters(spellBufRef.current, pendingSpellingIndexRef.current).join('')
+            }
+          } else if (diagnostic) {
+            diagnostic.decision = !stable ? 'await_consensus' :
+              !poseSettled && !['G', 'H', 'J', 'S', 'Z', 'Ñ'].includes(prediction)
+                ? 'pose_still_moving' : 'letter_confirmation_guard'
+          }
+          return
+        }
 
-        if (
-          finalize &&
-          prediction !== lastSignRef.current &&
-          !motionSincePredictRef.current &&
-          (
-            useLetters
-              // La ventana ya fue validada geométricamente como una forma
-              // estable; aquí solo exigimos confianza y margen del clasificador.
-              ? stable && confidence >= confFloor
-              : (stable && confidence >= confFloor) || confidence >= FINALIZE_UMBRAL
-          )
-        ) {
-          confirmSign(prediction, confidence)
-        } else if (
-          !finalize &&
-          prediction !== lastSignRef.current &&
-          confidence >= confFloor &&
-          (probe ? stable : (stable || confidence >= HIGH_CONF_INSTANT)) &&
-          !motionSincePredictRef.current
-        ) {
-          confirmSign(prediction, confidence)
+        if (shouldConfirmWord({
+          prediction, stable, confidence, minConfidence: confFloor,
+          finalized: finalize, handStill: handStillRef.current,
+          spelling: useLetters || usesAlphabetOnly(spellBufRef.current),
+          hasMotion: hasHandTrajectory(bufferCopy), inputFrames: bufferCopy.length,
+        })) {
+          confirmSign(prediction, confidence, { trailingFrames })
+          if (diagnostic) diagnostic.decision = 'accepted'
         }
 
       } catch {
-        mlAvailableRef.current = false
-        setMlMode(false)
+        if (requestSeq === requestSeqRef.current) {
+          mlAvailableRef.current = false
+          setMlMode(false)
+        }
       } finally {
         clearTimeout(timer)
-        apiInFlightRef.current = false
-        // Si la primera ventana todavía no alcanza consenso, permitir una
-        // segunda lectura de la MISMA forma quieta. No se exige desplazar la
-        // muñeca ni acercar/alejar la mano para volver a consultar al modelo.
-        if (!inferenceLockedRef.current) {
-          // Si el modelo no confirmó esta ventana, la pose sigue siendo válida:
-          // dejar que se llene otra ventana y pedir una nueva lectura. El
-          // pequeño cooldown evita repetir /predict continuamente mientras
-          // MediaPipe entrega muchos frames iguales.
-          pauseFiredRef.current = false
-          predictionRetryAtRef.current = performance.now() + 260
+        if (requestSeq === requestSeqRef.current) {
+          apiInFlightRef.current = false
+          // Si la primera ventana todavía no alcanza consenso, permitir una
+          // segunda lectura de la MISMA forma quieta.
+          if (gestureEpoch === gestureEpochRef.current && !inferenceLockedRef.current) {
+            // El cooldown evita repetir /predict en cada frame de MediaPipe.
+            pauseFiredRef.current = false
+            predictionRetryAtRef.current = performance.now() + (useSequence ? 30 : 100)
+          }
+          const pending = pendingFinalizeRef.current
+          pendingFinalizeRef.current = null
+          if (pending && pending.epoch === gestureEpochRef.current &&
+              !inferenceLockedRef.current && runningRef.current) {
+            runPrediction(pending.frames, {
+              finalize: true,
+              lettersOnly: pending.lettersOnly,
+            })
+          }
         }
       }
     })()
@@ -1186,12 +1494,6 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
       const hadHands = handWasVisibleRef.current
       const snapshot = hadHands ? [...landmarkBufferRef.current] : []
       const skipFinalize = inferenceLockedRef.current
-      const letterModeDrop = isLetterMode(
-        snapshot.length,
-        spellStableCountRef.current,
-        spellBufRef.current.length,
-      )
-
       landmarkBufferRef.current = []
       prevFrameRef.current      = null
       stillCountRef.current     = 0
@@ -1209,13 +1511,20 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
       if (hadHands && snapshot.length >= SPELL_MIN_FRAMES && !skipFinalize && !apiInFlightRef.current && !pauseFiredRef.current) {
         runPrediction(snapshot, {
           finalize: true,
-          lettersOnly: wantsLettersOnly(spellBufRef.current.length, letterModeDrop),
+          lettersOnly: usesAlphabetOnly(spellBufRef.current),
         })
+      } else if (hadHands && snapshot.length >= SPELL_MIN_FRAMES && !skipFinalize && apiInFlightRef.current) {
+        // No perder el gesto completo si se oculta la mano mientras aún
+        // responde una lectura provisional.
+        pendingFinalizeRef.current = {
+          frames: snapshot,
+          lettersOnly: usesAlphabetOnly(spellBufRef.current),
+          epoch: gestureEpochRef.current,
+        }
       }
 
-      if (hadHands && spellBufRef.current.length >= 2) {
-        flushSpellBuffer()
-      } else if (noHandCountRef.current >= NO_HAND_RESET && spellBufRef.current.length) {
+      if (noHandCountRef.current >= NO_HAND_RESET && spellBufRef.current.length &&
+          !apiInFlightRef.current && !pendingFinalizeRef.current) {
         flushSpellBuffer()
       }
 
@@ -1236,9 +1545,29 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
     }
 
     noHandCountRef.current = 0
+    if (!handWasVisibleRef.current) {
+      gestureEpochRef.current++
+      pendingFinalizeRef.current = null
+    }
     handWasVisibleRef.current = true
 
-    const currFrame = extractLandmarks(results)
+    const currFrame = stabilizeSingleHand(extractLandmarks(results), prevFrameRef.current)
+    if (pendingSpellingIndexRef.current !== null) {
+      // Mismos cuadros y misma mano estabilizada que recibe la red. No
+      // resolver una N por un único frame ni por quietud de muñeca sola.
+      const currentPose = [...landmarkBufferRef.current, currFrame]
+      if (isPoseSettled(currentPose) && isDownwardFingerPoseSettled(currentPose, 'N')) {
+        pendingSpellingIndexRef.current = null
+        const spaced = spellBufRef.current.join(' ')
+        setSpellPreview(spaced)
+        spellLastActivityAtRef.current = performance.now()
+        updateCaptureHud(0, { showHud: false, status: `Deletreando: ${spaced}` })
+      }
+    }
+    if (import.meta.env.DEV) {
+      diagnosticFramesRef.current.push(currFrame)
+      if (diagnosticFramesRef.current.length > 900) diagnosticFramesRef.current.shift()
+    }
     const movement = frameMovement(prevFrameRef.current, currFrame)
     const fingerDelta = prevFrameRef.current
       ? fingerProfileDistance(prevFrameRef.current, currFrame)
@@ -1278,27 +1607,67 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
     }
     const handMoving = movement >= stopThreshold || fingerDelta >= FINGER_MOTION_MIN
     handStillRef.current = !handMoving
+    if (handMoving && usesAlphabetOnly(spellBufRef.current)) {
+      spellLastActivityAtRef.current = performance.now()
+    }
     const deliberateMotion =
       movement >= CONFIRM_BLOCK_MOVEMENT || fingerDelta >= CONFIRM_BLOCK_FINGER
     deliberateMotionRef.current = deliberateMotion
     if (deliberateMotion) {
-      motionSincePredictRef.current = true
       predictionRetryAtRef.current = 0
-      if (!inferenceLockedRef.current) predHistRef.current = []
+      // Conservar los votos: el movimiento es parte de las letras dinámicas.
     }
 
     if (inferenceLockedRef.current) {
       movementSinceEmitRef.current += movement
       const spelling = spellBufRef.current.length > 0
       let unlocked = false
+      let strokeUnlocked = false
+      let pendulumUnlocked = false
       if (spelling && lockedPoseRef.current) {
+        // Confirmar durante G/J/etc. no convierte la continuación del MISMO
+        // recorrido en otra letra. Para otro trazo de igual forma, esperar a
+        // que termine el actual; cambiar dedos permite seguir sin esa pausa.
+        const poseSettled = isPoseSettled([...landmarkBufferRef.current, currFrame])
+        const sameConfiguration = sameFingerConfiguration(currFrame, lockedPoseRef.current)
+        if (!letterStrokeEndedRef.current && spellStableCountRef.current >= 8 && poseSettled && sameConfiguration) {
+          letterStrokeEndedRef.current = true
+          movementSinceEmitRef.current = 0
+          peakMovementRef.current = 0
+          // La pose al confirmar puede ser el MEDIO de G. Anclar el final
+          // asentado evita que su continuación desbloquee y repita esa G.
+          lockedPoseRef.current = currFrame
+          shapeUnlockStreakRef.current = 0
+          landmarkBufferRef.current = landmarkBufferRef.current.slice(-8)
+        }
         const profileDelta = fingerProfileDistance(currFrame, lockedPoseRef.current)
         if (profileDelta >= FINGER_PROFILE_UNLOCK) {
           shapeUnlockStreakRef.current++
         } else {
           shapeUnlockStreakRef.current = 0
         }
-        unlocked = shapeUnlockStreakRef.current >= SHAPE_UNLOCK_FRAMES
+        const completingSameMotion = ['G', 'H', 'J', 'S', 'Z', 'Ñ'].includes(lastSignRef.current) &&
+          !letterStrokeEndedRef.current && sameConfiguration
+        const shapeUnlocked = !completingSameMotion && shouldUnlockChangedShape({
+          changedFrames: shapeUnlockStreakRef.current,
+          minFrames: SHAPE_UNLOCK_FRAMES,
+          strokeEnded: letterStrokeEndedRef.current,
+          poseSettled,
+        })
+        // N y Ñ conservan dos dedos: el péndulo puede mover sus puntas sin
+        // trasladar mucho la muñeca. Desbloquear no EMITE Ñ; la API aún debe
+        // corroborar dedos, orientación, recorrido y dos respuestas.
+        pendulumUnlocked = !shapeUnlocked && letterStrokeEndedRef.current &&
+          ['N', 'Ñ'].includes(lastSignRef.current) &&
+          hasFingerPendulumTrajectory([...landmarkBufferRef.current, currFrame])
+        strokeUnlocked = !shapeUnlocked && letterStrokeEndedRef.current && shouldUnlockSpellingStroke({
+          movementSum: movementSinceEmitRef.current,
+          peakMovement: peakMovementRef.current,
+          moving: handMoving,
+          wristTrajectory: hasWristTrajectory([...landmarkBufferRef.current.slice(-8), currFrame]),
+          fingerPendulum: pendulumUnlocked,
+        })
+        unlocked = shapeUnlocked || strokeUnlocked
       } else if (spelling) {
         unlocked = false
       } else if (lockedPoseRef.current) {
@@ -1317,21 +1686,27 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
           peakMovementRef.current >= MOVED_MIN * 1.15
       }
       if (unlocked) {
+        gestureEpochRef.current++
+        pendingFinalizeRef.current = null
         inferenceLockedRef.current = false
         pauseFiredRef.current = false
         movementSinceEmitRef.current = 0
         lastSignRef.current = ''
         predHistRef.current = []
-        // Muy importante en deletreo: descartar la letra anterior y los frames
-        // del cambio. La nueva ventana empieza únicamente cuando ya cambió la
-        // configuración de los dedos; antes se clasificaba una mezcla A→B.
-        landmarkBufferRef.current = []
+        // Cambio de dedos: descartar transición A→B. Trazo nuevo con dedos
+        // similares: conservar su inicio; si se borra aquí, solo queda la
+        // postura final y se pierde la forma de G/J/S/Z.
+        landmarkBufferRef.current = pendulumUnlocked ? landmarkBufferRef.current
+          : strokeUnlocked
+          ? landmarkBufferRef.current.slice(-6)
+          : preserveShapeChangeStart(landmarkBufferRef.current, shapeUnlockStreakRef.current)
         stillCountRef.current = 0
         settleCountRef.current = 0
         stillPeakRef.current = 0
         spellStableCountRef.current = 0
-        peakMovementRef.current = 0
-        gesturePeakRef.current = 0
+        if (strokeUnlocked) gesturePeakRef.current = peakMovementRef.current
+        else gesturePeakRef.current = 0
+        if (!strokeUnlocked) peakMovementRef.current = 0
         shapeUnlockStreakRef.current = 0
         spellUnlockGenRef.current++
       }
@@ -1340,7 +1715,7 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
     let len = 0
     if (runningRef.current) {
       landmarkBufferRef.current.push(currFrame)
-      if (landmarkBufferRef.current.length > SEQ_LEN) {
+      if (landmarkBufferRef.current.length > MAX_GESTURE_FRAMES) {
         landmarkBufferRef.current.shift()
       }
       len = landmarkBufferRef.current.length
@@ -1367,8 +1742,13 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
         spellBufRef.current.length,
       )
       const spellingFlow = wantsLettersOnly(spellBufRef.current.length, letterMode)
-      const minFrames = spellingFlow ? SPELL_MIN_FRAMES : MIN_FRAMES
-      const stopNeed = spellingFlow ? SPELL_STOP_FRAMES : STOP_FRAMES
+      const spellingMinFrames = gesturePeakRef.current >= MOVED_MIN
+        ? SPELL_MOVING_MIN_FRAMES
+        : SPELL_MIN_FRAMES
+      const minFrames = sequenceReadyRef.current ? 6 : (spellingFlow ? spellingMinFrames : MIN_FRAMES)
+      const stopNeed = spellingFlow
+        ? (gesturePeakRef.current >= MOVED_MIN ? SPELL_MOVING_STOP_FRAMES : SPELL_STOP_FRAMES)
+        : STOP_FRAMES
       const heldMin = spellingFlow ? SPELL_HELD_MIN : HELD_MIN_FRAMES
       const gestureSignal = Math.max(gesturePeakRef.current, peakMovementRef.current)
       const stableEnough = spellingFlow
@@ -1383,10 +1763,19 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
       // de quietud. En señas suaves el pico podía quedar en `peakMovement`
       // aunque la mano ya estuviera quieta; al usar solo `gesturePeak` nunca se
       // llamaba a /predict hasta que la persona retiraba la mano.
+      // Una primera letra puede entrar en cámara ya formada y quedarse quieta:
+      // no tiene pico de movimiento. Consultar el modelo COMPLETO en ese caso
+      // (sin forzar letters_only) para no convertir palabras quietas en letras.
+      const firstLetterHeld = !spellingFlow && spellBufRef.current.length === 0 &&
+        len >= FIRST_LETTER_HOLD_FRAMES &&
+        spellStableCountRef.current >= SPELL_STOP_FRAMES
       const gestureHappened =
         gestureSignal >= MOVED_MIN ||
         (len >= heldMin && gestureSignal >= HELD_MOVED_MIN) ||
-        (letterMode && len >= minFrames)
+        (letterMode && len >= minFrames) ||
+        firstLetterHeld ||
+        (spellingFlow && stableEnough && len >= minFrames) ||
+        (sequenceReadyRef.current && !inferenceLockedRef.current && hasHandTrajectory(landmarkBufferRef.current))
 
       if (
         letterMode &&
@@ -1407,44 +1796,53 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
         performance.now() >= predictionRetryAtRef.current &&
         gestureHappened &&
         stableEnough &&
+        !handMoving &&
         len >= minFrames
       ) {
         pauseFiredRef.current = true
         const snapshot = [...landmarkBufferRef.current]
-        landmarkBufferRef.current = []
-        peakMovementRef.current   = 0
-        gesturePeakRef.current    = 0
-        stillCountRef.current     = 0
-        settleCountRef.current    = 0
-        stillPeakRef.current      = 0
-        spellStableCountRef.current = 0
+        // No vaciar un gesto de deletreo hasta confirmarlo: S puede parecer NO
+        // al principio, y el modelo necesita sus cuadros finales para verla.
         runPrediction(snapshot, {
           finalize: true,
-          lettersOnly: spellingFlow,
+          lettersOnly: usesAlphabetOnly(spellBufRef.current),
         })
       }
 
-      // Respaldo para una seña que no consigue una pausa perfecta por jitter:
-      // no reemplaza la confirmación normal y exige dos respuestas iguales.
-      // La ventana no se borra, por lo que el modelo sigue viendo la secuencia
-      // más reciente de landmarks reales.
+      // Lectura provisional con la mano todavía moviéndose: dos respuestas
+      // concordantes, sin exigir pausa ni perder el inicio del gesto.
       const now = performance.now()
-      const probeReady =
-        !inferenceLockedRef.current &&
-        !apiInFlightRef.current &&
-        !spellingFlow &&
-        len >= PROBE_MIN_FRAMES &&
-        now >= predictionRetryAtRef.current &&
-        now - lastProbeAtRef.current >= PROBE_INTERVAL_MS &&
-        settleCountRef.current >= 2 &&
-        gestureHappened
+      const probeReady = shouldProbeWhileSigning({
+        locked: inferenceLockedRef.current,
+        inFlight: apiInFlightRef.current,
+        spelling: spellingFlow,
+        sequence: sequenceReadyRef.current,
+        length: len,
+        minLength: sequenceReadyRef.current ? 6 : PROBE_MIN_FRAMES,
+        now,
+        retryAt: predictionRetryAtRef.current,
+        lastProbeAt: lastProbeAtRef.current,
+        intervalMs: PROBE_INTERVAL_MS,
+        gestureHappened,
+        newFrames: newFrameCountSinceQuery(landmarkBufferRef.current, lastQueryEndRef.current),
+      })
       if (probeReady) {
         lastProbeAtRef.current = now
         runPrediction([...landmarkBufferRef.current], {
           finalize: false,
           probe: true,
+          lettersOnly: usesAlphabetOnly(spellBufRef.current),
         })
       }
+      // Cerrar por una pausa entre unidades, no por retirar la mano. Mantener
+      // la pose ya emitida bloqueada evita releer la última letra tras cerrar.
+      if (shouldCloseSpelling({
+        spelling: usesAlphabetOnly(spellBufRef.current),
+        locked: inferenceLockedRef.current,
+        inFlight: apiInFlightRef.current,
+        handStill: handStillRef.current && spellStableCountRef.current >= SPELL_STOP_FRAMES,
+        now, lastActivityAt: spellLastActivityAtRef.current,
+      })) flushSpellBuffer({ keepPoseLock: true })
     }
 
     hudTickRef.current++
@@ -1531,8 +1929,14 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
       if (hand && t !== lastVideoTime) {
         lastVideoTime = t
         try {
-          detectCtx.drawImage(video, 0, 0, DETECT_W, DETECT_H)
-          autoExposeCanvas(detectCtx, DETECT_W, DETECT_H)
+          const inferW = DETECT_W
+          const inferH = DETECT_H
+          if (detectCanvas.width !== inferW || detectCanvas.height !== inferH) {
+            detectCanvas.width = inferW
+            detectCanvas.height = inferH
+          }
+          detectCtx.drawImage(video, 0, 0, inferW, inferH)
+          autoExposeCanvas(detectCtx, inferW, inferH)
           const handResult = hand.detectForVideo(detectCanvas, ts)
           handleResultsRef.current(adaptHandResult(handResult))
           if (segmenter) {
@@ -1561,7 +1965,7 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
                   ictx.clearRect(0, 0, inferMask.width, inferMask.height)
                   ictx.drawImage(displayMask, 0, 0)
                   keepPrimaryPersonOnly(inferMask, { keepSatellites: true })
-                  solidifyBackgroundFromMask(detectCtx, DETECT_W, DETECT_H, inferMask)
+                  solidifyBackgroundFromMask(detectCtx, detectCanvas.width, detectCanvas.height, inferMask)
                   maskReady = true
                 } finally {
                   try {
@@ -1730,6 +2134,7 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
     checkMlApiHealth({ force: true })
       .then((result) => {
         mlAvailableRef.current = result.ok
+        sequenceReadyRef.current = result.sequenceReady
         setMlMode(result.ok)
         setMlConnecting(false)
       })
@@ -1744,7 +2149,9 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
     if (!mlMode)                   return 'Servidor IA no conectado'
     if (spellPreview)              return `Deletreando: ${spellPreview}`
     if (!handVisible)              return 'Muestra una mano'
-    if (displaySign)               return `${displaySign.replace(/_/g, ' ')} · ${Math.round(displayConf * 100)}%`
+    if (displaySign)               return latest?.spelled
+      ? `${displaySign} · deletreo`
+      : `${displaySign.replace(/_/g, ' ')} · ${Math.round(displayConf * 100)}%`
     if (bufferLen > 0)             return 'Escuchando…'
     return 'Haz la seña'
   })()
@@ -2061,6 +2468,18 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
                       <Icon name="layers" className="h-4 w-4" strokeWidth={2} /> Fondo estudio
                     </label>
 
+                    {import.meta.env.DEV && (
+                      <button
+                        type="button"
+                        onClick={() => window.signaraExportTrace?.()}
+                        disabled={!diagnosticFramesRef.current.length}
+                        title="Descargar los últimos landmarks y decisiones; no incluye video ni audio"
+                        className="inline-flex h-11 items-center rounded-xl border-2 border-white/60 bg-white/80 px-3 text-sm font-bold text-pastel-ink disabled:opacity-40"
+                      >
+                        Guardar diagnóstico
+                      </button>
+                    )}
+
                     <label className="ml-auto inline-flex cursor-pointer select-none items-center gap-2 rounded-xl border-2 border-white/60 bg-white/80 px-3 py-2 text-sm font-bold text-pastel-ink">
                       <input
                         type="checkbox"
@@ -2109,27 +2528,35 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
                       <p className="mt-2 text-xs font-bold uppercase tracking-[0.18em] text-pastel-sub">
                         Deletreando
                       </p>
-                      <p
-                        className={`mt-2 max-h-28 overflow-y-auto break-all font-extrabold uppercase text-pastel-grape ${
-                          spellPreview.replace(/\s/g, '').length > 10
-                            ? 'text-xl leading-snug tracking-wide'
-                            : 'text-3xl tracking-[0.15em] sm:text-4xl'
-                        }`}
-                      >
-                        {spellPreview.replace(/ /g, '')}
-                      </p>
+                      <div className="mt-2 max-h-28 overflow-y-auto overflow-x-hidden">
+                        <p
+                          className={`break-all py-2 pr-2 font-extrabold uppercase leading-[1.35] text-pastel-grape ${
+                            spellPreview.replace(/\s/g, '').length > 10
+                              ? 'text-xl tracking-wide'
+                              : 'text-3xl tracking-[0.15em] sm:text-4xl'
+                          }`}
+                        >
+                          {spellPreview.replace(/ /g, '')}
+                        </p>
+                      </div>
                     </>
                   ) : latest ? (
                     <>
-                      <p className="mt-3 max-h-28 overflow-y-auto break-all text-3xl font-extrabold uppercase tracking-tight text-pastel-grape sm:text-4xl">
-                        {(latest.displayText || latest.sign.replace(/_/g, ' '))}
-                      </p>
+                      <div className="mt-3 max-h-28 overflow-y-auto overflow-x-hidden">
+                        <p className="break-all py-2 pr-2 text-3xl font-extrabold uppercase leading-[1.35] tracking-tight text-pastel-grape sm:text-4xl">
+                          {(latest.displayText || latest.sign.replace(/_/g, ' '))}
+                        </p>
+                      </div>
                       {latest.lang && latest.lang !== 'es' && (
                         <p className="mt-1 text-xs font-bold text-pastel-sub">
                           Seña: {latest.sign.replace(/_/g, ' ')} · {findOutputLang(latest.lang).label}
                         </p>
                       )}
-                      <div className="mt-4">
+                      {latest.spelled ? (
+                        <p className="mt-4 text-xs font-bold text-pastel-sub">
+                          Deletreo detectado · verifica las letras
+                        </p>
+                      ) : <div className="mt-4">
                         <div className="mb-1 flex justify-between text-xs font-bold text-pastel-sub">
                           <span>Confianza</span>
                           <span>{confPct}%</span>
@@ -2140,7 +2567,7 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
                             style={{ width: `${confPct}%` }}
                           />
                         </div>
-                      </div>
+                      </div>}
                     </>
                   ) : (
                     <div className="mt-4 flex flex-col items-center rounded-xl border-2 border-dashed border-pastel-ink/15 bg-white px-4 py-8 text-center [background-image:radial-gradient(rgba(45,42,38,0.06)_1px,transparent_1px)] [background-size:16px_16px]">
@@ -2174,7 +2601,9 @@ export default function InterpretScreen({ onBack, onHome, onOpenFloating, compac
                         <span className="min-w-0 flex-1 break-all text-sm font-bold text-pastel-ink">
                           {(h.displayText || h.sign.replace(/_/g, ' '))}
                         </span>
-                        <span className="text-xs font-extrabold text-pastel-sub">{Math.round((h.confidence || 0) * 100)}%</span>
+                        <span className="text-xs font-extrabold text-pastel-sub">
+                          {h.spelled ? 'Deletreo' : `${Math.round((h.confidence || 0) * 100)}%`}
+                        </span>
                       </li>
                     ))}
                   </ul>

@@ -69,15 +69,19 @@ function drain(words, options, final) {
 }
 
 export function pushContextWord(currentWords, rawWord, options) {
-  const words = [...normalizeWords(currentWords), ...tokenize(rawWord)]
-  const forced = words.length > (options.maxWords || CONTEXT_WINDOW_MAX_WORDS)
-  if (!forced) return drain(words, options, false)
-
-  // Límite defensivo: una expresión desconocida nunca puede dejar creciendo
-  // la memoria de una sesión de voz indefinidamente.
-  const first = buildCommittedUnit(words.slice(0, 1), options)
-  const rest = drain(words.slice(1), options, false)
-  return { pendingWords: rest.pendingWords, committed: [first, ...rest.committed] }
+  // Web Speech suele entregar palabras; Play puede entregar varias frases.
+  // El límite corresponde al CONTEXTO PENDIENTE, no al tamaño del delta.
+  // Resolver antes de limitar: cortar la primera palabra de un bloque largo
+  // rompía «tengo sed» en TENGO + SED aunque existiese su animación.
+  const result = drain([...normalizeWords(currentWords), ...tokenize(rawWord)], options, false)
+  const maximum = options.maxWords || CONTEXT_WINDOW_MAX_WORDS
+  while (result.pendingWords.length > maximum) {
+    const first = buildCommittedUnit(result.pendingWords.slice(0, 1), options)
+    const rest = drain(result.pendingWords.slice(1), options, false)
+    result.pendingWords = rest.pendingWords
+    result.committed.push(first, ...rest.committed)
+  }
+  return result
 }
 
 export function flushContextWindow(currentWords, options) {

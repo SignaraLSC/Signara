@@ -49,4 +49,36 @@ const final = flushContextWindow(pending, options)
 played.push(...final.committed.flatMap((unit) => unit.playTokens))
 assert.deepEqual(played.slice(-5), ['M', 'A', 'R', 'I', 'A'])
 
+// Play entrega bloques, el micrófono normal entrega palabras. Deben resolver
+// las mismas frases aun cuando el delta supere el límite de ocho palabras.
+const fullAvailable = [...available, 'HOLA', 'GRACIAS']
+const fullOptions = { ...options, availableTokens: fullAvailable }
+for (const text of [
+  'tengo sed por favor necesito ayuda mañana gracias hola',
+  'hola como estas por favor tengo sed gracias hola',
+  'tengo sed tengo sed tengo sed tengo sed tengo sed',
+]) {
+  const batch = pushContextWord([], text, fullOptions)
+  let incrementalPending = []
+  const incrementalTokens = []
+  for (const word of text.split(' ')) {
+    const next = pushContextWord(incrementalPending, word, fullOptions)
+    incrementalPending = next.pendingWords
+    incrementalTokens.push(...next.committed.flatMap(unit => unit.playTokens))
+  }
+  assert.deepEqual(batch.committed.flatMap(unit => unit.playTokens), incrementalTokens,
+    `no romper expresiones por el tamaño del fragmento: ${text}`)
+  assert.deepEqual(batch.pendingWords, incrementalPending)
+  assert.ok(incrementalTokens.includes('TENGO_SED'))
+}
+const split = pushContextWord(['tengo'], 'sed por favor necesito ayuda mañana gracias hola como estas', fullOptions)
+assert.equal(split.committed[0].playTokens[0], 'TENGO_SED', 'conservar prefijo del delta anterior')
+const unfinished = pushContextWord([], 'hola gracias hola gracias hola gracias hola gracias tengo', fullOptions)
+assert.deepEqual(unfinished.pendingWords, ['tengo'], 'el límite no vacía una frase todavía incompleta')
+assert.deepEqual(pushContextWord([], 'tengo', fullOptions).committed, [])
+assert.deepEqual(pushContextWord([], 'tengo ser', fullOptions).committed.flatMap(unit => unit.playTokens),
+  'TENGOSER'.split(''), 'no cambiar una transcripción distinta a SED por adivinación')
+const limited = pushContextWord([], 'por la', { ...fullOptions, maxWords: 1 })
+assert.ok(limited.pendingWords.length <= 1, 'mantener límite defensivo del contexto pendiente')
+
 console.log('OK ventana contextual: frases, espera incremental y deletreo de respaldo')

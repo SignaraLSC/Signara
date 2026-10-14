@@ -3,6 +3,8 @@
  * Corrige NO/SI cuando el GNN se equivoca; espejo de sign_ai/core/handshape_hints.py.
  */
 
+import { isLetterToken } from './fingerspell.js'
+
 const INDEX_MCP = 5
 const INDEX_TIP = 8
 const MIDDLE_MCP = 9
@@ -141,7 +143,7 @@ const TE_AMO_FORMS = new Set([
 /** Si el modelo se equivocó pero la mano es ILY → TE_AMO (cita). */
 export function maybeCorrectTeAmo(prediction, framesCompact) {
   const pred = String(prediction || '').toUpperCase()
-  if (TE_AMO_FORMS.has(pred)) return prediction
+  if (TE_AMO_FORMS.has(pred) || isLetterToken(pred)) return prediction
   const hint = looksLikeIly(framesCompact)
   if (hint.ily) return 'TE_AMO'
   return prediction

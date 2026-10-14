@@ -1,0 +1,5 @@
+# Entorno independiente del GNN y de sign_ai/venv.
+faster-whisper==1.2.1
+PyAudioWPatch==0.2.12.7; sys_platform == 'win32'
+numpy>=1.26,<3
+scipy>=1.13,<2

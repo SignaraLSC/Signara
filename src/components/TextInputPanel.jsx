@@ -37,92 +37,14 @@ const TextInputPanel = forwardRef(function TextInputPanel(
   onVoiceEndRef.current = onVoiceEnd
   onListeningChangeRef.current = onListeningChange
 
-  const liveEmittedRef = useRef([])
-  // Tras limpiar la barra en voz, el API sigue mandando el transcript COMPLETO
-  // de la sesión. Solo mostramos/emitimos a partir de este índice (no
-  // reiniciamos liveEmittedRef — eso re-disparaba todas las señas).
-  const displayFromRef = useRef(0)
-
-  // Reconocimiento de voz: el texto interim/final puede llegar acumulado o como
-  // delta. Solo emitimos palabras NUEVAS respecto a lo ya enviado. Si el
-  // interim se acorta (el motor corrige), NO reiniciamos ni re-emitimos: eso
-  // duplicaba señas. Solo reiniciamos si el prefijo deja de coincidir.
-  function normW(w) {
-    return String(w || '').normalize('NFD').replace(/\p{M}/gu, '').toLowerCase()
-  }
-  function emitNewWords(allWords) {
-    const prev = liveEmittedRef.current
-    let common = 0
-    while (
-      common < prev.length &&
-      common < allWords.length &&
-      normW(prev[common]) === normW(allWords[common])
-    ) common++
-
-    // TEMPORAL: mismo flag que useVoiceInput.js — window.__SIGNARA_VOICE_DEBUG = true
-    if (typeof window !== 'undefined' && window.__SIGNARA_VOICE_DEBUG) {
-      console.log('[voz][emitNewWords]', { prev: prev.slice(), allWords: allWords.slice(), common })
-    }
-
-    // Prefijo roto (reinicio del transcript): NO re-emitir lo ya enviado
-    // desde el último clear. Si no, en inglés/otro idioma la 1ª palabra
-    // (p.ej. "hello") se traduce y seña dos veces.
-    if (common < prev.length && common < allWords.length) {
-      const already = prev.slice(displayFromRef.current)
-      let shared = 0
-      while (
-        shared < already.length &&
-        shared < allWords.length &&
-        normW(already[shared]) === normW(allWords[shared])
-      ) shared++
-      for (let i = shared; i < allWords.length; i++) {
-        const w = allWords[i]
-        if (w && onLiveWordRef.current) onLiveWordRef.current(w)
-      }
-      liveEmittedRef.current = prev.slice(0, displayFromRef.current).concat(allWords)
-      return
-    }
-
-    // Acortó pero sigue siendo prefijo: no re-emitir.
-    if (allWords.length < prev.length) {
-      liveEmittedRef.current = allWords.slice()
-      return
-    }
-
-    for (let i = prev.length; i < allWords.length; i++) {
-      const w = allWords[i]
-      if (!w) continue
-      if (onLiveWordRef.current) onLiveWordRef.current(w)
-    }
-    liveEmittedRef.current = allWords.slice()
+  function handleLive(_text, _isFinal, snapshot) {
+    // Mostrar lo que el navegador aún edita, sin enviarlo al avatar.
+    // Lo confirmado llega por onResult como delta, nunca desde esta caja.
+    setValue(snapshot?.interimText || '')
   }
 
-  function handleLive(text) {
-    const cleaned = String(text || '').trim()
-    const words = cleaned.split(/\s+/).filter(Boolean)
-    // Barra: solo lo dicho desde el último clear (no todo el historial de sesión).
-    setValue(words.slice(displayFromRef.current).join(' '))
-    // También enviamos la última palabra interim. El reconocedor puede
-    // mostrarla en pantalla y no volver a emitir otro evento cuando la marca
-    // como final; si la excluimos, frases como "cómo estás" dejan pasar
-    // únicamente "cómo" al avatar. `emitNewWords` conserva el prefijo y
-    // deduplica la confirmación posterior, mientras la ventana contextual
-    // decide si esa palabra ya es una seña o todavía debe esperar otra.
-    emitNewWords(words)
-  }
-
-  // Tras traducir: barra vacía. En voz HAY que conservar liveEmittedRef —
-  // el reconocedor reenvía todo el transcript tras cada pausa; si lo
-  // reseteamos, se re-emiten (y se re-apendan a "Lo que dijiste") todas
-  // las palabras otra vez.
-  function clearBar({ keepVoiceMemory = false } = {}) {
+  function clearBar() {
     setValue('')
-    if (keepVoiceMemory) {
-      displayFromRef.current = liveEmittedRef.current.length
-    } else {
-      liveEmittedRef.current = []
-      displayFromRef.current = 0
-    }
   }
 
   const { listening, error, supported, start, stop } = useVoiceInput({
@@ -131,8 +53,8 @@ const TextInputPanel = forwardRef(function TextInputPanel(
     onLiveTranscript: handleLive,
     onResult: (text) => {
       if (!text) return
+      for (const word of text.split(/\s+/).filter(Boolean)) onLiveWordRef.current?.(word)
       if (onSubmitRef.current) onSubmitRef.current(text, { fromVoice: true })
-      clearBar({ keepVoiceMemory: true })
     }
   })
 
@@ -167,7 +89,7 @@ const TextInputPanel = forwardRef(function TextInputPanel(
         try { stopRef.current() } catch (_) {}
       }
       setInputMode('text')
-      clearBar({ keepVoiceMemory: false })
+      clearBar()
     },
     isListening: () => listeningRef.current,
     stopMic: () => { if (listeningRef.current) stopRef.current() }
@@ -220,9 +142,9 @@ const TextInputPanel = forwardRef(function TextInputPanel(
   }
 
   function pickVoiceMode() {
-    if (!supported || busy) return
+    if (!supported || busy || listening) return
     setInputMode('voice')
-    clearBar({ keepVoiceMemory: false })
+    clearBar()
     start()
   }
 
@@ -357,7 +279,7 @@ const TextInputPanel = forwardRef(function TextInputPanel(
           <div className="flex flex-wrap items-center gap-2 text-xs font-semibold text-pastel-sub">
             <span className="inline-flex items-center gap-1.5 rounded-full border-2 border-pastel-blue-line/60 bg-pastel-blue/60 px-3 py-1 text-palette-azure">
               <span className="h-1.5 w-1.5 rounded-full bg-palette-azure animate-pulse" />
-              Escuchando… cada palabra se convierte en seña
+              Escuchando… las frases confirmadas se convierten en señas
             </span>
             {pendingWord && (
               <span className="inline-flex items-center gap-1 rounded-full border-2 border-pastel-blue-line bg-pastel-blue px-2.5 py-1 text-palette-azure animate-pulse">

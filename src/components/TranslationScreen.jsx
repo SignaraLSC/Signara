@@ -130,7 +130,6 @@ export default function TranslationScreen({
   const missedTimerRef = useRef(null)
   const signerRef = useRef(null)
   const availableTokensRef = useRef([])
-  const liveMatchedRef = useRef(false)
   const liveQueueBufferRef = useRef([])
   const useSignerRef = useRef(false)
   const pendingWordsRef = useRef([])
@@ -138,7 +137,6 @@ export default function TranslationScreen({
   const inputLangRef = useRef(inputLang)
   const liveTranslateBusyRef = useRef(false)
   const liveTranslateSeqRef = useRef(0)
-  const lastLiveQueueRef = useRef({ token: '', t: 0 })
 
   useEffect(() => { inputLangRef.current = inputLang }, [inputLang])
 
@@ -201,13 +199,11 @@ export default function TranslationScreen({
     setSignerTokens([])
     signerRef.current?.clear()
     pendingWordRef.current = ''
-    liveMatchedRef.current = false
     liveQueueBufferRef.current = []
     pendingWordsRef.current = []
     contextWordsRef.current = []
     liveTranslateSeqRef.current += 1
     liveTranslateBusyRef.current = false
-    lastLiveQueueRef.current = { token: '', t: 0 }
     if (missedTimerRef.current) clearTimeout(missedTimerRef.current)
   }, [revokePoseBlob])
 
@@ -302,21 +298,24 @@ export default function TranslationScreen({
   const queueLiveTokens = useCallback((tokens) => {
     const list = (Array.isArray(tokens) ? tokens : [tokens]).filter(Boolean)
     if (!list.length) return
-    // Evita doble seña cuando el mic reenvía la misma 1ª palabra
-    // (típico al cambiar de interim→final o reiniciar transcript).
-    const dedupeKey = list.join('|')
-    const now = Date.now()
-    const last = lastLiveQueueRef.current
-    if (last.token === dedupeKey && now - last.t < 1500) return
-    lastLiveQueueRef.current = { token: dedupeKey, t: now }
-
+    // La identidad del resultado de voz ya evita reenvíos. No descartar
+    // dos frases realmente dichas por compartir texto dentro de 1.5 s.
     setMissedWord('')
     setPoseFinished(false)
-    liveMatchedRef.current = true
     setTranslateSource('signer3d')
     // No setSignerTokens aquí: el useEffect haría replace() y reiniciaría la cola.
-    if (useSignerRef.current) {
-      for (const t of list) signerRef.current?.queue(t)
+    // El VRM ya se precarga aunque useSigner siga en false. Usar el ref real:
+    // guardar solo la primera seña y enviar las siguientes antes del efecto
+    // invertía el orden dentro del mismo resultado confirmado.
+    if (signerRef.current) {
+      const ready = [...liveQueueBufferRef.current, ...list]
+      liveQueueBufferRef.current = []
+      if (signerRef.current.queueBatch) signerRef.current.queueBatch(ready)
+      else for (const token of ready) signerRef.current.queue(token)
+      if (!useSignerRef.current) {
+        useSignerRef.current = true
+        setUseSigner(true)
+      }
     } else {
       liveQueueBufferRef.current.push(...list)
       useSignerRef.current = true
@@ -453,24 +452,20 @@ export default function TranslationScreen({
         }
       }
     }
-    // Nadie más viene detrás — cualquier palabra que quedó esperando pareja
-    // (ej. dijiste "por" y ahí terminó, sin "favor") no va a combinar con
-    // nada; se limpia el buffer para la próxima frase.
-    pendingWordsRef.current = []
-    // Si ya se fueron encolando señas en vivo palabra por palabra, no hay que
-    // reprocesar toda la frase de nuevo — signerRef.current.replace(...) (vía
-    // handleSubmit) reiniciaría la cola (duplicados / se salta la del medio) y
-    // además desmontaba el VRM. liveMatchedRef es síncrono (liveMode es async).
-    if (liveMatchedRef.current) {
-      liveMatchedRef.current = false
+    // El panel ya entregó todas las palabras CONFIRMADAS a handleLiveWord.
+    // Un final de SpeechRecognitionResult no es fin de conversación: puede
+    // quedar «tengo» pendiente o una traducción asíncrona aún en curso.
+    // No volver a traducir ese delta ni borrar trabajo pendiente.
+    if (availableTokensRef.current.length) {
       setBusy(false)
       return
     }
+    // Sin servidor de animaciones, conservar el respaldo sign.mt.
     if (text?.trim()) handleSubmit(text.trim())
   }, [handleSubmit, queueLiveTokens])
 
-  // Apagar mic: limpia UI en vivo. No toca liveMatchedRef — el onResult
-  // final de la sesión aún puede llegar y necesita ese flag.
+  // Apagar mic: limpia UI en vivo. El último resultado confirmado aún puede
+  // llegar después de stop(), así que conservar su contexto hasta procesarlo.
   const handleVoiceEnd = useCallback(() => {
     setLiveMode(false)
     pendingWordsRef.current = []
@@ -482,13 +477,11 @@ export default function TranslationScreen({
 
   const handlePanelSubmit = useCallback((text, { fromVoice = false } = {}) => {
     // Voz: cierre de frase del reconocedor (puede ser no-op si ya señaó en vivo).
-    // Texto: SIEMPRE traduce — antes liveMatchedRef quedaba true tras el mic
-    // y el submit escrito caía en handleVoiceFinal sin hacer nada.
+    // Texto: siempre traduce independientemente de la sesión de voz anterior.
     if (fromVoice) {
       handleVoiceFinal(text)
       return
     }
-    liveMatchedRef.current = false
     setLiveMode(false)
     pendingWordsRef.current = []
     contextWordsRef.current = []

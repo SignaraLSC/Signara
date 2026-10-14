@@ -1,0 +1,1066 @@
+{
+  "architecture": "variable_gcn_lstm_v1",
+  "preprocess": "wrist_trajectory_xyz_v1",
+  "normalize_inputs": true,
+  "classes": [
+    "A",
+    "ADIOS",
+    "AYUDA",
+    "B",
+    "BIEN",
+    "C",
+    "CABEZA",
+    "COMO_ESTAS",
+    "D",
+    "E",
+    "F",
+    "FAMILIA",
+    "G",
+    "GRACIAS",
+    "H",
+    "HOLA",
+    "I",
+    "IDLE",
+    "J",
+    "K",
+    "L",
+    "M",
+    "MAL",
+    "N",
+    "NO",
+    "O",
+    "OJOS",
+    "P",
+    "PERDON",
+    "POR_FAVOR",
+    "Q",
+    "R",
+    "S",
+    "SCOOBA",
+    "SI",
+    "T",
+    "TENGO_SED",
+    "TE_AMO",
+    "U",
+    "V",
+    "W",
+    "X",
+    "Y",
+    "Z",
+    "Ñ"
+  ],
+  "best_epoch": 77,
+  "best_val_acc": 96.2,
+  "validation": "random_takes_same_signers_possible_not_live_camera",
+  "train_samples": 6259,
+  "val_samples": 1104,
+  "long_samples": 118,
+  "coverage": {
+    "A": {
+      "total": 201,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "ADIOS": {
+      "total": 200,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "AYUDA": {
+      "total": 147,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "B": {
+      "total": 200,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "BIEN": {
+      "total": 192,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "C": {
+      "total": 200,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "CABEZA": {
+      "total": 40,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "juan"
+      ]
+    },
+    "COMO_ESTAS": {
+      "total": 144,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "D": {
+      "total": 202,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "E": {
+      "total": 200,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "F": {
+      "total": 200,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "FAMILIA": {
+      "total": 111,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "G": {
+      "total": 300,
+      "complete": 100,
+      "longer_than_24": 1,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "GRACIAS": {
+      "total": 190,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alani",
+        "alanis",
+        "juan"
+      ]
+    },
+    "H": {
+      "total": 300,
+      "complete": 100,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "HOLA": {
+      "total": 100,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis"
+      ]
+    },
+    "I": {
+      "total": 200,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "IDLE": {
+      "total": 33,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis"
+      ]
+    },
+    "J": {
+      "total": 300,
+      "complete": 100,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "K": {
+      "total": 201,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "L": {
+      "total": 260,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "aalanis",
+        "alanis",
+        "juan"
+      ]
+    },
+    "M": {
+      "total": 200,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "MAL": {
+      "total": 192,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "N": {
+      "total": 202,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "NO": {
+      "total": 195,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "O": {
+      "total": 200,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "jua"
+      ]
+    },
+    "OJOS": {
+      "total": 52,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "juan"
+      ]
+    },
+    "P": {
+      "total": 208,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "PERDON": {
+      "total": 153,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "POR_FAVOR": {
+      "total": 144,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "PRUEBA_MUNECA": {
+      "total": 2,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis"
+      ]
+    },
+    "Q": {
+      "total": 203,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "R": {
+      "total": 200,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "S": {
+      "total": 300,
+      "complete": 100,
+      "longer_than_24": 32,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "SCOOBA": {
+      "total": 4,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis"
+      ]
+    },
+    "SI": {
+      "total": 194,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "T": {
+      "total": 200,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "TENGO_SED": {
+      "total": 196,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "TE_AMO": {
+      "total": 191,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "U": {
+      "total": 201,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "V": {
+      "total": 205,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "W": {
+      "total": 200,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "X": {
+      "total": 200,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alalanis",
+        "juan"
+      ]
+    },
+    "Y": {
+      "total": 202,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "Z": {
+      "total": 300,
+      "complete": 100,
+      "longer_than_24": 80,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "Ñ": {
+      "total": 302,
+      "complete": 100,
+      "longer_than_24": 5,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    }
+  },
+  "selected_coverage": {
+    "A": {
+      "total": 201,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "ADIOS": {
+      "total": 200,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "AYUDA": {
+      "total": 147,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "B": {
+      "total": 200,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "BIEN": {
+      "total": 192,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "C": {
+      "total": 200,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "CABEZA": {
+      "total": 40,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "juan"
+      ]
+    },
+    "COMO_ESTAS": {
+      "total": 144,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "D": {
+      "total": 202,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "E": {
+      "total": 200,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "F": {
+      "total": 200,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "FAMILIA": {
+      "total": 111,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "G": {
+      "total": 100,
+      "complete": 100,
+      "longer_than_24": 1,
+      "people": [
+        "alanis"
+      ]
+    },
+    "GRACIAS": {
+      "total": 190,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alani",
+        "alanis",
+        "juan"
+      ]
+    },
+    "H": {
+      "total": 100,
+      "complete": 100,
+      "longer_than_24": 0,
+      "people": [
+        "alanis"
+      ]
+    },
+    "HOLA": {
+      "total": 100,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis"
+      ]
+    },
+    "I": {
+      "total": 200,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "IDLE": {
+      "total": 33,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis"
+      ]
+    },
+    "J": {
+      "total": 100,
+      "complete": 100,
+      "longer_than_24": 0,
+      "people": [
+        "alanis"
+      ]
+    },
+    "K": {
+      "total": 201,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "L": {
+      "total": 260,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "aalanis",
+        "alanis",
+        "juan"
+      ]
+    },
+    "M": {
+      "total": 200,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "MAL": {
+      "total": 192,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "N": {
+      "total": 202,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "NO": {
+      "total": 195,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "O": {
+      "total": 200,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "jua"
+      ]
+    },
+    "OJOS": {
+      "total": 52,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "juan"
+      ]
+    },
+    "P": {
+      "total": 208,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "PERDON": {
+      "total": 153,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "POR_FAVOR": {
+      "total": 144,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "PRUEBA_MUNECA": {
+      "total": 2,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis"
+      ]
+    },
+    "Q": {
+      "total": 203,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "R": {
+      "total": 200,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "S": {
+      "total": 100,
+      "complete": 100,
+      "longer_than_24": 32,
+      "people": [
+        "alanis"
+      ]
+    },
+    "SCOOBA": {
+      "total": 4,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis"
+      ]
+    },
+    "SI": {
+      "total": 194,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "T": {
+      "total": 200,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "TENGO_SED": {
+      "total": 196,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "TE_AMO": {
+      "total": 191,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "U": {
+      "total": 201,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "V": {
+      "total": 205,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "W": {
+      "total": 200,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "X": {
+      "total": 200,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alalanis",
+        "juan"
+      ]
+    },
+    "Y": {
+      "total": 202,
+      "complete": 0,
+      "longer_than_24": 0,
+      "people": [
+        "alanis",
+        "juan"
+      ]
+    },
+    "Z": {
+      "total": 100,
+      "complete": 100,
+      "longer_than_24": 80,
+      "people": [
+        "alanis"
+      ]
+    },
+    "Ñ": {
+      "total": 100,
+      "complete": 100,
+      "longer_than_24": 5,
+      "people": [
+        "alanis"
+      ]
+    }
+  },
+  "complete_only_labels": [
+    "G",
+    "H",
+    "J",
+    "S",
+    "Z",
+    "Ñ"
+  ],
+  "per_class_val": {
+    "A": {
+      "correct": 30,
+      "total": 30
+    },
+    "ADIOS": {
+      "correct": 29,
+      "total": 30
+    },
+    "AYUDA": {
+      "correct": 21,
+      "total": 22
+    },
+    "B": {
+      "correct": 29,
+      "total": 30
+    },
+    "BIEN": {
+      "correct": 25,
+      "total": 29
+    },
+    "C": {
+      "correct": 27,
+      "total": 30
+    },
+    "CABEZA": {
+      "correct": 6,
+      "total": 6
+    },
+    "COMO_ESTAS": {
+      "correct": 22,
+      "total": 22
+    },
+    "D": {
+      "correct": 29,
+      "total": 30
+    },
+    "E": {
+      "correct": 30,
+      "total": 30
+    },
+    "F": {
+      "correct": 30,
+      "total": 30
+    },
+    "FAMILIA": {
+      "correct": 17,
+      "total": 17
+    },
+    "G": {
+      "correct": 15,
+      "total": 15
+    },
+    "GRACIAS": {
+      "correct": 28,
+      "total": 28
+    },
+    "H": {
+      "correct": 15,
+      "total": 15
+    },
+    "HOLA": {
+      "correct": 14,
+      "total": 15
+    },
+    "I": {
+      "correct": 30,
+      "total": 30
+    },
+    "IDLE": {
+      "correct": 3,
+      "total": 5
+    },
+    "J": {
+      "correct": 15,
+      "total": 15
+    },
+    "K": {
+      "correct": 28,
+      "total": 30
+    },
+    "L": {
+      "correct": 39,
+      "total": 39
+    },
+    "M": {
+      "correct": 28,
+      "total": 30
+    },
+    "MAL": {
+      "correct": 27,
+      "total": 29
+    },
+    "N": {
+      "correct": 28,
+      "total": 30
+    },
+    "NO": {
+      "correct": 27,
+      "total": 29
+    },
+    "O": {
+      "correct": 30,
+      "total": 30
+    },
+    "OJOS": {
+      "correct": 8,
+      "total": 8
+    },
+    "P": {
+      "correct": 28,
+      "total": 31
+    },
+    "PERDON": {
+      "correct": 21,
+      "total": 23
+    },
+    "POR_FAVOR": {
+      "correct": 22,
+      "total": 22
+    },
+    "Q": {
+      "correct": 30,
+      "total": 30
+    },
+    "R": {
+      "correct": 29,
+      "total": 30
+    },
+    "S": {
+      "correct": 14,
+      "total": 15
+    },
+    "SCOOBA": {
+      "correct": 0,
+      "total": 1
+    },
+    "SI": {
+      "correct": 28,
+      "total": 29
+    },
+    "T": {
+      "correct": 30,
+      "total": 30
+    },
+    "TENGO_SED": {
+      "correct": 28,
+      "total": 29
+    },
+    "TE_AMO": {
+      "correct": 27,
+      "total": 29
+    },
+    "U": {
+      "correct": 30,
+      "total": 30
+    },
+    "V": {
+      "correct": 30,
+      "total": 31
+    },
+    "W": {
+      "correct": 28,
+      "total": 30
+    },
+    "X": {
+      "correct": 29,
+      "total": 30
+    },
+    "Y": {
+      "correct": 29,
+      "total": 30
+    },
+    "Z": {
+      "correct": 15,
+      "total": 15
+    },
+    "Ñ": {
+      "correct": 14,
+      "total": 15
+    }
+  }
+}

@@ -10,6 +10,9 @@ import numpy as np
 from core.gnn_model import N_FEATURES, N_NODES
 
 MIN_HAND_SCALE = 0.05
+LEGACY_PREPROCESS = "hand_local_v1"
+MOTION_PREPROCESS = "wrist_motion_v1"
+TRAJECTORY_PREPROCESS = "wrist_trajectory_xyz_v1"
 
 
 def compact_to_gnn(frame_compact: np.ndarray) -> np.ndarray:
@@ -53,15 +56,71 @@ def normalize_sequence(seq: np.ndarray) -> np.ndarray:
     return np.stack([normalize_frame_nodes(frame) for frame in seq], axis=0)
 
 
+def normalize_sequence_motion(seq: np.ndarray) -> np.ndarray:
+    """Forma local + trayectoria de cada muñeca respecto al inicio del gesto.
+
+    La normalización anterior restaba la muñeca EN CADA FRAME: un traslado
+    puro de la mano producía exactamente la misma entrada al GNN. Esta versión
+    mantiene la forma local pero suma el desplazamiento X/Y de la muñeca,
+    dividido por el tamaño mediano de la mano para ser invariante a distancia.
+    Se requiere reentrenar; no aplicar a un checkpoint antiguo.
+    """
+    out = normalize_sequence(seq)
+    for start, end in ((0, 21), (21, 42)):
+        wrists = seq[:, start, :3]
+        visible = np.linalg.norm(wrists[:, :2], axis=1) > 1e-6
+        if not visible.any():
+            continue
+        local = seq[visible, start:end, :3] - wrists[visible, None, :]
+        spans = np.linalg.norm(local, axis=2).max(axis=1)
+        scale = max(float(np.median(spans)), MIN_HAND_SCALE)
+        first = wrists[visible, :2][:3]
+        anchor = np.median(first, axis=0)
+        travel = np.clip((wrists[visible, :2] - anchor) / scale, -4.0, 4.0)
+        out[visible, start:end, :2] += travel[:, None, :]
+    return out
+
+
+def normalize_sequence_trajectory(seq: np.ndarray) -> np.ndarray:
+    """Forma local + recorrido XYZ de cada muñeca en todos los cuadros reales.
+
+    Es una representación nueva para entrenamiento de duración variable. El
+    ancla se calcula al inicio de cada mano, no en cada cuadro; así un trazo
+    de letra no desaparece al centrar la forma de los dedos. Las manos ausentes
+    permanecen a cero y no generan trayectorias ficticias.
+    """
+    out = normalize_sequence(seq)
+    for start, end in ((0, 21), (21, 42)):
+        wrists = seq[:, start, :3]
+        visible = np.linalg.norm(wrists[:, :2], axis=1) > 1e-6
+        if not visible.any():
+            continue
+        local = seq[visible, start:end, :3] - wrists[visible, None, :]
+        spans = np.linalg.norm(local, axis=2).max(axis=1)
+        scale = max(float(np.median(spans)), MIN_HAND_SCALE)
+        anchor = np.median(wrists[visible][:3], axis=0)
+        travel = np.clip((wrists[visible] - anchor) / scale, -4.0, 4.0)
+        out[visible, start:end, :3] += travel[:, None, :]
+    return out
+
+
 def sequence_compact_to_gnn(
     frames_compact: np.ndarray,
     *,
     normalize: bool = True,
+    preprocess: str = LEGACY_PREPROCESS,
 ) -> np.ndarray:
     """(T, 126) → (T, 42, 4), opcionalmente normalizado."""
     seq = np.stack([compact_to_gnn(frames_compact[i]) for i in range(len(frames_compact))])
+    if preprocess not in (LEGACY_PREPROCESS, MOTION_PREPROCESS, TRAJECTORY_PREPROCESS):
+        raise ValueError(f"Preprocesamiento desconocido: {preprocess}")
     if normalize:
-        seq = normalize_sequence(seq)
+        if preprocess == TRAJECTORY_PREPROCESS:
+            seq = normalize_sequence_trajectory(seq)
+        elif preprocess == MOTION_PREPROCESS:
+            seq = normalize_sequence_motion(seq)
+        else:
+            seq = normalize_sequence(seq)
     return seq
 
 

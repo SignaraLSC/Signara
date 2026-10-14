@@ -1,7 +1,7 @@
 """
 import_raw_samples.py
 Importa muestras sueltas en formato raw_full (una por archivo JSON:
-{label, persona, muestra, frames:[{face, pose, lh, rh}]} — el mismo que
+{label, persona, muestra, frames:[{face, pose, lh, rh}], train_frames:[...]} — el mismo que
 genera save_raw_full() en 00_capture.py) hacia data/<persona>_raw.csv,
 re-numerando las muestras para no chocar con las que ya existan.
 
@@ -17,9 +17,9 @@ Uso:
 Filtra automáticamente archivos que no calcen con lo esperado:
   - Demasiado grandes (probablemente un dump completo guardado por error con
     extensión .json en vez de .csv, no una muestra individual).
-  - JSON inválido, sin 'label'/'frames', o con una cantidad de frames distinta
-    a SEQ_LEN (core/config.py) — mezclar tamaños de secuencia distintos
-    corrompería el entrenamiento.
+  - JSON inválido, sin 'label'/'frames', o sin una secuencia de entrenamiento
+    de SEQ_LEN (core/config.py). `frames` puede conservar la duración natural;
+    `train_frames` contiene los 24 cuadros usados por el GNN.
 """
 
 import csv
@@ -34,7 +34,7 @@ DATA_DIR = "data"
 RAW_FULL_DIR = os.path.join(DATA_DIR, "raw_full")
 RAW_HEADER = ["label", "persona", "muestra", "frame", "id", "mano", "x", "y", "z"]
 
-MAX_REASONABLE_SIZE = 5 * 1024 * 1024  # una muestra real ronda ~1-1.5 MB
+MAX_REASONABLE_SIZE = 32 * 1024 * 1024  # hasta 150 frames completos (cara+pose+manos)
 
 
 def existing_muestra_counters(csv_path):
@@ -101,14 +101,15 @@ def main():
             if not label or not frames:
                 skipped.append((path, "sin 'label' o sin 'frames'"))
                 continue
-            if len(frames) != SEQ_LEN:
-                skipped.append((path, f"{len(frames)} frames, se esperaban {SEQ_LEN} (SEQ_LEN)"))
+            train_frames = d.get("train_frames") or frames
+            if len(train_frames) != SEQ_LEN:
+                skipped.append((path, f"{len(train_frames)} frames de entrenamiento, se esperaban {SEQ_LEN} (SEQ_LEN)"))
                 continue
 
             muestra = muestra_counters.get(label, 1)
             muestra_counters[label] = muestra + 1
 
-            for fi, frame in enumerate(frames):
+            for fi, frame in enumerate(train_frames):
                 lh = frame.get("lh") or [[0.0, 0.0, 0.0]] * 21
                 rh = frame.get("rh") or [[0.0, 0.0, 0.0]] * 21
                 for lid, (x, y, z) in enumerate(lh):
@@ -118,7 +119,8 @@ def main():
 
             with open(os.path.join(out_dir, f"{label}_{muestra}.json"), "w", encoding="utf-8") as f:
                 json.dump(
-                    {"label": label, "persona": persona, "muestra": muestra, "frames": frames},
+                    {"label": label, "persona": persona, "muestra": muestra,
+                     "frames": frames, "train_frames": d.get("train_frames")},
                     f, separators=(",", ":"),
                 )
             imported += 1

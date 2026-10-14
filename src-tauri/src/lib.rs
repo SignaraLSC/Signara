@@ -1,12 +1,16 @@
 use tauri::{
   menu::{Menu, MenuItem},
   tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-  Manager,
+  Emitter, Manager,
 };
+mod desktop_audio;
+use desktop_audio::DesktopAudio;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
   tauri::Builder::default()
+    .manage(DesktopAudio::default())
+    .invoke_handler(tauri::generate_handler![desktop_audio::start_system_audio, desktop_audio::stop_system_audio, desktop_audio::read_system_audio_events])
     .setup(|app| {
       if cfg!(debug_assertions) {
         app.handle().plugin(
@@ -39,7 +43,9 @@ pub fn run() {
             }
           }
           "hide_overlay" => {
+            app.state::<DesktopAudio>().stop();
             if let Some(window) = app.get_webview_window("overlay") {
+              let _ = window.emit("signara-overlay-hidden", ());
               let _ = window.hide();
             }
           }
@@ -62,7 +68,10 @@ pub fn run() {
               let _ = window.set_focus();
             }
           }
-          "quit" => app.exit(0),
+          "quit" => {
+            app.state::<DesktopAudio>().shutdown();
+            app.exit(0);
+          }
           _ => {}
         })
         .on_tray_icon_event(|tray, event| {
@@ -83,6 +92,18 @@ pub fn run() {
         .build(app)?;
       Ok(())
     })
-    .run(tauri::generate_context!())
-    .expect("error while building tauri application");
+    .on_window_event(|window, event| {
+      if window.label() == "overlay" && matches!(event, tauri::WindowEvent::Focused(true)) {
+        if let Some(overlay) = window.app_handle().get_webview_window("overlay") {
+          window.app_handle().state::<DesktopAudio>().prepare(&overlay);
+        }
+      }
+    })
+    .build(tauri::generate_context!())
+    .expect("error while building tauri application")
+    .run(|app, event| {
+      if matches!(event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
+        app.state::<DesktopAudio>().shutdown();
+      }
+    });
 }

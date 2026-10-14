@@ -13,9 +13,9 @@ export const ML_API_URL =
 
 const CACHE_TTL_MS = 5 * 60 * 1000
 
-/** @type {{ ok: boolean, at: number } | null} */
+/** @type {{ ok: boolean, sequenceReady: boolean, fingerspellingRevision: string | null, at: number } | null} */
 let cached = null
-/** @type {Promise<{ ok: boolean, at: number }> | null} */
+/** @type {Promise<{ ok: boolean, sequenceReady: boolean, fingerspellingRevision: string | null, at: number }> | null} */
 let inflight = null
 
 export function getMlApiCache() {
@@ -40,12 +40,17 @@ export function checkMlApiHealth({ force = false } = {}) {
   inflight = fetch(`${ML_API_URL}/health`, { signal: controller.signal })
     .then((r) => r.json())
     .then((data) => {
-      cached = { ok: !!data.model_loaded, at: Date.now() }
+      cached = {
+        ok: !!data.model_loaded,
+        sequenceReady: !!data.sequence_model_loaded,
+        fingerspellingRevision: data.fingerspelling_revision || null,
+        at: Date.now(),
+      }
       inflight = null
       return cached
     })
     .catch(() => {
-      cached = { ok: false, at: Date.now() }
+      cached = { ok: false, sequenceReady: false, fingerspellingRevision: null, at: Date.now() }
       inflight = null
       return cached
     })

@@ -68,6 +68,15 @@
   },
   "bundle": {
     "active": true,
+    "resources": {
+      "../desktop_audio/worker.py": "desktop_audio/worker.py",
+      "../desktop_audio/streaming.py": "desktop_audio/streaming.py",
+      "../desktop_audio/model_store.py": "desktop_audio/model_store.py",
+      "../desktop_audio/low_latency.py": "desktop_audio/low_latency.py",
+      "../desktop_audio/resident.py": "desktop_audio/resident.py",
+      "../desktop_audio/recognition.py": "desktop_audio/recognition.py",
+      "../desktop_audio/requirements.txt": "desktop_audio/requirements.txt"
+    },
     "targets": "all",
     "icon": [
       "icons/32x32.png",

@@ -6,6 +6,8 @@ Uso:
     cd sign_ai
     conda activate signara
     python 06_gnn_train.py
+    # Candidato independiente que conserva trayectoria; no reemplaza el actual:
+    # PowerShell: $env:SIGNARA_TRAIN_MOTION='1'; python 06_gnn_train.py
 """
 
 import os
@@ -20,7 +22,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 
 from core.gnn_model import GCN_LSTM, N_NODES, N_FEATURES, SEQ_LEN
-from core.preprocess import normalize_sequence
+from core.preprocess import MOTION_PREPROCESS, LEGACY_PREPROCESS, normalize_sequence, normalize_sequence_motion
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -32,10 +34,13 @@ AUGMENT_COPIES   = 2
 DURATION_COPIES  = 3       # copias con remuestreo de duración (ver augment_duration)
 MIN_FRAMES       = 8       # debe coincidir con MIN_FRAMES en InterpretScreen.jsx
 NORMALIZE_INPUTS = True
+MOTION_CANDIDATE = os.getenv("SIGNARA_TRAIN_MOTION", "0") == "1"
+PREPROCESS = MOTION_PREPROCESS if MOTION_CANDIDATE else LEGACY_PREPROCESS
+normalize_input = normalize_sequence_motion if MOTION_CANDIDATE else normalize_sequence
 DEVICE           = "cuda" if torch.cuda.is_available() else "cpu"
-MODEL_PATH       = "models/signara_gnn.pt"
-LABEL_PATH       = "models/labels_gnn.json"
-META_PATH        = "models/signara_gnn_meta.json"
+MODEL_PATH       = "models/signara_gnn_motion.pt" if MOTION_CANDIDATE else "models/signara_gnn.pt"
+LABEL_PATH       = "models/labels_gnn_motion.json" if MOTION_CANDIDATE else "models/labels_gnn.json"
+META_PATH        = "models/signara_gnn_motion_meta.json" if MOTION_CANDIDATE else "models/signara_gnn_meta.json"
 
 print(f"⚙  Dispositivo: {DEVICE}")
 
@@ -70,9 +75,10 @@ def df_to_tensor(df_sample):
     Nodos 0-20 = lh (mano=0), nodos 21-41 = rh (mano=1).
     Features por nodo: [x, y, z, mano]
 
-    La selección temporal debe coincidir con padBuffer() de InterpretScreen:
-    cuando sobran frames se conservan los últimos SEQ_LEN; cuando faltan se
-    remuestrea la secuencia completa.
+    La captura actual suele almacenar SEQ_LEN frames, pero también existen
+    muestras de 30. El candidato de movimiento remuestrea la toma entera:
+    cortar sus primeros cuadros destruiría precisamente el recorrido que
+    queremos aprender. El modelo legado conserva su entrada anterior.
     """
     frames = sorted(df_sample["frame"].unique())
     if not frames:
@@ -97,7 +103,9 @@ def df_to_tensor(df_sample):
             if 0 <= lid < 21:
                 raw[fi, lid + 21] = [row["x"], row["y"], row["z"], 1.0]
 
-    if len(raw) >= SEQ_LEN:
+    if len(raw) == SEQ_LEN:
+        return raw
+    if len(raw) > SEQ_LEN and not MOTION_CANDIDATE:
         return raw[-SEQ_LEN:]
     return resample_frames(raw, SEQ_LEN)
 
@@ -106,15 +114,21 @@ def augment_sample(x: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     """Augmentación ligera: ruido + jitter temporal."""
     out = x.copy()
 
-    noise = rng.normal(0, 0.012, size=out[:, :, :3].shape).astype(np.float32)
+    noise_scale = 0.003 if MOTION_CANDIDATE else 0.012
+    noise = rng.normal(0, noise_scale, size=out[:, :, :3].shape).astype(np.float32)
+    if MOTION_CANDIDATE:
+        # No inventar una mano ausente: esos nodos deben seguir en cero.
+        for start, end in ((0, 21), (21, 42)):
+            visible = np.linalg.norm(out[:, start, :2], axis=1) > 1e-6
+            noise[~visible, start:end] = 0
     out[:, :, :3] += noise
 
-    if rng.random() < 0.35:
+    if not MOTION_CANDIDATE and rng.random() < 0.35:
         shift = int(rng.integers(-2, 3))
         out = np.roll(out, shift, axis=0)
 
     if NORMALIZE_INPUTS:
-        out = normalize_sequence(out)
+        out = normalize_input(out)
 
     return out
 
@@ -141,7 +155,7 @@ def resample_frames(x: np.ndarray, target_len: int) -> np.ndarray:
 def augment_duration(x: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     """Simula una detección de fin de seña que capturó menos frames reales
     (seña más rápida, o cámara con menos fps efectivos) y que Interpretar
-    luego estira a SEQ_LEN con padBuffer(). Sin este caso en el entrenamiento,
+    luego estira a SEQ_LEN con resampleGestureFrames(). Sin este caso en el entrenamiento,
     el modelo solo conoce secuencias de SEQ_LEN frames reales — cualquier
     seña remuestreada le resulta "rara" y su confianza cae debajo del umbral,
     así que la detección de fin de seña temprana nunca llega a confirmar y
@@ -151,7 +165,7 @@ def augment_duration(x: np.ndarray, rng: np.random.Generator) -> np.ndarray:
     short = x[idx]
     out = resample_frames(short, SEQ_LEN)
     if NORMALIZE_INPUTS:
-        out = normalize_sequence(out)
+        out = normalize_input(out)
     return out
 
 
@@ -194,7 +208,7 @@ total  = len(grupos)
 
 for i, ((label, persona, muestra_id), group) in enumerate(grupos):
     x = df_to_tensor(group)
-    if NORMALIZE_INPUTS:
+    if NORMALIZE_INPUTS and not MOTION_CANDIDATE:
         x = normalize_sequence(x)
     y = int(le.transform([label])[0])
     samples_X.append(x)
@@ -214,7 +228,9 @@ X_train_raw, X_test, y_train_raw, y_test = train_test_split(
     random_state=42,
 )
 
-X_train = list(X_train_raw)
+X_train = [normalize_input(x) for x in X_train_raw] if MOTION_CANDIDATE else list(X_train_raw)
+if MOTION_CANDIDATE:
+    X_test = [normalize_input(x) for x in X_test]
 y_train = list(y_train_raw)
 for x, y in zip(X_train_raw, y_train_raw):
     for _ in range(AUGMENT_COPIES):
@@ -255,7 +271,7 @@ criterion = nn.CrossEntropyLoss(weight=weight_tensor)
 # ─── Entrenamiento ────────────────────────────────────────────────────────────
 
 print(f"\n🚀 Iniciando entrenamiento ({EPOCHS} épocas)...")
-print(f"   Normalización: {NORMALIZE_INPUTS} | Augment x{AUGMENT_COPIES + 1} + duración x{DURATION_COPIES} train\n")
+print(f"   Normalización: {NORMALIZE_INPUTS} ({PREPROCESS}) | Augment x{AUGMENT_COPIES + 1} + duración x{DURATION_COPIES} train\n")
 
 best_val_acc = 0.0
 epochs_no_improve = 0
@@ -321,6 +337,7 @@ with open(META_PATH, "w", encoding="utf-8") as f:
     json.dump(
         {
             "normalize_inputs": NORMALIZE_INPUTS,
+            "preprocess": PREPROCESS,
             "best_val_acc": round(best_val_acc, 2),
             "classes": clases,
         },

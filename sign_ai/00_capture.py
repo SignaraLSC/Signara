@@ -197,19 +197,30 @@ def normalize_label(raw):
     return s
 
 
-def next_muestra_id(csv_path, label):
-    """Continúa la numeración de muestras si el CSV ya existe."""
-    if not os.path.exists(csv_path):
-        return 1
+def next_muestra_id(csv_path, label, persona=None):
+    """Devuelve un ID libre considerando el CSV y las capturas completas."""
     max_id = 0
-    with open(csv_path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            if row.get("label") == label:
-                try:
-                    max_id = max(max_id, int(row["muestra"]))
-                except (ValueError, KeyError):
-                    pass
+    if os.path.exists(csv_path):
+        with open(csv_path, "r", newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get("label") == label:
+                    try:
+                        max_id = max(max_id, int(row["muestra"]))
+                    except (ValueError, KeyError):
+                        pass
+
+    if persona:
+        out_dir = os.path.join(RAW_FULL_DIR, persona)
+        prefix = f"{label}_"
+        if os.path.isdir(out_dir):
+            for name in os.listdir(out_dir):
+                stem, ext = os.path.splitext(name)
+                if ext.lower() != ".json" or not stem.startswith(prefix):
+                    continue
+                suffix = stem[len(prefix):]
+                if suffix.isdigit():
+                    max_id = max(max_id, int(suffix))
     return max_id + 1
 
 
@@ -231,14 +242,15 @@ def append_raw_csv(csv_path, label, persona, muestra, full_frames):
                     writer.writerow([label, persona, muestra, frame_idx, lid, mano_val, x, y, z])
 
 
-def save_raw_full(persona, label, muestra, full_frames):
-    """Respaldo crudo de cuerpo completo por muestra (para escalar sin re-grabar)."""
+def save_raw_full(persona, label, muestra, full_frames, train_frames=None):
+    """Guarda la toma completa y, aparte, la versión de 24 cuadros del GNN."""
     out_dir = os.path.join(RAW_FULL_DIR, persona)
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"{label}_{muestra}.json")
-    with open(path, "w", encoding="utf-8") as f:
+    with open(path, "x", encoding="utf-8") as f:
         json.dump(
-            {"label": label, "persona": persona, "muestra": muestra, "frames": full_frames},
+            {"label": label, "persona": persona, "muestra": muestra,
+             "frames": full_frames, "train_frames": train_frames},
             f, separators=(",", ":"),
         )
 
@@ -328,7 +340,7 @@ def main():
     print(f"   → etiqueta guardada: {label}")
 
     csv_path = os.path.join(DATA_DIR, f"{persona}_raw.csv")
-    muestra  = next_muestra_id(csv_path, label)
+    muestra  = next_muestra_id(csv_path, label, persona)
 
     print(f"\n🎥 Captura única — persona: {persona} | seña: {label}")
     print(f"   Muestras se guardan en: {csv_path} (empezando en #{muestra})")
@@ -406,12 +418,11 @@ def main():
 
                 report_quality(buffer_frames)
 
-                # El CSV de entrenamiento (y su respaldo raw_full) SIEMPRE va
-                # remuestreado a SEQ_LEN — así lo espera 06_gnn_train.py e
-                # import_raw_samples.py (que rechaza tamaños distintos).
+                # El CSV sigue en SEQ_LEN, pero raw_full conserva la toma
+                # natural para poder reentrenar modelos temporales después.
                 sample = resample_frames(buffer_frames, SEQ_LEN)
                 append_raw_csv(csv_path, label, persona, muestra, sample)
-                save_raw_full(persona, label, muestra, sample)
+                save_raw_full(persona, label, muestra, buffer_frames, sample)
 
                 # El AVATAR, en cambio, usa la toma COMPLETA sin comprimir a
                 # SEQ_LEN (24 frames aplanaría el detalle temporal de señas
